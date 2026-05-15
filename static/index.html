@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Meeting Transcriber</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #ffffff;
+  --surface:  #f5f5f7;
+  --surface2: #e8e8ed;
+  --border:   #d2d2d7;
+  --text:     #1d1d1f;
+  --text2:    #6e6e73;
+  --accent:   #0071e3;
+  --red:      #ff3b30;
+  --green:    #34c759;
+  --orange:   #ff9500;
+  --r:        10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:       #161617;
+    --surface:  #1c1c1e;
+    --surface2: #2c2c2e;
+    --border:   #38383a;
+    --text:     #f5f5f7;
+    --text2:    #8e8e93;
+    --accent:   #0a84ff;
+    --red:      #ff453a;
+    --green:    #30d158;
+    --orange:   #ff9f0a;
+  }
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 20px 16px;
+  gap: 12px;
+  overflow: hidden;
+}
+
+/* ── header ── */
+.header { display: flex; align-items: center; gap: 10px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.badge {
+  font-size: 11px; font-weight: 600; padding: 2px 8px;
+  border-radius: 20px; background: var(--surface2); color: var(--text2);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.badge.recording { background: var(--red); color: #fff; animation: blink 1.2s ease-in-out infinite; }
+.badge.paused    { background: var(--orange); color: #fff; }
+
+@keyframes blink { 0%,100% { opacity:1 } 50% { opacity:.4 } }
+
+/* ── key row ── */
+.key-row { display: flex; gap: 8px; align-items: center; }
+.key-row label { font-size: 13px; color: var(--text2); white-space: nowrap; }
+
+.key-saved {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text2);
+}
+.key-saved .dot-ok {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--green); display: inline-block;
+}
+
+input[type="password"] {
+  flex: 1; height: 32px; padding: 0 10px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text); font-size: 14px;
+  outline: none;
+}
+input[type="password"]:focus { border-color: var(--accent); }
+
+/* ── buttons ── */
+.btn-row { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+
+button {
+  height: 32px; padding: 0 14px; border: none; border-radius: var(--r);
+  background: var(--surface2); color: var(--text);
+  font-size: 13px; font-weight: 500; cursor: pointer;
+  transition: filter .12s;
+}
+button:hover:not(:disabled) { filter: brightness(0.88); }
+button:disabled { opacity: 0.38; cursor: default; }
+
+.btn-start  { background: var(--green);  color: #fff; }
+.btn-stop   { background: var(--red);    color: #fff; }
+.btn-save   { background: var(--accent); color: #fff; margin-left: auto; }
+
+.divider { width: 1px; height: 20px; background: var(--border); }
+
+/* ── meters ── */
+.meters {
+  display: none;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 2px 2px;
+}
+.meters.visible { display: flex; }
+.meter-row { display: flex; align-items: center; gap: 7px; flex: 1; }
+.meter-label { font-size: 11px; color: var(--text2); width: 26px; text-align: right; flex-shrink: 0; }
+.meter-canvas { flex: 1; height: 28px; border-radius: 6px; }
+
+/* ── transcribing indicator ── */
+.loading-bar {
+  display: none;
+  height: 3px;
+  background: var(--surface2);
+  border-radius: 2px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.loading-bar.active { display: block; }
+.loading-bar::after {
+  content: '';
+  display: block;
+  height: 100%;
+  width: 40%;
+  background: var(--accent);
+  border-radius: 2px;
+  animation: slide 1.2s ease-in-out infinite;
+}
+@keyframes slide {
+  0%   { transform: translateX(-150%); }
+  100% { transform: translateX(350%); }
+}
+
+/* ── transcript ── */
+.transcript-card {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+.transcript-header {
+  padding: 8px 14px 7px;
+  font-size: 11px; font-weight: 600;
+  color: var(--text2); text-transform: uppercase; letter-spacing: .05em;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+#transcript {
+  flex: 1; padding: 12px 14px; overflow-y: auto;
+  font-size: 14px; line-height: 1.65;
+  white-space: pre-wrap; word-break: break-word;
+  color: var(--text);
+}
+#transcript .ts { color: var(--text2); font-size: 12px; user-select: none; }
+
+/* ── status ── */
+.status-bar {
+  font-size: 12px; color: var(--text2);
+  height: 18px; overflow: hidden;
+}
+
+/* ── file input hidden ── */
+#upload-input { display: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Meeting Transcriber</h1>
+  <span class="badge" id="badge">Idle</span>
+</div>
+
+<div class="key-row" id="key-input-row">
+  <label>Groq API Key</label>
+  <input type="password" id="api-key" placeholder="gsk_…" autocomplete="off" spellcheck="false">
+  <button onclick="saveKey()">Save</button>
+</div>
+<div class="key-saved" id="key-saved-row" style="display:none">
+  <span class="dot-ok"></span>
+  <span>API key set</span>
+  <button onclick="showKeyInput()" style="height:24px;padding:0 10px;font-size:12px">Change</button>
+</div>
+
+<div class="btn-row">
+  <button id="btn-start" class="btn-start" onclick="startRecording()">● Start</button>
+  <button id="btn-pause" disabled onclick="togglePause()">⏸ Pause</button>
+  <button id="btn-stop"  disabled class="btn-stop" onclick="stopRecording()">■ Stop</button>
+  <div class="divider"></div>
+  <select id="lang-select" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
+    <option value="zh">中文</option>
+    <option value="en">English</option>
+    <option value="auto">Auto</option>
+  </select>
+  <div class="divider"></div>
+  <button onclick="document.getElementById('upload-input').click()">↑ Upload file</button>
+  <input type="file" id="upload-input" accept="audio/*,video/*" onchange="uploadFile(this)">
+  <button onclick="clearTranscript()">Clear</button>
+  <button class="btn-save" onclick="saveTranscript()">Save .txt</button>
+</div>
+
+<div class="meters" id="meters">
+  <div class="meter-row">
+    <span class="meter-label">IN</span>
+    <canvas class="meter-canvas" id="canvas-audio"></canvas>
+  </div>
+</div>
+
+<div class="loading-bar" id="loading-bar"></div>
+
+<div class="transcript-card" id="transcript-card" style="display:none">
+  <div class="transcript-header">Transcript</div>
+  <div id="transcript"></div>
+</div>
+
+<div id="transcript-empty" style="flex:1;display:flex;align-items:center;justify-content:center">
+  <span style="font-size:13px;color:var(--text2)">Transcript will appear here once recording starts</span>
+</div>
+
+<div class="status-bar" id="status">Ready — enter your Groq API key and press Start</div>
+
+<script>
+let recording = false, paused = false;
+
+// ── Waveform meters ──
+const BARS = 40;
+const audioHistory = new Array(BARS).fill(0);
+
+function drawMeter(canvasId, history, color) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  // Use parent width for reliable sizing
+  const parentW = canvas.parentElement ? canvas.parentElement.clientWidth : 0;
+  const w = Math.max(10, parentW - 44);  // subtract label + gap
+  const h = 28;
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+  ctx.clearRect(0, 0, w, h);
+  const barW = w / BARS - 1;
+  for (let i = 0; i < BARS; i++) {
+    const level = history[i];
+    const barH = Math.max(2, level * h);
+    const alpha = 0.35 + level * 0.65;
+    ctx.fillStyle = color.replace('A', Math.round(alpha * 255).toString(16).padStart(2,'0'));
+    ctx.beginPath();
+    ctx.roundRect(i * (barW + 1), (h - barH) / 2, barW, barH, 2);
+    ctx.fill();
+  }
+}
+
+function pushLevel(history, value) {
+  history.push(value); history.shift();
+}
+
+// Redraw ~30fps when recording
+setInterval(() => {
+  if (!recording || paused) return;
+  drawMeter('canvas-audio', audioHistory, '#34c759AA');
+}, 33);
+
+/* ── SSE ── */
+const es = new EventSource('/events');
+es.onmessage = ({data}) => {
+  const msg = JSON.parse(data);
+  if (msg.type === 'init') {
+    if (msg.key) {
+      document.getElementById('api-key').value = msg.key;
+      showKeySaved();
+    }
+    if (msg.language) document.getElementById('lang-select').value = msg.language;
+    document.getElementById('transcript').innerHTML = '';
+    msg.lines.forEach(l => appendLine(l));
+    if (!msg.lines.length) {
+      document.getElementById('transcript-card').style.display = 'none';
+      document.getElementById('transcript-empty').style.display = 'flex';
+    }
+    recording = msg.recording; paused = msg.paused; sync();
+  } else if (msg.type === 'transcript') {
+    appendLine(msg.data);
+  } else if (msg.type === 'status') {
+    document.getElementById('status').textContent = msg.data;
+  } else if (msg.type === 'state') {
+    recording = msg.data.recording; paused = msg.data.paused; sync();
+  } else if (msg.type === 'level') {
+    pushLevel(audioHistory, Math.max(msg.data.mic || 0, msg.data.sys || 0));
+  } else if (msg.type === 'transcribing') {
+    document.getElementById('loading-bar').className = 'loading-bar' + (msg.data ? ' active' : '');
+  }
+};
+
+function appendLine(text) {
+  // Show transcript card on first line
+  const card = document.getElementById('transcript-card');
+  const empty = document.getElementById('transcript-empty');
+  if (card.style.display === 'none') {
+    card.style.display = 'flex';
+    empty.style.display = 'none';
+  }
+
+  const box = document.getElementById('transcript');
+  const line = document.createElement('div');
+  line.style.marginBottom = '6px';
+  line.innerHTML = text.replace(
+    /^\[(\d{2}:\d{2}:\d{2})\]\s*/,
+    '<span class="ts">[$1]</span> '
+  );
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+}
+
+function sync() {
+  document.getElementById('btn-start').disabled = recording;
+  document.getElementById('btn-pause').disabled = !recording;
+  document.getElementById('btn-stop').disabled  = !recording;
+  document.getElementById('btn-pause').textContent = paused ? '▶ Resume' : '⏸ Pause';
+  const badge = document.getElementById('badge');
+  badge.textContent = recording ? (paused ? 'Paused' : 'Recording') : 'Idle';
+  badge.className = 'badge' + (recording && !paused ? ' recording' : paused ? ' paused' : '');
+  document.getElementById('meters').className = 'meters' + (recording && !paused ? ' visible' : '');
+  if (recording && !paused) requestAnimationFrame(() => { drawMeter('canvas-audio', audioHistory, '#34c759AA'); });
+  if (!recording) {
+    audioHistory.fill(0);
+    document.getElementById('loading-bar').className = 'loading-bar';
+  }
+}
+
+function getKey() { return document.getElementById('api-key').value.trim(); }
+
+function showKeyInput() {
+  document.getElementById('key-input-row').style.display = 'flex';
+  document.getElementById('key-saved-row').style.display = 'none';
+  document.getElementById('api-key').focus();
+}
+
+function showKeySaved() {
+  document.getElementById('key-input-row').style.display = 'none';
+  document.getElementById('key-saved-row').style.display = 'flex';
+}
+
+function saveKey() {
+  const key = getKey();
+  if (!key) { setStatus('No key to save.'); return; }
+  fetch('/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})});
+  showKeySaved();
+}
+
+function startRecording() {
+  const key = getKey();
+  if (!key) { setStatus('Enter your Groq API key first.'); return; }
+  const language = document.getElementById('lang-select').value;
+  fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, language})})
+    .then(r => r.json())
+    .then(d => { if (!d.ok) setStatus('Error: ' + d.error); });
+}
+
+function togglePause() { fetch('/pause', {method:'POST'}); }
+function stopRecording() { fetch('/stop', {method:'POST'}); }
+
+function uploadFile(input) {
+  const file = input.files[0]; if (!file) return;
+  const key = getKey();
+  if (!key) { setStatus('Enter your Groq API key first.'); return; }
+  const fd = new FormData(); fd.append('file', file); fd.append('key', key);
+  setStatus(`Uploading ${file.name}…`);
+  fetch('/upload', {method:'POST', body: fd})
+    .then(r => r.json())
+    .then(d => { if (!d.ok) setStatus('Error: ' + d.error); });
+  input.value = '';
+}
+
+function clearTranscript() {
+  document.getElementById('transcript').innerHTML = '';
+  fetch('/clear', {method:'POST'});
+}
+
+function saveTranscript() { window.location.href = '/transcript'; }
+function setStatus(msg)    { document.getElementById('status').textContent = msg; }
+</script>
+</body>
+</html>
