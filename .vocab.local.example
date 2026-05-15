@@ -1,0 +1,17 @@
+# 自訂詞彙表 — 複製這個檔案成 .vocab.local 開始用
+# 每行一個專有名詞 / 品牌 / 縮寫 / 常用英文詞
+# 以 # 開頭的行會被忽略
+# 這個檔案會 prepend 到 Whisper 的 prompt，提升辨識準確度
+# .vocab.local 已加進 .gitignore，不會進 repo
+
+# 例子：
+GoFreight
+Loki
+hardcoretech
+HBL
+MBL
+NVOCC
+OP
+Chopin
+Yafeng
+Hardcore

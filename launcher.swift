@@ -55,9 +55,26 @@ if !FileManager.default.fileExists(atPath: binaryURL.path) {
 // ── Install Python packages if missing ──
 let check = run(python, args: ["-c", "import flask, groq, sounddevice, numpy, webview"], silent: true)
 if check != 0 {
-    run(python, args: ["-m", "pip", "install", "--break-system-packages",
-                       "-r", projectDir.appendingPathComponent("requirements.txt").path],
-        silent: true)
+    osascriptDialog("First launch: installing Python packages.\n\nThis takes 1-2 minutes. Click OK to continue.")
+    let pipLog = projectDir.appendingPathComponent(".pip-install.log").path
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: python)
+    p.arguments = ["-m", "pip", "install", "--user", "--break-system-packages",
+                   "-r", projectDir.appendingPathComponent("requirements.txt").path]
+    let logHandle = FileManager.default.createFile(atPath: pipLog, contents: nil)
+        ? FileHandle(forWritingAtPath: pipLog) : nil
+    if let logHandle {
+        p.standardOutput = logHandle
+        p.standardError = logHandle
+    }
+    try? p.run(); p.waitUntilExit()
+
+    // Re-check after install
+    let recheck = run(python, args: ["-c", "import flask, groq, sounddevice, numpy, webview"], silent: true)
+    if recheck != 0 {
+        osascriptDialog("Package install failed.\n\nSee log:\n  \(pipLog)\n\nOr run manually:\n  \(python) -m pip install --user --break-system-packages -r \(projectDir.appendingPathComponent("requirements.txt").path)")
+        exit(1)
+    }
 }
 
 // ── Launch app ──

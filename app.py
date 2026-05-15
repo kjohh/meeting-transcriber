@@ -4,6 +4,7 @@ import io
 import json
 import os
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -20,10 +21,33 @@ from groq import Groq
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000
-CHUNK_SECONDS = 10
+
+# Silence-aware chunking parameters (ported from lazy-take-notes).
+# A chunk is triggered when EITHER the buffer hits CHUNK_DURATION (hard cap)
+# OR the tail goes silent for PAUSE_DURATION while the body had speech (natural
+# sentence boundary). OVERLAP samples are retained between chunks so the next
+# transcription gets context.
+CHUNK_DURATION = 25.0           # seconds — hard cap when speech is continuous
+OVERLAP = 1.0                   # seconds — retained tail for context bleed
+SILENCE_THRESHOLD = 0.01        # RMS below this counts as silence
+PAUSE_DURATION = 1.5            # seconds of silence required to trigger
+MIN_SPEECH = 2.0                # don't trigger before this much speech buffered
+
 PORT = 8765
 BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native/.build/release/coreaudio_tap")
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".config.json")
+VOCAB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vocab.local")
+
+# Hugging Face model registry — borrowed from lazy-take-notes/hf_model_resolver.
+# Models are cached in pywhispercpp's MODELS_DIR so this app shares the cache
+# with lazy-take-notes (no double-download on machines that have both).
+BREEZE_REPO = "alan314159/Breeze-ASR-25-whispercpp"
+WHISPER_CPP_REPO = "ggerganov/whisper.cpp"
+MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    # alias: (hf_repo, filename)
+    "large-v3-turbo-q8_0": (WHISPER_CPP_REPO, "ggml-large-v3-turbo-q8_0.bin"),
+    "breeze-q8":           (BREEZE_REPO, "ggml-model-q8_0.bin"),
+}
 
 app = Flask(__name__, static_folder="static")
 
@@ -31,7 +55,33 @@ app = Flask(__name__, static_folder="static")
 
 _recording = False
 _paused = False
-_language = "zh"  # default: Traditional Chinese
+_language = "zh-en"  # default: bilingual Chinese + English
+_backend = "cloud"   # "cloud" (Groq) or "local" (whisper.cpp)
+
+# Download state (local backend only). Lock-protected so SSE clients can poll.
+_download_state: dict = {"active": False, "percent": 0, "model": "", "error": ""}
+_download_lock = threading.Lock()
+
+# Lazy-loaded local whisper model cache: {model_alias: pywhispercpp.Model}
+_local_models: dict = {}
+_local_models_lock = threading.Lock()
+
+# Prompt chain — last N transcript segments fed back as conditioning. Whisper's
+# prompt window is ~224 tokens, so we cap by char count and keep only recent.
+_prompt_chain: list[str] = []
+
+# Whisper's `prompt` parameter is conditioning context (not instruction).
+# Best practice for code-switched zh/en meetings: force language="zh" so the
+# decoder stays in Chinese mode (which natively interleaves Latin tokens),
+# and provide example sentences that demonstrate the expected style. The
+# decoder mimics the style of the prompt, not its semantic content.
+_BILINGUAL_PROMPT = (
+    "以下是一段繁體中文與英文混合的設計討論會議逐字稿。"
+    "我覺得這個 component 的 hover state 太 subtle 了。"
+    "我們等等 review 一下 design system 的 token。"
+    "Loki 的 Modal 要用 ModalHeader 包標題,不要直接放 ModalBody。"
+    "請 follow 既有的 pattern,不要自己造輪子。"
+)
 _sys_buf: list[np.ndarray] = []
 _mic_buf: list[np.ndarray] = []
 _buf_lock = threading.Lock()
@@ -64,18 +114,201 @@ def _append_line(line: str):
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def _read_config() -> dict:
+    try:
+        return json.loads(open(CONFIG_FILE).read())
+    except Exception:
+        return {}
+
+
+def _write_config(cfg: dict):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
+
+
 def load_api_key() -> str:
     if k := os.environ.get("GROQ_API_KEY", ""):
         return k
-    try:
-        return json.loads(open(CONFIG_FILE).read()).get("groq_api_key", "")
-    except Exception:
-        return ""
+    return _read_config().get("groq_api_key", "")
 
 
 def save_api_key(key: str):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({"groq_api_key": key}, f)
+    cfg = _read_config()
+    cfg["groq_api_key"] = key
+    _write_config(cfg)
+
+
+def load_backend() -> str:
+    return _read_config().get("backend", "cloud")
+
+
+def save_backend(backend: str):
+    cfg = _read_config()
+    cfg["backend"] = backend
+    _write_config(cfg)
+
+
+# ─── Local whisper backend ────────────────────────────────────────────────────
+
+def pick_local_model(language: str) -> str:
+    """Choose best local model for a given language.
+
+    - Mandarin/bilingual → Breeze ASR 25 (fine-tuned on Traditional Chinese,
+      noticeably better on code-switched zh/en).
+    - English / auto → general large-v3-turbo-q8_0.
+    """
+    if language in ("zh", "zh-en"):
+        return "breeze-q8"
+    return "large-v3-turbo-q8_0"
+
+
+def model_local_path(alias: str) -> Optional[str]:
+    """Return the cached on-disk path for *alias*, or None if not downloaded."""
+    from pywhispercpp.constants import MODELS_DIR
+
+    if alias not in MODEL_REGISTRY:
+        return None
+    repo, fname = MODEL_REGISTRY[alias]
+    owner, repo_name = repo.split("/")
+    # Match lazy-take-notes' layout so caches are shared.
+    if alias.startswith("breeze"):
+        candidate = os.path.join(MODELS_DIR, "breeze", fname)
+    elif alias.startswith("large-v3-turbo"):
+        # lazy-take-notes uses 'whisper-cpp', but pywhispercpp uses 'hf/owner__repo'
+        # We check both for compatibility.
+        candidates = [
+            os.path.join(MODELS_DIR, "whisper-cpp", fname),
+            os.path.join(MODELS_DIR, "hf", f"{owner}__{repo_name}", fname),
+        ]
+        return next((p for p in candidates if os.path.exists(p)), None)
+    else:
+        candidate = os.path.join(MODELS_DIR, "hf", f"{owner}__{repo_name}", fname)
+    return candidate if os.path.exists(candidate) else None
+
+
+def download_model(alias: str, on_progress=None) -> str:
+    """Download *alias* from HF Hub into MODELS_DIR. Returns local path."""
+    from huggingface_hub import hf_hub_download
+    from pywhispercpp.constants import MODELS_DIR
+
+    if alias not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model alias: {alias}")
+    repo, fname = MODEL_REGISTRY[alias]
+    owner, repo_name = repo.split("/")
+    if alias.startswith("breeze"):
+        cache_dir = os.path.join(MODELS_DIR, "breeze")
+    else:
+        cache_dir = os.path.join(MODELS_DIR, "hf", f"{owner}__{repo_name}")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    kwargs = dict(repo_id=repo, filename=fname, local_dir=cache_dir)
+    if on_progress:
+        kwargs["tqdm_class"] = _make_progress_tqdm(on_progress)
+    return hf_hub_download(**kwargs)
+
+
+def _make_progress_tqdm(callback):
+    """Build a tqdm-compatible class that pipes progress to *callback*(percent)."""
+    class _Progress:
+        def __init__(self, *args, **kwargs):
+            self.total = kwargs.get("total", 0) or 0
+            self.n = 0
+            if self.total > 0:
+                callback(0)
+        def update(self, n=1):
+            self.n += n
+            if self.total > 0:
+                callback(min(int(self.n / self.total * 100), 100))
+        def close(self): pass
+        def set_description(self, *a, **k): pass
+        def set_description_str(self, *a, **k): pass
+        def refresh(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): self.close()
+    return _Progress
+
+
+def get_local_model(alias: str):
+    """Return a loaded pywhispercpp.Model for *alias*. Loads on first use."""
+    with _local_models_lock:
+        if alias in _local_models:
+            return _local_models[alias]
+
+    path = model_local_path(alias)
+    if path is None:
+        raise FileNotFoundError(f"Model {alias} not downloaded")
+
+    from pywhispercpp.model import Model
+    # Suppress whisper.cpp's C-level stdout so it doesn't pollute Flask logs.
+    import contextlib
+
+    @contextlib.contextmanager
+    def _quiet():
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_out, old_err = os.dup(1), os.dup(2)
+        try:
+            os.dup2(devnull, 1); os.dup2(devnull, 2); yield
+        finally:
+            os.dup2(old_out, 1); os.dup2(old_err, 2)
+            os.close(devnull); os.close(old_out); os.close(old_err)
+
+    with _quiet():
+        m = Model(path, print_progress=False, print_realtime=False)
+
+    with _local_models_lock:
+        _local_models[alias] = m
+    return m
+
+
+def save_vocab(text: str):
+    """Persist user vocabulary. Empty text deletes the file."""
+    if not text.strip():
+        try:
+            os.unlink(VOCAB_FILE)
+        except FileNotFoundError:
+            pass
+        return
+    with open(VOCAB_FILE, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def read_vocab_raw() -> str:
+    """Return the raw vocab file contents (for the editor UI)."""
+    try:
+        with open(VOCAB_FILE, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def cleanup_orphan_tempfiles():
+    """Remove any mt_*.wav left in TMPDIR by previous crashed runs."""
+    tmp_dir = tempfile.gettempdir()
+    for name in os.listdir(tmp_dir):
+        if name.startswith("mt_") and name.endswith(".wav"):
+            try:
+                os.unlink(os.path.join(tmp_dir, name))
+            except OSError:
+                pass
+
+
+def load_vocab() -> str:
+    """Read user vocabulary from .vocab.local. Returns a comma-joined hint string
+    to be appended to Whisper's prompt, improving recognition of proper nouns
+    that aren't in the model's training distribution (brand names, internal
+    jargon, people)."""
+    try:
+        with open(VOCAB_FILE, encoding="utf-8") as f:
+            words = [
+                line.strip()
+                for line in f
+                if line.strip() and not line.strip().startswith("#")
+            ]
+    except FileNotFoundError:
+        return ""
+    if not words:
+        return ""
+    return "專有名詞:" + "、".join(words) + "。"
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -93,7 +326,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -121,13 +354,18 @@ def route_key():
 
 @app.route("/start", methods=["POST"])
 def route_start():
-    global _recording, _paused, _swift_proc, _mic_stream, _language
+    global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
 
     data = request.json or {}
     key = data.get("key", "").strip()
-    _language = data.get("language", "zh")
-    if not key:
-        return jsonify({"ok": False, "error": "No API key"})
+    _language = data.get("language", "zh-en")
+    _backend = data.get("backend", "cloud")
+    if _backend == "cloud" and not key:
+        return jsonify({"ok": False, "error": "No API key (required for cloud backend)"})
+    if _backend == "local":
+        alias = pick_local_model(_language)
+        if model_local_path(alias) is None:
+            return jsonify({"ok": False, "error": f"Local model not downloaded: {alias}"})
     if not os.path.exists(BINARY):
         return jsonify({"ok": False, "error": "Binary missing — run: cd native && swift build -c release"})
 
@@ -194,7 +432,7 @@ def route_upload():
         return jsonify({"ok": False, "error": "No file"})
 
     suffix = os.path.splitext(f.filename)[1] or ".wav"
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp = tempfile.NamedTemporaryFile(prefix="mt_", suffix=suffix, delete=False)
     f.save(tmp.name)
     fname = f.filename
 
@@ -203,10 +441,18 @@ def route_upload():
         _set_status(f"Transcribing {fname}…")
         try:
             client = Groq(api_key=key)
+            vocab = load_vocab()
             with open(tmp.name, "rb") as af:
                 kw = dict(model="whisper-large-v3-turbo", file=(fname, af))
-                if _language != "auto":
+                if _language == "zh-en":
+                    kw["language"] = "zh"
+                    kw["prompt"] = (_BILINGUAL_PROMPT + " " + vocab).strip()
+                elif _language != "auto":
                     kw["language"] = _language
+                    if vocab:
+                        kw["prompt"] = vocab
+                elif vocab:
+                    kw["prompt"] = vocab
                 result = client.audio.transcriptions.create(**kw)
             _append_line(f"[{ts}] [{fname}]\n{result.text.strip()}")
             _set_status("Upload transcribed.")
@@ -223,6 +469,82 @@ def route_upload():
 @app.route("/clear", methods=["POST"])
 def route_clear():
     _lines.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/vocab", methods=["GET"])
+def route_vocab_get():
+    return jsonify({"ok": True, "text": read_vocab_raw()})
+
+
+@app.route("/vocab", methods=["POST"])
+def route_vocab_post():
+    text = (request.json or {}).get("text", "")
+    save_vocab(text)
+    return jsonify({"ok": True})
+
+
+def _model_status_payload() -> dict:
+    """Return per-model {alias: {downloaded: bool, size_mb: int|None, path: str|None}}."""
+    out = {}
+    for alias in MODEL_REGISTRY:
+        path = model_local_path(alias)
+        out[alias] = {
+            "downloaded": path is not None,
+            "path": path,
+        }
+    return out
+
+
+@app.route("/backend", methods=["GET"])
+def route_backend_get():
+    return jsonify({
+        "ok": True,
+        "backend": load_backend(),
+        "models": _model_status_payload(),
+        "download": dict(_download_state),
+    })
+
+
+@app.route("/backend", methods=["POST"])
+def route_backend_post():
+    backend = (request.json or {}).get("backend", "cloud")
+    if backend not in ("cloud", "local"):
+        return jsonify({"ok": False, "error": "Invalid backend"})
+    save_backend(backend)
+    return jsonify({"ok": True, "backend": backend})
+
+
+@app.route("/model/download", methods=["POST"])
+def route_model_download():
+    """Kick off a background HF Hub download. Progress is exposed via /backend
+    (the SSE stream also broadcasts 'download' events)."""
+    alias = (request.json or {}).get("model", "")
+    if alias not in MODEL_REGISTRY:
+        return jsonify({"ok": False, "error": f"Unknown model: {alias}"})
+    with _download_lock:
+        if _download_state["active"]:
+            return jsonify({"ok": False, "error": "Another download in progress"})
+        _download_state.update({"active": True, "percent": 0, "model": alias, "error": ""})
+
+    def _on_progress(percent: int):
+        with _download_lock:
+            _download_state["percent"] = percent
+        _broadcast("download", dict(_download_state))
+
+    def _do():
+        try:
+            download_model(alias, on_progress=_on_progress)
+            with _download_lock:
+                _download_state.update({"active": False, "percent": 100})
+            _broadcast("download", dict(_download_state))
+            _broadcast("models", _model_status_payload())
+        except Exception as e:
+            with _download_lock:
+                _download_state.update({"active": False, "error": str(e)})
+            _broadcast("download", dict(_download_state))
+
+    threading.Thread(target=_do, daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -313,54 +635,238 @@ def _mix_buffers(sa: np.ndarray, ma: np.ndarray) -> np.ndarray:
     return np.clip(sa[:n] + ma[:n], -1.0, 1.0)
 
 
+def _should_trigger(buf_len: int) -> tuple[bool, str]:
+    """Decide whether to fire a transcription based on the merged buffer length.
+
+    Returns (trigger, reason). Reason is 'cap', 'pause', or '' (no trigger).
+    """
+    chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION)
+    pause_samples = int(SAMPLE_RATE * PAUSE_DURATION)
+    min_speech_samples = int(SAMPLE_RATE * MIN_SPEECH)
+
+    if buf_len >= chunk_samples:
+        return True, "cap"
+    if buf_len >= min_speech_samples + pause_samples:
+        return True, "pause-check"  # actual silence check needs the audio array
+    return False, ""
+
+
+def _is_pause_boundary(audio: np.ndarray) -> bool:
+    """Check whether the tail of *audio* is silent and the body had speech —
+    indicating a natural sentence boundary (lazy-take-notes' VAD heuristic)."""
+    pause_samples = int(SAMPLE_RATE * PAUSE_DURATION)
+    if len(audio) < pause_samples + int(SAMPLE_RATE * MIN_SPEECH):
+        return False
+    tail = audio[-pause_samples:]
+    body = audio[:-pause_samples]
+    tail_rms = float(np.sqrt(np.mean(tail ** 2)))
+    body_rms = float(np.sqrt(np.mean(body ** 2)))
+    return tail_rms < SILENCE_THRESHOLD and body_rms >= SILENCE_THRESHOLD
+
+
+def _build_prompt(vocab: str) -> str:
+    """Compose the Whisper conditioning prompt: vocab + bilingual style demo +
+    last segment(s) from the prompt chain (for cross-chunk continuity)."""
+    parts: list[str] = []
+    if vocab:
+        parts.append(vocab)
+    if _language == "zh-en":
+        parts.append(_BILINGUAL_PROMPT)
+    if _prompt_chain:
+        # Cap aggressively at 80 chars — longer context makes Whisper much more
+        # likely to enter a repetition loop on tokens that appear in the prompt.
+        parts.append(_prompt_chain[-1][-80:])
+    return " ".join(parts).strip()
+
+
+def _update_prompt_chain(text: str):
+    """Append the latest transcript to the prompt chain. Keep just 1 entry —
+    feeding more risks Whisper entering a repetition loop (it treats the prompt
+    as a continuation context and can fixate on tokens it sees there)."""
+    if not text:
+        return
+    _prompt_chain.clear()
+    _prompt_chain.append(text)
+
+
+_SENT_SPLIT_RE = re.compile(r'(?<=[。\.!?！？])\s*')
+
+
+def _trim_repetition(text: str, max_repeat: int = 2) -> str:
+    """Trim consecutive sentence-level repetitions in *text*.
+
+    Whisper's repetition-loop failure mode emits the same phrase N times in a
+    row when it loses confidence (often primed by a prompt token). This keeps
+    at most ``max_repeat`` consecutive copies of each sentence.
+    """
+    parts = [p for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+    if len(parts) < 2:
+        return text
+    out: list[str] = []
+    prev = None
+    count = 0
+    for p in parts:
+        norm = p.strip().lower()
+        if norm == prev:
+            count += 1
+            if count > max_repeat:
+                continue
+        else:
+            prev = norm
+            count = 1
+        out.append(p)
+    return ' '.join(out)
+
+
+def _is_repetition_loop(text: str) -> bool:
+    """True if *text* contains 3+ consecutive identical sentences (the
+    signature of a Whisper repetition loop). Used to suppress prompt-chain
+    propagation so the next chunk isn't primed with poisonous context."""
+    parts = [p.strip().lower() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+    if len(parts) < 3:
+        return False
+    prev, count = None, 0
+    for p in parts:
+        if p == prev:
+            count += 1
+            if count >= 3:
+                return True
+        else:
+            prev, count = p, 1
+    return False
+
+
 def _chunk_worker(api_key: str):
-    target = SAMPLE_RATE * CHUNK_SECONDS
+    """Silence-aware chunk loop (ported from lazy-take-notes).
+
+    Fires a transcription whenever EITHER the merged buffer hits CHUNK_DURATION
+    (hard cap when speech is continuous) OR the tail goes silent for
+    PAUSE_DURATION (natural sentence boundary).
+
+    After triggering, OVERLAP seconds are retained as the head of the next chunk
+    so the transcriber gets context bleed across boundaries.
+    """
+    overlap_samples = int(SAMPLE_RATE * OVERLAP)
+
+    _prompt_chain.clear()
+
     while _recording:
-        time.sleep(1)
+        time.sleep(0.3)
         if _paused:
             continue
 
         with _buf_lock:
             sys_len = sum(len(x) for x in _sys_buf)
             mic_len = sum(len(x) for x in _mic_buf)
-            # Trigger when the longer of the two buffers reaches target
-            # (allows mic-only if system audio isn't available)
-            primary = mic_len if sys_len == 0 else (sys_len if mic_len == 0 else min(sys_len, mic_len))
-            if primary < target:
-                continue
+            buf_len = sys_len if sys_len else mic_len  # whichever is active
 
-            sys_full = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
-            mic_full = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
-            _sys_buf[:] = [sys_full[target:]] if len(sys_full) > target else []
-            _mic_buf[:] = [mic_full[target:]] if len(mic_full) > target else []
+        trigger, reason = _should_trigger(buf_len)
+        if not trigger:
+            continue
 
-        mixed = _mix_buffers(sys_full[:target], mic_full[:target])
-        threading.Thread(target=_transcribe, args=(mixed, api_key), daemon=True).start()
+        # Take a snapshot of the merged buffer (peek; don't consume yet).
+        with _buf_lock:
+            sa = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
+            ma = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
+        mixed = _mix_buffers(sa, ma)
+
+        if reason == "pause-check" and not _is_pause_boundary(mixed):
+            continue  # tail not actually silent — keep accumulating
+
+        # Overlap retention strategy:
+        #  - 'cap' (hit 25 s with continuous speech): retain overlap so the next
+        #    chunk has context for what was mid-sentence.
+        #  - 'pause-check' (sentence ended naturally at silence): DON'T retain.
+        #    The overlap would carry a stale-speech tail into the next buffer,
+        #    which combined with following silence triggers a phantom chunk
+        #    of mostly-silent audio → Whisper hallucinates.
+        if reason == "cap":
+            with _buf_lock:
+                _sys_buf[:] = [sa[-overlap_samples:]] if len(sa) > overlap_samples else []
+                _mic_buf[:] = [ma[-overlap_samples:]] if len(ma) > overlap_samples else []
+        else:
+            with _buf_lock:
+                _sys_buf.clear()
+                _mic_buf.clear()
+
+        threading.Thread(
+            target=_transcribe, args=(mixed, api_key), daemon=True
+        ).start()
 
     # flush remaining audio after stop
     with _buf_lock:
         sa = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
         ma = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
+        _sys_buf.clear()
+        _mic_buf.clear()
     audio = _mix_buffers(sa, ma)
     if len(audio) > SAMPLE_RATE // 2:  # at least 0.5 s
         _transcribe(audio, api_key)
 
 
 def _transcribe(audio: np.ndarray, api_key: str):
+    """Transcribe *audio*, dispatching to cloud (Groq) or local (whisper.cpp)
+    based on `_backend`."""
     global _transcribing
-    # Skip silent chunks to prevent Whisper hallucinations
+
+    # Two-layer silence gate against Whisper hallucination on near-silent input:
+    #   (1) Overall RMS too low → entire chunk is quiet.
+    #   (2) Voice-activity ratio: fraction of 100ms frames that exceed the
+    #       speech threshold. Whisper is prone to inventing content when fed
+    #       audio that has a brief speech burst followed by long silence —
+    #       require at least 25% of the chunk to be "active" frames.
     rms = float(np.sqrt(np.mean(audio ** 2)))
-    if rms < 0.005:
+    if rms < 0.01:
         if _recording:
             _set_status("Recording…")
         return
+
+    frame = int(SAMPLE_RATE * 0.1)  # 100 ms frames
+    if len(audio) >= frame * 4:
+        frame_count = len(audio) // frame
+        frames = audio[: frame_count * frame].reshape(frame_count, frame)
+        frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
+        active_ratio = float(np.mean(frame_rms > SILENCE_THRESHOLD))
+        if active_ratio < 0.25:
+            if _recording:
+                _set_status("Recording…")
+            return
 
     ts = datetime.now().strftime("%H:%M:%S")
     _transcribing = True
     _broadcast("transcribing", True)
     _set_status(f"Transcribing [{ts}]…")
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    vocab = load_vocab()
+    prompt = _build_prompt(vocab)
+
+    try:
+        if _backend == "local":
+            text = _transcribe_local(audio, prompt)
+        else:
+            text = _transcribe_cloud(audio, api_key, prompt)
+
+        text = (text or "").strip()
+        if text:
+            cleaned = _trim_repetition(text)
+            _append_line(f"[{ts}] {cleaned}")
+            # If the result still shows a repetition loop after trimming, the
+            # chunk was unreliable — don't poison the next chunk's prompt chain.
+            if not _is_repetition_loop(text):
+                _update_prompt_chain(cleaned)
+    except Exception as e:
+        _append_line(f"[{ts}] Error: {e}")
+    finally:
+        _transcribing = False
+        _broadcast("transcribing", False)
+
+    if _recording:
+        _set_status("Recording…")
+
+
+def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
+    """Cloud backend — Groq Whisper API."""
+    tmp = tempfile.NamedTemporaryFile(prefix="mt_", suffix=".wav", delete=False)
     tmp.close()
     try:
         with wave.open(tmp.name, "wb") as wf:
@@ -369,32 +875,72 @@ def _transcribe(audio: np.ndarray, api_key: str):
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
-        kwargs = dict(model="whisper-large-v3-turbo", file=("chunk.wav", open(tmp.name, "rb"), "audio/wav"))
-        if _language != "auto":
+        kwargs: dict = dict(model="whisper-large-v3-turbo")
+        if _language == "zh-en":
+            kwargs["language"] = "zh"
+        elif _language != "auto":
             kwargs["language"] = _language
+        if prompt:
+            kwargs["prompt"] = prompt
 
         with open(tmp.name, "rb") as f:
             kwargs["file"] = ("chunk.wav", f, "audio/wav")
             result = Groq(api_key=api_key).audio.transcriptions.create(**kwargs)
-
-        text = result.text.strip()
-        if text:
-            _append_line(f"[{ts}] {text}")
-    except Exception as e:
-        _append_line(f"[{ts}] Error: {e}")
+        return result.text
     finally:
         os.unlink(tmp.name)
-        _transcribing = False
-        _broadcast("transcribing", False)
 
-    if _recording:
-        _set_status("Recording…")
+
+def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
+    """Local backend — pywhispercpp on-device inference."""
+    alias = pick_local_model(_language)
+    model = get_local_model(alias)
+
+    kwargs: dict = {}
+    if _language == "zh-en":
+        kwargs["language"] = "zh"
+    elif _language != "auto":
+        kwargs["language"] = _language
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+
+    # pywhispercpp expects float32 numpy at 16kHz mono — which is exactly our
+    # internal format, so no resampling needed.
+    segments = model.transcribe(audio.astype(np.float32), **kwargs)
+    return " ".join(s.text.strip() for s in segments if s.text.strip())
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import webview
+
+    cleanup_orphan_tempfiles()
+
+    class JSAPI:
+        """Bridge exposed to the webview JS as `window.pywebview.api`."""
+
+        def save_transcript(self):
+            """Show native macOS save dialog and write transcript to chosen path."""
+            if not _lines:
+                return {"ok": False, "error": "Nothing to save"}
+            default_name = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            win = webview.windows[0] if webview.windows else None
+            if not win:
+                return {"ok": False, "error": "Window not ready"}
+            result = win.create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename=default_name,
+            )
+            if not result:
+                return {"ok": False, "cancelled": True}
+            path = result if isinstance(result, str) else result[0]
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(_lines))
+                return {"ok": True, "path": path}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
 
     # Flask runs in a daemon thread; dies automatically when the window closes
     threading.Thread(
@@ -406,9 +952,10 @@ if __name__ == "__main__":
     window = webview.create_window(
         "Meeting Transcriber",
         f"http://localhost:{PORT}",
-        width=820,
-        height=660,
-        min_size=(600, 440),
+        width=1000,
+        height=680,
+        min_size=(720, 440),
+        js_api=JSAPI(),
     )
     webview.start()
     # webview.start() blocks until window is closed — process exits cleanly

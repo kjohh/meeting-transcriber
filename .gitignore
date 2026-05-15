@@ -1,5 +1,7 @@
 native/.build/
 .config.json
+.vocab.local
+.pip-install.log
 .DS_Store
 __pycache__/
 *.pyc

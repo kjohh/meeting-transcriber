@@ -92,7 +92,8 @@ button {
   transition: filter .12s;
 }
 button:hover:not(:disabled) { filter: brightness(0.88); }
-button:disabled { opacity: 0.38; cursor: default; }
+button:disabled,
+select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
 .btn-start  { background: var(--green);  color: #fff; }
 .btn-stop   { background: var(--red);    color: #fff; }
@@ -100,29 +101,38 @@ button:disabled { opacity: 0.38; cursor: default; }
 
 .divider { width: 1px; height: 20px; background: var(--border); }
 
-/* ── meters ── */
-.meters {
+/* ── audio waveform — small, centered, CSS-transitioned for smoothness ── */
+.audio-wave {
   display: none;
-  gap: 10px;
-  align-items: center;
-  padding: 8px 2px 2px;
+  align-items: center;   /* bars grow up+down from middle line */
+  gap: 2px;
+  height: 18px;
+  padding: 6px 4px;
 }
-.meters.visible { display: flex; }
-.meter-row { display: flex; align-items: center; gap: 7px; flex: 1; }
-.meter-label { font-size: 11px; color: var(--text2); width: 26px; text-align: right; flex-shrink: 0; }
-.meter-canvas { flex: 1; height: 28px; border-radius: 6px; }
+.audio-wave.visible { display: flex; }
+.audio-wave .wave-bar {
+  width: 2px;
+  height: 2px;
+  background: #34c759;
+  border-radius: 1px;
+  /* Short transition smooths each frame's height change without lagging
+     behind the 30fps RAF scroll. */
+  transition: height 0.08s linear;
+}
 
 /* ── transcribing indicator ── */
 .loading-bar {
-  display: none;
+  display: block;
   height: 3px;
   background: var(--surface2);
   border-radius: 2px;
   overflow: hidden;
   flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.2s;
 }
-.loading-bar.active { display: block; }
-.loading-bar::after {
+.loading-bar.active { opacity: 1; }
+.loading-bar.active::after {
   content: '';
   display: block;
   height: 100%;
@@ -158,8 +168,49 @@ button:disabled { opacity: 0.38; cursor: default; }
   font-size: 14px; line-height: 1.65;
   white-space: pre-wrap; word-break: break-word;
   color: var(--text);
+  user-select: text; -webkit-user-select: text; cursor: text;
 }
 #transcript .ts { color: var(--text2); font-size: 12px; user-select: none; }
+.transcript-header { display: flex; align-items: center; }
+.btn-copy {
+  margin-left: auto; height: 26px; padding: 0 10px;
+  border-radius: var(--r); border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text);
+  font-size: 12px; cursor: pointer;
+}
+.btn-copy:hover { background: var(--border); }
+
+/* ── modal ── */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  display: none; align-items: center; justify-content: center; z-index: 10;
+}
+.modal-backdrop.open { display: flex; }
+.modal {
+  background: var(--surface); border-radius: 10px;
+  width: 520px; max-width: 90vw; max-height: 80vh;
+  display: flex; flex-direction: column; box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+}
+.modal-header {
+  padding: 14px 18px; border-bottom: 1px solid var(--border);
+  font-weight: 600; font-size: 14px;
+}
+.modal-body { padding: 14px 18px; flex: 1; overflow-y: auto; }
+.modal-body .hint { font-size: 12px; color: var(--text2); margin-bottom: 8px; line-height: 1.5; }
+.modal-body textarea {
+  width: 100%; height: 280px; padding: 10px;
+  border-radius: var(--r); border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px; line-height: 1.5; resize: vertical;
+}
+.modal-footer {
+  padding: 12px 18px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; justify-content: flex-end;
+}
+.modal-footer button { height: 30px; padding: 0 14px; font-size: 13px; }
+.btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+.btn-primary   { background: var(--accent); color: #fff; }
 
 /* ── status ── */
 .status-bar {
@@ -190,33 +241,82 @@ button:disabled { opacity: 0.38; cursor: default; }
 </div>
 
 <div class="btn-row">
-  <button id="btn-start" class="btn-start" onclick="startRecording()">● Start</button>
-  <button id="btn-pause" disabled onclick="togglePause()">⏸ Pause</button>
-  <button id="btn-stop"  disabled class="btn-stop" onclick="stopRecording()">■ Stop</button>
+  <button id="btn-record" class="btn-start" onclick="onRecordClick()">● Start</button>
+  <button id="btn-new" onclick="newSession()" title="End current session and start fresh">↻ New</button>
   <div class="divider"></div>
   <select id="lang-select" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
+    <option value="zh-en">中英混合</option>
     <option value="zh">中文</option>
     <option value="en">English</option>
     <option value="auto">Auto</option>
   </select>
+  <select id="backend-select" onchange="onBackendChange()" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
+    <option value="cloud">☁ Cloud (Groq)</option>
+    <option value="local">💻 Local (whisper.cpp)</option>
+  </select>
   <div class="divider"></div>
-  <button onclick="document.getElementById('upload-input').click()">↑ Upload file</button>
+  <button id="btn-upload" onclick="document.getElementById('upload-input').click()">↑ Upload file</button>
   <input type="file" id="upload-input" accept="audio/*,video/*" onchange="uploadFile(this)">
-  <button onclick="clearTranscript()">Clear</button>
-  <button class="btn-save" onclick="saveTranscript()">Save .txt</button>
+  <button id="btn-vocab" onclick="openVocab()">Vocab</button>
+  <button id="btn-save" class="btn-save" onclick="saveTranscript()">Save .txt</button>
 </div>
 
-<div class="meters" id="meters">
-  <div class="meter-row">
-    <span class="meter-label">IN</span>
-    <canvas class="meter-canvas" id="canvas-audio"></canvas>
+<div class="modal-backdrop" id="model-modal">
+  <div class="modal">
+    <div class="modal-header">Download Local Model</div>
+    <div class="modal-body">
+      <div class="hint" id="model-modal-hint">
+        Local backend needs a Whisper model on disk. The file lives in
+        <code>~/Library/Application Support/pywhispercpp/models/</code> and is
+        shared with lazy-take-notes if you also use that.
+      </div>
+      <div id="model-list" style="display:flex;flex-direction:column;gap:8px;margin-top:10px"></div>
+      <div id="download-progress" style="display:none;margin-top:14px">
+        <div style="font-size:12px;color:var(--text2);margin-bottom:4px" id="download-label"></div>
+        <div style="background:var(--surface2);border-radius:3px;height:6px;overflow:hidden">
+          <div id="download-bar" style="height:100%;width:0%;background:var(--accent);transition:width 0.2s"></div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeModelModal()">Close</button>
+    </div>
   </div>
+</div>
+
+<div class="modal-backdrop" id="vocab-modal">
+  <div class="modal">
+    <div class="modal-header">Custom Vocabulary</div>
+    <div class="modal-body">
+      <div class="hint">
+        每行一個專有名詞 / 品牌 / 縮寫。# 開頭為註解。<br>
+        儲存後立即生效（下次 chunk 轉錄就會用到），檔案存在本機，已 git-ignored。
+      </div>
+      <textarea id="vocab-textarea" placeholder="GoFreight&#10;Loki&#10;HBL"></textarea>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeVocab()">Cancel</button>
+      <button class="btn-primary" onclick="saveVocab()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="audio-wave" id="audio-wave">
+  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+  <span class="wave-bar"></span>
 </div>
 
 <div class="loading-bar" id="loading-bar"></div>
 
 <div class="transcript-card" id="transcript-card" style="display:none">
-  <div class="transcript-header">Transcript</div>
+  <div class="transcript-header">
+    Transcript
+    <button class="btn-copy" onclick="copyTranscript()">Copy all</button>
+  </div>
   <div id="transcript"></div>
 </div>
 
@@ -229,42 +329,29 @@ button:disabled { opacity: 0.38; cursor: default; }
 <script>
 let recording = false, paused = false;
 
-// ── Waveform meters ──
-const BARS = 40;
-const audioHistory = new Array(BARS).fill(0);
+// ── Audio waveform — short centered bars, RAF-driven so scroll stays smooth
+//    even though SSE level events only fire ~5x/sec.
+const WAVE_BARS = 16;
+const waveHistory = new Array(WAVE_BARS).fill(0);
+let _latestLevel = 0;
+let _lastWaveTick = 0;
 
-function drawMeter(canvasId, history, color) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  // Use parent width for reliable sizing
-  const parentW = canvas.parentElement ? canvas.parentElement.clientWidth : 0;
-  const w = Math.max(10, parentW - 44);  // subtract label + gap
-  const h = 28;
-  if (canvas.width !== w) canvas.width = w;
-  if (canvas.height !== h) canvas.height = h;
-  ctx.clearRect(0, 0, w, h);
-  const barW = w / BARS - 1;
-  for (let i = 0; i < BARS; i++) {
-    const level = history[i];
-    const barH = Math.max(2, level * h);
-    const alpha = 0.35 + level * 0.65;
-    ctx.fillStyle = color.replace('A', Math.round(alpha * 255).toString(16).padStart(2,'0'));
-    ctx.beginPath();
-    ctx.roundRect(i * (barW + 1), (h - barH) / 2, barW, barH, 2);
-    ctx.fill();
+function setAudioLevel(level) { _latestLevel = level; }
+
+function _tickWave(now) {
+  if (now - _lastWaveTick > 33) {        // ~30 fps scroll
+    _lastWaveTick = now;
+    waveHistory.push(_latestLevel);
+    waveHistory.shift();
+    const bars = document.querySelectorAll('#audio-wave .wave-bar');
+    for (let i = 0; i < bars.length; i++) {
+      const h = Math.max(2, Math.min(16, waveHistory[i] * 32));
+      bars[i].style.height = h + 'px';
+    }
   }
+  requestAnimationFrame(_tickWave);
 }
-
-function pushLevel(history, value) {
-  history.push(value); history.shift();
-}
-
-// Redraw ~30fps when recording
-setInterval(() => {
-  if (!recording || paused) return;
-  drawMeter('canvas-audio', audioHistory, '#34c759AA');
-}, 33);
+requestAnimationFrame(_tickWave);
 
 /* ── SSE ── */
 const es = new EventSource('/events');
@@ -276,6 +363,8 @@ es.onmessage = ({data}) => {
       showKeySaved();
     }
     if (msg.language) document.getElementById('lang-select').value = msg.language;
+    if (msg.backend) document.getElementById('backend-select').value = msg.backend;
+    if (msg.models) modelStatus = msg.models;
     document.getElementById('transcript').innerHTML = '';
     msg.lines.forEach(l => appendLine(l));
     if (!msg.lines.length) {
@@ -283,6 +372,11 @@ es.onmessage = ({data}) => {
       document.getElementById('transcript-empty').style.display = 'flex';
     }
     recording = msg.recording; paused = msg.paused; sync();
+  } else if (msg.type === 'download') {
+    handleDownloadEvent(msg.data);
+  } else if (msg.type === 'models') {
+    modelStatus = msg.data;
+    renderModelList();
   } else if (msg.type === 'transcript') {
     appendLine(msg.data);
   } else if (msg.type === 'status') {
@@ -290,7 +384,7 @@ es.onmessage = ({data}) => {
   } else if (msg.type === 'state') {
     recording = msg.data.recording; paused = msg.data.paused; sync();
   } else if (msg.type === 'level') {
-    pushLevel(audioHistory, Math.max(msg.data.mic || 0, msg.data.sys || 0));
+    setAudioLevel(Math.max(msg.data.mic || 0, msg.data.sys || 0));
   } else if (msg.type === 'transcribing') {
     document.getElementById('loading-bar').className = 'loading-bar' + (msg.data ? ' active' : '');
   }
@@ -317,17 +411,49 @@ function appendLine(text) {
 }
 
 function sync() {
-  document.getElementById('btn-start').disabled = recording;
-  document.getElementById('btn-pause').disabled = !recording;
-  document.getElementById('btn-stop').disabled  = !recording;
-  document.getElementById('btn-pause').textContent = paused ? '▶ Resume' : '⏸ Pause';
+  // ── Record toggle (Start → Pause → Resume) ──
+  const btn = document.getElementById('btn-record');
+  if (!recording) {
+    btn.textContent = '● Start';
+    btn.className = 'btn-start';
+  } else if (paused) {
+    btn.textContent = '▶ Resume';
+    btn.className = 'btn-start';
+  } else {
+    btn.textContent = '⏸ Pause';
+    btn.className = '';
+  }
+
+  // ── State machine for everything else ──
+  //   Idle     : nothing recorded, full freedom to configure + start
+  //   Active   : recording in progress — lock everything except the record toggle
+  //   Paused   : session ongoing but recording halted — selectors stay locked
+  //              (changes wouldn't apply mid-session anyway), but Save / New
+  //              re-enable so the user can checkpoint or end the session.
+  const sessionInProgress = recording;          // true in Active OR Paused
+  const activeRecording   = recording && !paused;
+  const transcriptEmpty   = document.querySelectorAll('#transcript > div').length === 0;
+
+  // Selectors: locked for the entire session — only Idle or after New unlocks.
+  document.getElementById('lang-select').disabled    = sessionInProgress;
+  document.getElementById('backend-select').disabled = sessionInProgress;
+
+  // Buttons that have no meaningful behavior mid-session.
+  document.getElementById('btn-upload').disabled = sessionInProgress;
+  document.getElementById('btn-vocab').disabled  = sessionInProgress;
+
+  // Save + New: usable in Paused (checkpoint / end), off during Active recording
+  // and Idle-empty (nothing to save / end).
+  document.getElementById('btn-save').disabled = activeRecording || transcriptEmpty;
+  document.getElementById('btn-new').disabled  = activeRecording || transcriptEmpty;
+
   const badge = document.getElementById('badge');
   badge.textContent = recording ? (paused ? 'Paused' : 'Recording') : 'Idle';
   badge.className = 'badge' + (recording && !paused ? ' recording' : paused ? ' paused' : '');
-  document.getElementById('meters').className = 'meters' + (recording && !paused ? ' visible' : '');
-  if (recording && !paused) requestAnimationFrame(() => { drawMeter('canvas-audio', audioHistory, '#34c759AA'); });
+  document.getElementById('audio-wave').className = 'audio-wave' + (recording && !paused ? ' visible' : '');
   if (!recording) {
-    audioHistory.fill(0);
+    waveHistory.fill(0);
+    document.querySelectorAll('#audio-wave .wave-bar').forEach(b => b.style.height = '2px');
     document.getElementById('loading-bar').className = 'loading-bar';
   }
 }
@@ -352,13 +478,130 @@ function saveKey() {
   showKeySaved();
 }
 
+function onRecordClick() {
+  // Single button cycles Start → Pause → Resume.
+  if (!recording) {
+    startRecording();
+  } else {
+    // Toggle pause/resume — server endpoint /pause does the same toggle.
+    fetch('/pause', {method:'POST'});
+  }
+}
+
 function startRecording() {
-  const key = getKey();
-  if (!key) { setStatus('Enter your Groq API key first.'); return; }
   const language = document.getElementById('lang-select').value;
-  fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, language})})
+  const backend  = document.getElementById('backend-select').value;
+  const key      = getKey();
+
+  if (backend === 'cloud' && !key) {
+    setStatus('Enter your Groq API key first (or switch to Local backend).'); return;
+  }
+  if (backend === 'local') {
+    const required = (language === 'zh' || language === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
+    if (!modelStatus[required] || !modelStatus[required].downloaded) {
+      setStatus('Local model not downloaded — opening download dialog.');
+      openModelModal(required);
+      return;
+    }
+  }
+
+  fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, language, backend})})
     .then(r => r.json())
     .then(d => { if (!d.ok) setStatus('Error: ' + d.error); });
+}
+
+function newSession() {
+  // End current recording (if any) and clear the transcript.
+  // The model+backend selectors unlock automatically via sync().
+  fetch('/stop', {method:'POST'})
+    .then(() => fetch('/clear', {method:'POST'}))
+    .then(() => {
+      document.getElementById('transcript').innerHTML = '';
+      document.getElementById('transcript-card').style.display = 'none';
+      document.getElementById('transcript-empty').style.display = 'flex';
+      setStatus('Ready for a new session.');
+      sync();
+    });
+}
+
+/* ── Backend / model management ── */
+let modelStatus = {};
+
+function onBackendChange() {
+  const backend = document.getElementById('backend-select').value;
+  fetch('/backend', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({backend})})
+    .then(r => r.json())
+    .then(() => setStatus('Backend: ' + (backend === 'local' ? 'Local (whisper.cpp)' : 'Cloud (Groq)')));
+  if (backend === 'local') {
+    const lang = document.getElementById('lang-select').value;
+    const required = (lang === 'zh' || lang === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
+    if (!modelStatus[required] || !modelStatus[required].downloaded) {
+      openModelModal(required);
+    }
+  }
+}
+
+function openModelModal(highlight) {
+  renderModelList(highlight);
+  document.getElementById('model-modal').classList.add('open');
+}
+function closeModelModal() {
+  document.getElementById('model-modal').classList.remove('open');
+}
+
+function renderModelList(highlight) {
+  const labels = {
+    'large-v3-turbo-q8_0': {name: 'large-v3-turbo (general, multilingual)', size: '834 MB'},
+    'breeze-q8':           {name: 'Breeze ASR 25 (繁中 + 中英夾雜強化)',    size: '1.5 GB'},
+  };
+  const root = document.getElementById('model-list');
+  root.innerHTML = '';
+  Object.keys(labels).forEach(alias => {
+    const info = labels[alias];
+    const downloaded = modelStatus[alias] && modelStatus[alias].downloaded;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--border);border-radius:var(--r);' + (highlight === alias ? 'background:var(--surface2);' : '');
+    row.innerHTML = `
+      <div style="flex:1">
+        <div style="font-size:13px">${info.name}</div>
+        <div style="font-size:11px;color:var(--text2)">${alias} · ${info.size}</div>
+      </div>
+      <div>${downloaded
+        ? '<span style="color:var(--green);font-size:12px">✓ Downloaded</span>'
+        : `<button class="btn-primary" style="height:28px;padding:0 12px;font-size:12px" onclick="downloadModel('${alias}')">Download</button>`}</div>
+    `;
+    root.appendChild(row);
+  });
+}
+
+function downloadModel(alias) {
+  fetch('/model/download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model: alias})})
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) { setStatus('Download error: ' + d.error); return; }
+      document.getElementById('download-progress').style.display = 'block';
+      document.getElementById('download-label').textContent = 'Downloading ' + alias + '…';
+    });
+}
+
+function handleDownloadEvent(state) {
+  const bar = document.getElementById('download-bar');
+  const label = document.getElementById('download-label');
+  const wrap = document.getElementById('download-progress');
+  if (!state.active && state.error) {
+    label.textContent = 'Error: ' + state.error;
+    return;
+  }
+  if (state.active) {
+    wrap.style.display = 'block';
+    bar.style.width = state.percent + '%';
+    label.textContent = 'Downloading ' + state.model + '… ' + state.percent + '%';
+  } else if (state.percent === 100) {
+    bar.style.width = '100%';
+    label.textContent = '✓ ' + state.model + ' downloaded';
+    // Refresh model list state
+    fetch('/backend').then(r => r.json()).then(d => { modelStatus = d.models; renderModelList(); });
+  }
 }
 
 function togglePause() { fetch('/pause', {method:'POST'}); }
@@ -381,7 +624,48 @@ function clearTranscript() {
   fetch('/clear', {method:'POST'});
 }
 
-function saveTranscript() { window.location.href = '/transcript'; }
+function openVocab() {
+  fetch('/vocab').then(r => r.json()).then(d => {
+    document.getElementById('vocab-textarea').value = d.text || '';
+    document.getElementById('vocab-modal').classList.add('open');
+    document.getElementById('vocab-textarea').focus();
+  });
+}
+function closeVocab() {
+  document.getElementById('vocab-modal').classList.remove('open');
+}
+function saveVocab() {
+  const text = document.getElementById('vocab-textarea').value;
+  fetch('/vocab', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})})
+    .then(r => r.json())
+    .then(() => {
+      closeVocab();
+      setStatus('Vocabulary saved.');
+    });
+}
+
+function copyTranscript() {
+  const text = document.getElementById('transcript').innerText;
+  if (!text.trim()) { setStatus('Nothing to copy.'); return; }
+  navigator.clipboard.writeText(text).then(
+    () => setStatus('Copied transcript to clipboard.'),
+    () => setStatus('Copy failed.')
+  );
+}
+
+function saveTranscript() {
+  // Prefer native save dialog via pywebview bridge; fall back to HTTP download
+  // when opened in a plain browser (no pywebview).
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.save_transcript) {
+    window.pywebview.api.save_transcript().then(r => {
+      if (r.ok)               setStatus('Saved: ' + r.path);
+      else if (r.cancelled)   setStatus('Save cancelled.');
+      else                    setStatus('Save failed: ' + (r.error || 'unknown'));
+    });
+  } else {
+    window.location.href = '/transcript';
+  }
+}
 function setStatus(msg)    { document.getElementById('status').textContent = msg; }
 </script>
 </body>
