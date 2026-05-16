@@ -61,19 +61,6 @@ body {
 
 @keyframes blink { 0%,100% { opacity:1 } 50% { opacity:.4 } }
 
-/* ── key row ── */
-.key-row { display: flex; gap: 8px; align-items: center; }
-.key-row label { font-size: 13px; color: var(--text2); white-space: nowrap; }
-
-.key-saved {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 13px; color: var(--text2);
-}
-.key-saved .dot-ok {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--green); display: inline-block;
-}
-
 input[type="password"] {
   flex: 1; height: 32px; padding: 0 10px;
   background: var(--surface); border: 1px solid var(--border);
@@ -239,17 +226,6 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   <span class="badge" id="badge">Idle</span>
 </div>
 
-<div class="key-row" id="key-input-row">
-  <label>Groq API Key</label>
-  <input type="password" id="api-key" placeholder="gsk_…" autocomplete="off" spellcheck="false">
-  <button onclick="saveKey()">Save</button>
-</div>
-<div class="key-saved" id="key-saved-row" style="display:none">
-  <span class="dot-ok"></span>
-  <span>API key set</span>
-  <button onclick="showKeyInput()" style="height:24px;padding:0 10px;font-size:12px">Change</button>
-</div>
-
 <div class="btn-row">
   <button id="btn-record" class="btn-start" onclick="onRecordClick()">● Start</button>
   <button id="btn-new" onclick="newSession()" title="End current session and start fresh">↻ New</button>
@@ -350,7 +326,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   <span style="font-size:13px;color:var(--text2)">Transcript will appear here once recording starts</span>
 </div>
 
-<div class="status-bar" id="status">Ready — enter your Groq API key and press Start</div>
+<div class="status-bar" id="status">Ready — press ● Start to begin recording</div>
 
 <script>
 let recording = false, paused = false;
@@ -380,14 +356,12 @@ function _tickWave(now) {
 requestAnimationFrame(_tickWave);
 
 /* ── SSE ── */
+let cachedKey = '';
 const es = new EventSource('/events');
 es.onmessage = ({data}) => {
   const msg = JSON.parse(data);
   if (msg.type === 'init') {
-    if (msg.key) {
-      document.getElementById('api-key').value = msg.key;
-      showKeySaved();
-    }
+    if (msg.key) cachedKey = msg.key;
     if (msg.language) document.getElementById('lang-select').value = msg.language;
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
     if (msg.models) modelStatus = msg.models;
@@ -484,25 +458,7 @@ function sync() {
   }
 }
 
-function getKey() { return document.getElementById('api-key').value.trim(); }
-
-function showKeyInput() {
-  document.getElementById('key-input-row').style.display = 'flex';
-  document.getElementById('key-saved-row').style.display = 'none';
-  document.getElementById('api-key').focus();
-}
-
-function showKeySaved() {
-  document.getElementById('key-input-row').style.display = 'none';
-  document.getElementById('key-saved-row').style.display = 'flex';
-}
-
-function saveKey() {
-  const key = getKey();
-  if (!key) { setStatus('No key to save.'); return; }
-  fetch('/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})});
-  showKeySaved();
-}
+function getKey() { return cachedKey; }
 
 function onRecordClick() {
   // Single button cycles Start → Pause → Resume.
@@ -593,9 +549,7 @@ function saveKeyFromSettings() {
   if (!key) { setStatus('Empty key — not saved.'); return; }
   fetch('/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})})
     .then(() => {
-      // Sync the legacy front-page input too
-      document.getElementById('api-key').value = key;
-      showKeySaved();
+      cachedKey = key;
       setStatus('API key saved.');
     });
 }
