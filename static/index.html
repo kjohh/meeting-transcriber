@@ -212,6 +212,16 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
 .btn-primary   { background: var(--accent); color: #fff; }
 
+/* Settings modal sections */
+.settings-section { padding: 4px 0 14px; }
+.settings-section + .settings-section { border-top: 1px solid var(--border); padding-top: 14px; margin-top: 6px; }
+.settings-section-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.settings-section .hint code {
+  background: var(--surface2); padding: 1px 5px; border-radius: 3px;
+  font-size: 11px;
+}
+.settings-section-highlight { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: var(--r); transition: outline 0.4s; }
+
 /* ── status ── */
 .status-bar {
   font-size: 12px; color: var(--text2);
@@ -259,27 +269,43 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   <input type="file" id="upload-input" accept="audio/*,video/*" onchange="uploadFile(this)">
   <button id="btn-vocab" onclick="openVocab()">Vocab</button>
   <button id="btn-save" class="btn-save" onclick="saveTranscript()">Save .txt</button>
+  <button id="btn-settings" onclick="openSettings()" title="Settings" aria-label="Settings" style="margin-left:6px;width:32px;padding:0;font-size:16px">⚙</button>
 </div>
 
-<div class="modal-backdrop" id="model-modal">
-  <div class="modal">
-    <div class="modal-header">Download Local Model</div>
+<div class="modal-backdrop" id="settings-modal">
+  <div class="modal" style="width:560px">
+    <div class="modal-header">Settings</div>
     <div class="modal-body">
-      <div class="hint" id="model-modal-hint">
-        Local backend needs a Whisper model on disk. The file lives in
-        <code>~/Library/Application Support/pywhispercpp/models/</code> and is
-        shared with lazy-take-notes if you also use that.
-      </div>
-      <div id="model-list" style="display:flex;flex-direction:column;gap:8px;margin-top:10px"></div>
-      <div id="download-progress" style="display:none;margin-top:14px">
-        <div style="font-size:12px;color:var(--text2);margin-bottom:4px" id="download-label"></div>
-        <div style="background:var(--surface2);border-radius:3px;height:6px;overflow:hidden">
-          <div id="download-bar" style="height:100%;width:0%;background:var(--accent);transition:width 0.2s"></div>
+
+      <!-- API Key section -->
+      <div class="settings-section">
+        <div class="settings-section-title">Groq API Key</div>
+        <div class="hint">Required only for Cloud backend. Stored locally in <code>.config.json</code> (git-ignored).</div>
+        <div style="display:flex;gap:6px;align-items:center;margin-top:8px">
+          <input type="password" id="settings-api-key" placeholder="gsk_…" autocomplete="off" spellcheck="false" style="flex:1;height:32px;padding:0 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px">
+          <button class="btn-primary" onclick="saveKeyFromSettings()" style="height:32px;padding:0 14px">Save</button>
         </div>
       </div>
+
+      <!-- Models section -->
+      <div class="settings-section" id="settings-models-section">
+        <div class="settings-section-title">Local Models</div>
+        <div class="hint">
+          Download the model matching your meeting language. Models are cached in
+          <code>~/Library/Application Support/pywhispercpp/models/</code> and shared with lazy-take-notes.
+        </div>
+        <div id="model-list" style="display:flex;flex-direction:column;gap:8px;margin-top:10px"></div>
+        <div id="download-progress" style="display:none;margin-top:14px">
+          <div style="font-size:12px;color:var(--text2);margin-bottom:4px" id="download-label"></div>
+          <div style="background:var(--surface2);border-radius:3px;height:6px;overflow:hidden">
+            <div id="download-bar" style="height:100%;width:0%;background:var(--accent);transition:width 0.2s"></div>
+          </div>
+        </div>
+      </div>
+
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary" onclick="closeModelModal()">Close</button>
+      <button class="btn-secondary" onclick="closeSettings()">Close</button>
     </div>
   </div>
 </div>
@@ -500,7 +526,7 @@ function startRecording() {
     const required = (language === 'zh' || language === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
     if (!modelStatus[required] || !modelStatus[required].downloaded) {
       setStatus('Local model not downloaded — opening download dialog.');
-      openModelModal(required);
+      openSettings('models', required);
       return;
     }
   }
@@ -536,18 +562,44 @@ function onBackendChange() {
     const lang = document.getElementById('lang-select').value;
     const required = (lang === 'zh' || lang === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
     if (!modelStatus[required] || !modelStatus[required].downloaded) {
-      openModelModal(required);
+      openSettings('models', required);
     }
   }
 }
 
-function openModelModal(highlight) {
-  renderModelList(highlight);
-  document.getElementById('model-modal').classList.add('open');
+function openSettings(focusSection, highlightModel) {
+  // Refresh content from server before opening
+  fetch('/backend').then(r => r.json()).then(d => {
+    modelStatus = d.models;
+    renderModelList(highlightModel);
+  });
+  document.getElementById('settings-api-key').value = getKey() || '';
+  document.getElementById('settings-modal').classList.add('open');
+
+  if (focusSection === 'models') {
+    const sec = document.getElementById('settings-models-section');
+    sec.classList.add('settings-section-highlight');
+    sec.scrollIntoView({behavior: 'smooth', block: 'center'});
+    setTimeout(() => sec.classList.remove('settings-section-highlight'), 1800);
+  }
 }
-function closeModelModal() {
-  document.getElementById('model-modal').classList.remove('open');
+
+function closeSettings() {
+  document.getElementById('settings-modal').classList.remove('open');
 }
+
+function saveKeyFromSettings() {
+  const key = document.getElementById('settings-api-key').value.trim();
+  if (!key) { setStatus('Empty key — not saved.'); return; }
+  fetch('/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})})
+    .then(() => {
+      // Sync the legacy front-page input too
+      document.getElementById('api-key').value = key;
+      showKeySaved();
+      setStatus('API key saved.');
+    });
+}
+
 
 function renderModelList(highlight) {
   const labels = {
