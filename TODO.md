@@ -22,6 +22,7 @@
 
 | 類型 | 描述 | 狀態 |
 | --- | --- | --- |
+| UX | 錄音中關 app 時跳警示確認(避免誤關丟資料)。實作用 pywebview 的 closing callback + confirm dialog | TODO |
 | UX | 按 New 時跳 confirm dialog(transcript 非空時) | TODO |
 | UX | Save 視覺更突出,New 視覺更次要 | TODO |
 | UX | Disabled 控制項加 tooltip 解釋為什麼鎖 | TODO |
