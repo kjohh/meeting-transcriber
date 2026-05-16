@@ -38,10 +38,10 @@ ditto -c -k --keepParent "$APP" "$ZIP"
 ls -lh "$ZIP"
 
 echo
-echo "→ Creating GitHub release $TAG…"
-gh release create "$TAG" "$ZIP" \
-  --title "$TAG" \
-  --notes "Meeting Transcriber $TAG
+echo "→ Creating GitHub release ${TAG}…"
+gh release create "${TAG}" "$ZIP" \
+  --title "${TAG}" \
+  --notes "Meeting Transcriber ${TAG}
 
 Download \`Meeting Transcriber.zip\`, unzip, drag the app to your Applications folder.
 
@@ -49,4 +49,4 @@ First launch will walk you through screen-recording + microphone permissions and
 
 echo
 echo "✓ Released. End users download from:"
-gh release view "$TAG" --json url --jq .url
+gh release view "${TAG}" --json url --jq .url
