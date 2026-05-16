@@ -4,60 +4,90 @@
 
 狀態：`TODO`（要做）/ `WIP`（進行中）/ `Done` / `Maybe`（再考慮）
 
-## 安裝 & Onboarding（核心 friction，第一步要解決）
+## 下一階段（自己主導）
 
 | 類型 | 描述 | 狀態 |
 | --- | --- | --- |
-| Install | py2app 打包成 self-contained .app（不含模型，~200MB） | TODO |
-| Onboarding | First-launch 螢幕錄製授權說明 modal（解釋為何需要、引導開啟系統設定，附截圖）。完成 trigger 寫 `.config.json` 的 `onboarding_completed` flag | TODO |
-| Onboarding | First-launch 模型下載步驟（旁邊註明每個模型對應哪些語言情境） | TODO |
-| Onboarding | Settings 加「重新看 tutorial」按鈕，繞過 flag 重跑 onboarding（dev 自己也要看得到） | TODO |
-| UX | 預設 backend 改 Local，Cloud 藏進 Settings | TODO |
+| Rebrand | 整體 UI 重新設計 — 漸層 / 光暈 / 動態效果,做成完整的視覺作品 | TODO |
+| Rebrand | 換 fancy 一點的產品名稱(目前還叫 Meeting Transcriber) | TODO |
+| Distribution | Rebrand 成熟後註冊 Apple Developer Program,正式簽章 + Notarization → 解決月度 TCC re-prompt | Maybe |
 
-## Settings 介面
+## 等使用者回饋
 
 | 類型 | 描述 | 狀態 |
 | --- | --- | --- |
-| UI | 加 Settings 頁/Modal，收容：Groq API key、模型下載清單、（未來）chunk 參數 | TODO |
-| UX | Settings 入口（齒輪 icon）放工具列右側 | TODO |
+| Bug / 優化 | 等實際給朋友試之後再回收回饋,排優先序 | — |
 
-## UI/UX 小改
+## UI/UX 小改（之前討論待辦,跟 rebrand 一起做也可)
 
 | 類型 | 描述 | 狀態 |
 | --- | --- | --- |
-| UX | 按 New 時跳 confirm dialog（transcript 非空時） | TODO |
-| UX | Save 變主要動作（強調色），New 變次要 | TODO |
+| UX | 按 New 時跳 confirm dialog(transcript 非空時) | TODO |
+| UX | Save 視覺更突出,New 視覺更次要 | TODO |
 | UX | Disabled 控制項加 tooltip 解釋為什麼鎖 | TODO |
 | UX | Download modal 依當前 language 只顯示需要的模型 | TODO |
-| UX | macOS 月度授權 prompt：在 status bar 或一次性 modal 提醒「正常，按允許即可」 | TODO |
-| UX | Jargon 改名：「Vocab」→「常用詞彙」、考慮重新命名「Cloud / Local」 | Maybe |
+| UX | macOS 月度授權 prompt:在 status bar 或一次性 modal 提醒「正常,按允許即可」 | TODO |
 
-## 產品功能（跟「給誰用」無關，純功能擴充）
+## 產品功能（跟「給誰用」無關,純功能擴充)
 
 | 類型 | 描述 | 狀態 |
 | --- | --- | --- |
-| Feature | LLM summary / action items 整理（可走 Ollama 本地或 Groq） | Maybe |
-| Feature | Speaker diarization（多人會議區分發言者） | Maybe |
-| Feature | 匯出 docx / markdown（不只 .txt） | Maybe |
-| Feature | Chunk 參數做成 UI 設定（CHUNK_DURATION / PAUSE_DURATION） | Maybe |
+| Feature | LLM summary / action items 整理(可走 Ollama 本地或 Groq) | Maybe |
+| Feature | Speaker diarization(多人會議區分發言者) | Maybe |
+| Feature | 匯出 docx / markdown(不只 .txt) | Maybe |
+| Feature | Chunk 參數做成 UI 設定(CHUNK_DURATION / PAUSE_DURATION) | Maybe |
 
 ## 已知 bug / 觀察
 
 | 類型 | 描述 | 狀態 |
 | --- | --- | --- |
 
-（暫無）
+(暫無)
 
 ## Done
 
-- 加入 local backend（pywhispercpp + Breeze ASR + large-v3-turbo-q8）
-- Silence-aware chunker（取代死板 10s 切片）
-- Repetition trim + loop detection（解 Whisper hallucination）
+### 安裝 / 打包
+- py2app 打包成 self-contained .app(139MB,不含模型)
+- `scripts/build-app.sh` 一鍵 build + deep codesign + TCC reset + onboarding flag reset
+- `scripts/build-icon.sh` 從 PNG 生 .icns
+- `scripts/release.sh` ditto-zip + gh release create 上傳 GitHub Releases
+- App icon(placeholder,之後 rebrand 換)
+- 修 sounddevice libportaudio.dylib 在 zip 內 dlopen 失敗的問題(`packages` 加 sounddevice)
+
+### Onboarding
+- 4-step first-launch onboarding modal(自動跳 + 用 Settings「重新看引導」可手動觸發)
+- Step 2 螢幕錄製 + 麥克風授權都在同一頁
+- 一鍵授權按鈕(spawn coreaudio_tap 觸發 macOS 對話框)
+- 「打開系統設定」捷徑(x-apple.systempreferences URL scheme)
+- 即時 polling 偵測授權狀態(CGPreflight + AVFoundation,不觸發 prompt)
+- 麥克風授權後 live 波形預覽
+- Step 3 雲端 inline key input + 即時驗證 + 已存的 key 自動 pre-fill
+
+### Settings 介面
+- ⚙ 齒輪 icon 入口
+- API Key section(填寫 + 即時驗證)
+- 本機模型 section(下載 + 進度)
+- 說明 section(重新看引導)
+
+### 核心功能
+- Local backend 透過 pywhispercpp,自動從 HF Hub 下載模型
+- 模型 cache 與 lazy-take-notes 共用路徑
+- 中英混合自動使用 Breeze ASR 25
+- Silence-aware chunker(取代死板 10s 切片)
+- Repetition trim + loop detection(解 Whisper hallucination)
 - Voice activity ratio gate
-- UI 重整：合併 Pause/Stop、加 New session、state machine
-- 中英混合預設 + bilingual prompt priming
-- Vocabulary editor modal + `.vocab.local`
-- Native macOS save dialog（pywebview JS API）
-- launcher.swift 改進（--user pip install、失敗時彈 dialog）
-- Ad-hoc deep codesign（解決重複跳螢幕錄製授權）
-- Audio waveform 換成輕量 RAF 滾動小波紋
+- Prompt chain(跨 chunk 上下文連續)
+- 自訂詞彙表 UI(Vocab modal + `.vocab.local`)
+- Native macOS save dialog(pywebview JS API bridge)
+- 系統音失敗警告 banner(僅 mic recording 時提醒)
+- 雲端模式無 key 時即時警告 banner
+
+### UI / UX
+- 全 UI 台灣繁中
+- 工具列簡化:Pause/Stop 合併成單一錄音 toggle + New session
+- 鎖定 selector(錄音中不可改 lang/backend)
+- 小型 RAF-driven 音訊波形
+- AA 對比度連結色(--link variable)
+- (i) tooltip 自製(WKWebView title= 不可靠)
+- /pause 進入時 flush 避免漏字
+- /stop 等 chunk worker join 完成,New 不再 race 殘留文字
