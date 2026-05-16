@@ -636,7 +636,8 @@ es.onmessage = ({data}) => {
   } else if (msg.type === 'transcribing') {
     document.getElementById('loading-bar').className = 'loading-bar' + (msg.data ? ' active' : '');
   } else if (msg.type === 'sys_audio') {
-    document.getElementById('sys-audio-warning').style.display = msg.data.ok ? 'none' : 'block';
+    const warn = document.getElementById('sys-audio-warning');
+    warn.style.display = (msg.data.ok || _isOnboardingOpen()) ? 'none' : 'block';
   } else if (msg.type === 'mic_test_level') {
     _micTestLatest = msg.data;
   }
@@ -776,11 +777,18 @@ function onBackendChange() {
   updateKeyBanner();
 }
 
+function _isOnboardingOpen() {
+  const m = document.getElementById('onboarding-modal');
+  return !!(m && m.classList.contains('open'));
+}
+
 function updateKeyBanner() {
   const backend = document.getElementById('backend-select').value;
   const banner = document.getElementById('key-needed-banner');
   if (!banner) return;
-  banner.style.display = (backend === 'cloud' && !cachedKey) ? 'block' : 'none';
+  // Don't bleed through behind the onboarding modal — the user is still in
+  // setup, the banner is just visual noise.
+  banner.style.display = (backend === 'cloud' && !cachedKey && !_isOnboardingOpen()) ? 'block' : 'none';
 }
 
 function openSettings(focusSection, highlightModel) {
@@ -812,6 +820,10 @@ function openOnboarding() {
   obStep = 1;
   renderOnboarding();
   document.getElementById('onboarding-modal').classList.add('open');
+  // Onboarding owns the setup flow; hide any toolbar banners that were
+  // showing setup hints redundantly.
+  updateKeyBanner();
+  document.getElementById('sys-audio-warning').style.display = 'none';
 }
 
 function obNext() {
@@ -921,6 +933,8 @@ function completeOnboarding() {
   document.getElementById('onboarding-modal').classList.remove('open');
   stopPermissionPolling();
   stopMicTest();
+  // Now that onboarding is closed, re-evaluate the toolbar banners.
+  updateKeyBanner();
 }
 
 function setObPermissionStatus(msg, color) {

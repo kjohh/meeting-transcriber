@@ -39,13 +39,11 @@ ls -lh "$ZIP"
 
 echo
 echo "→ Creating GitHub release ${TAG}…"
+# --generate-notes auto-fills the body with the commit list since the
+# previous tag, so users see what changed without us writing it by hand.
 gh release create "${TAG}" "$ZIP" \
   --title "${TAG}" \
-  --notes "Meeting Transcriber ${TAG}
-
-Download \`Meeting Transcriber.zip\`, unzip, drag the app to your Applications folder.
-
-First launch will walk you through screen-recording + microphone permissions and let you pick between cloud (Groq) or local (whisper.cpp) transcription."
+  --generate-notes
 
 echo
 echo "✓ Released. End users download from:"

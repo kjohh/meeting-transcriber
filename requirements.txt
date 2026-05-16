@@ -1,8 +1,12 @@
-sounddevice>=0.4.6
-numpy>=1.24.0
-groq>=0.11.0
-flask>=3.0.0
-pywebview>=5.0
-pywhispercpp>=1.2.0
-huggingface_hub>=0.20.0
-pyobjc-framework-AVFoundation>=10.0
+# Compatible-release pins (~=) — accept patch + minor of the same major,
+# reject the next major bump that's likely to break us.
+# Updated 2026-05 against versions that the bundled .app was tested with.
+sounddevice~=0.5.5
+numpy~=2.4
+groq~=1.2
+flask~=3.1
+pywebview~=6.2
+pywhispercpp~=1.4
+huggingface_hub~=1.15
+pyobjc-framework-AVFoundation~=12.1
+pyobjc-framework-Quartz~=12.1

@@ -16,7 +16,7 @@ from typing import Optional
 
 import numpy as np
 import sounddevice as sd
-from flask import Flask, Response, jsonify, request, send_file
+from flask import Flask, Response, abort, jsonify, request, send_file
 from groq import Groq
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -30,9 +30,17 @@ SAMPLE_RATE = 16000
 # transcription gets context.
 CHUNK_DURATION = 25.0           # seconds — hard cap when speech is continuous
 OVERLAP = 1.0                   # seconds — retained tail for context bleed
-SILENCE_THRESHOLD = 0.01        # RMS below this counts as silence
+SILENCE_THRESHOLD = 0.005       # RMS below this counts as silence (was 0.01 —
+                                # 0.005 catches soft speech where the user is
+                                # speaking but their mic gain is low; trade-off
+                                # is slightly more hallucination risk, but
+                                # repetition_trim + loop detection still handle
+                                # those.)
 PAUSE_DURATION = 1.5            # seconds of silence required to trigger
 MIN_SPEECH = 2.0                # don't trigger before this much speech buffered
+VOICE_ACTIVITY_RATIO = 0.15     # min fraction of 100ms frames that must be
+                                # "active" (above SILENCE_THRESHOLD) before we
+                                # send a chunk to Whisper (was 0.25)
 
 PORT = 8765
 
@@ -78,6 +86,28 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 
 app = Flask(__name__, static_folder=os.path.join(_resource_dir(), "static"))
 
+
+_ALLOWED_ORIGINS = frozenset([
+    "",  # no-Origin requests come from pywebview / curl localhost / direct browser bar
+    f"http://localhost:{PORT}",
+    f"http://127.0.0.1:{PORT}",
+])
+
+
+@app.before_request
+def _enforce_origin():
+    """Block cross-origin requests from arbitrary websites.
+
+    Flask binds localhost, so external attackers can't reach this — but any
+    browser tab the user opens to a malicious page could `fetch('http://
+    localhost:8765/start')` and silently drive the transcriber. The browser
+    always sends an `Origin` header on cross-origin fetches, so checking it
+    is sufficient to block that class of attack. Same-origin requests from
+    the pywebview UI have an Origin of `http://localhost:8765`."""
+    origin = request.headers.get("Origin", "")
+    if origin not in _ALLOWED_ORIGINS:
+        abort(403)
+
 # ─── Global state ─────────────────────────────────────────────────────────────
 
 _recording = False
@@ -85,7 +115,19 @@ _paused = False
 _language = "zh-en"  # default: bilingual Chinese + English
 _backend = "cloud"   # "cloud" (Groq) or "local" (whisper.cpp)
 _chunk_worker_thread: Optional[threading.Thread] = None
+_transcribe_consumer_thread: Optional[threading.Thread] = None
 _mic_test_stream = None  # separate stream used by onboarding mic preview
+
+# Recording-lifecycle mutations (start/stop/pause/clear, swift_proc, mic_stream,
+# worker threads) all serialise through this lock so a double-click or a
+# Flask threadpool race can't half-flip state.
+_lifecycle_lock = threading.Lock()
+
+# Bounded queue of audio chunks waiting to be transcribed. One consumer
+# thread drains it serially — prevents Groq slow / network glitch from
+# piling up transcribe threads, and prevents two local-whisper inferences
+# from contending for CPU at the same time.
+_transcribe_queue: "queue.Queue" = queue.Queue(maxsize=8)
 
 # Download state (local backend only). Lock-protected so SSE clients can poll.
 _download_state: dict = {"active": False, "percent": 0, "model": "", "error": ""}
@@ -146,12 +188,18 @@ def _append_line(line: str):
 def _read_config() -> dict:
     try:
         return json.loads(open(CONFIG_FILE).read())
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"WARN: config read failed: {e}", file=sys.stderr)
         return {}
 
 
 def _write_config(cfg: dict):
-    with open(CONFIG_FILE, "w") as f:
+    # Open with explicit 0o600 — config holds the Groq API key, must not
+    # leak to other users on shared / misconfigured-umask machines.
+    fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
 
 
@@ -408,105 +456,134 @@ def route_key():
 
 @app.route("/start", methods=["POST"])
 def route_start():
-    global _recording, _paused, _swift_proc, _mic_stream, _language, _backend, _chunk_worker_thread
+    global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
+    global _chunk_worker_thread, _transcribe_consumer_thread
 
     data = request.json or {}
     key = data.get("key", "").strip()
-    _language = data.get("language", "zh-en")
-    _backend = data.get("backend", "cloud")
-    if _backend == "cloud" and not key:
+    language = data.get("language", "zh-en")
+    backend = data.get("backend", "cloud")
+
+    if backend == "cloud" and not key:
         return jsonify({"ok": False, "error": "No API key (required for cloud backend)"})
-    if _backend == "local":
-        alias = pick_local_model(_language)
+    if backend == "local":
+        alias = pick_local_model(language)
         if model_local_path(alias) is None:
             return jsonify({"ok": False, "error": f"Local model not downloaded: {alias}"})
     if not os.path.exists(BINARY):
         return jsonify({"ok": False, "error": "Binary missing — run: cd native && swift build -c release"})
 
-    _recording = True
-    _paused = False
-    with _buf_lock:
-        _sys_buf.clear()
-        _mic_buf.clear()
+    with _lifecycle_lock:
+        if _recording:
+            return jsonify({"ok": False, "error": "Already recording"})
 
-    _broadcast("state", {"recording": True, "paused": False})
-    _set_status("Starting system audio capture…")
+        _language = language
+        _backend = backend
+        _recording = True
+        _paused = False
+        with _buf_lock:
+            _sys_buf.clear()
+            _mic_buf.clear()
 
-    _swift_proc = subprocess.Popen([BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    threading.Thread(target=_read_sys_audio, daemon=True).start()
-    threading.Thread(target=_watch_stderr, daemon=True).start()
+        # Drain any stale items left in the transcribe queue from a previous
+        # session (shouldn't happen if /stop joined properly, but defensive).
+        while not _transcribe_queue.empty():
+            try: _transcribe_queue.get_nowait()
+            except queue.Empty: break
 
-    _mic_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype=np.float32,
-        callback=_mic_cb, blocksize=int(SAMPLE_RATE * 0.1),
-    )
-    _mic_stream.start()
-    _chunk_worker_thread = threading.Thread(target=_chunk_worker, args=(key,), daemon=True)
-    _chunk_worker_thread.start()
+        _broadcast("state", {"recording": True, "paused": False})
+        _set_status("Starting system audio capture…")
+
+        _swift_proc = subprocess.Popen([BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        threading.Thread(target=_read_sys_audio, daemon=True).start()
+        threading.Thread(target=_watch_stderr, daemon=True).start()
+
+        _mic_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype=np.float32,
+            callback=_mic_cb, blocksize=int(SAMPLE_RATE * 0.1),
+        )
+        _mic_stream.start()
+
+        _transcribe_consumer_thread = threading.Thread(
+            target=_transcribe_consumer, args=(key,), daemon=True,
+        )
+        _transcribe_consumer_thread.start()
+
+        _chunk_worker_thread = threading.Thread(target=_chunk_worker, args=(key,), daemon=True)
+        _chunk_worker_thread.start()
 
     return jsonify({"ok": True})
 
 
 @app.route("/pause", methods=["POST"])
 def route_pause():
-    global _paused
-    entering_pause = not _paused
-    _paused = not _paused
-    _broadcast("state", {"recording": _recording, "paused": _paused})
-    _set_status("Paused" if _paused else "Recording…")
-
-    # On entering pause, flush whatever's in the merged buffer so audio that
-    # accumulated below the chunk trigger threshold doesn't get lost. The
-    # chunker normally only fires on hitting 25s OR detecting a 1.5s silence
-    # pause — speech that ends right when the user clicks pause hits neither.
-    if entering_pause and _recording:
-        api_key = load_api_key()
-        threading.Thread(
-            target=_flush_pending_audio, args=(api_key,), daemon=True
-        ).start()
-
-    return jsonify({"ok": True, "paused": _paused})
-
-
-def _flush_pending_audio(api_key: str):
-    """Drain remaining audio from sys/mic buffers and transcribe it.
-
-    Used by /pause entry and /stop. Idempotent — if buffer is empty / too
-    short it returns silently. Voice-activity gate in _transcribe still
-    filters out pure-silence flushes.
+    """Toggle pause. The actual buffer flush is handled by `_chunk_worker`
+    which watches `_paused` — no separate flush thread, which was the source
+    of an earlier race against the chunker.
     """
+    global _paused
+    with _lifecycle_lock:
+        _paused = not _paused
+        paused_now = _paused
+    _broadcast("state", {"recording": _recording, "paused": paused_now})
+    _set_status("暫停中" if paused_now else "錄音中…")
+    return jsonify({"ok": True, "paused": paused_now})
+
+
+def _flush_pending_audio():
+    """Drain whatever's in the merged buffer into the transcribe queue.
+
+    Called by `_chunk_worker` on pause entry and on session shutdown so
+    audio that accumulated below the trigger threshold isn't lost. Voice
+    activity gate in `_transcribe` filters out pure-silence flushes."""
     with _buf_lock:
         sa = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
         ma = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
         _sys_buf.clear()
         _mic_buf.clear()
     audio = _mix_buffers(sa, ma)
-    if len(audio) > SAMPLE_RATE // 2:  # at least 0.5s
-        _transcribe(audio, api_key)
+    if len(audio) > SAMPLE_RATE // 2:
+        try:
+            _transcribe_queue.put(audio, timeout=2)
+        except queue.Full:
+            print("WARN: transcribe queue full, dropping flush chunk", file=sys.stderr)
 
 
 @app.route("/stop", methods=["POST"])
 def route_stop():
-    global _recording, _paused, _swift_proc, _mic_stream, _chunk_worker_thread
+    global _recording, _paused, _swift_proc, _mic_stream
+    global _chunk_worker_thread, _transcribe_consumer_thread
 
-    _recording = False
-    _paused = False
+    with _lifecycle_lock:
+        if not _recording:
+            return jsonify({"ok": True})  # idempotent
+        _recording = False
+        _paused = False
 
-    if _mic_stream:
-        _mic_stream.stop()
-        _mic_stream.close()
-        _mic_stream = None
-    if _swift_proc:
-        _swift_proc.terminate()
-        _swift_proc = None
+        if _mic_stream:
+            _mic_stream.stop()
+            _mic_stream.close()
+            _mic_stream = None
+        if _swift_proc:
+            _swift_proc.terminate()
+            _swift_proc = None
 
-    # Wait for the chunk worker to fully exit (including its final flush
-    # transcription). Without this, /stop returns before the last chunk
-    # finishes transcribing — and a follow-up /clear (from New session) gets
-    # raced by the late _append_line, leaving stale text in the transcript.
-    if _chunk_worker_thread is not None and _chunk_worker_thread.is_alive():
-        _chunk_worker_thread.join(timeout=15)
+        chunk_worker = _chunk_worker_thread
+        consumer = _transcribe_consumer_thread
         _chunk_worker_thread = None
+        _transcribe_consumer_thread = None
+
+    # Join outside the lifecycle lock — chunk_worker needs to acquire _buf_lock
+    # and the consumer needs to drain the queue, both can take seconds.
+    # `newSession` (frontend) chains /stop → /clear, so /stop must return only
+    # after every late _append_line has landed, or /clear will race them.
+    if chunk_worker and chunk_worker.is_alive():
+        chunk_worker.join(timeout=15)
+    if consumer and consumer.is_alive():
+        # Sentinel wakes the consumer; it then exits the loop.
+        try: _transcribe_queue.put_nowait(None)
+        except queue.Full: pass
+        consumer.join(timeout=30)
 
     _broadcast("state", {"recording": False, "paused": False})
     _set_status(f"Stopped — {len(_lines)} segment(s) transcribed")
@@ -560,7 +637,10 @@ def route_upload():
 
 @app.route("/clear", methods=["POST"])
 def route_clear():
-    _lines.clear()
+    # Serialise with /stop so a late _append_line from a still-draining
+    # transcribe doesn't land into the cleared list.
+    with _lifecycle_lock:
+        _lines.clear()
     return jsonify({"ok": True})
 
 
@@ -687,7 +767,13 @@ def _read_sys_audio():
     tick = 0
     while _recording and _swift_proc and _swift_proc.poll() is None:
         data = _swift_proc.stdout.read(chunk)
-        if data and not _paused:
+        if not data:
+            # Swift binary EOF'd mid-recording — stream collapsed without
+            # process exit. Tell the user and stop the busy-loop.
+            _broadcast("sys_audio", {"ok": False, "msg": "system audio stream stopped"})
+            _set_status("⚠ 系統音擷取中斷,僅麥克風錄音中")
+            return
+        if not _paused:
             samples = np.frombuffer(data, dtype=np.float32).copy()
             with _buf_lock:
                 _sys_buf.append(samples)
@@ -849,27 +935,27 @@ def _is_repetition_loop(text: str) -> bool:
 def _chunk_worker(api_key: str):
     """Silence-aware chunk loop (ported from lazy-take-notes).
 
-    Fires a transcription whenever EITHER the merged buffer hits CHUNK_DURATION
-    (hard cap when speech is continuous) OR the tail goes silent for
-    PAUSE_DURATION (natural sentence boundary).
-
-    After triggering, OVERLAP seconds are retained as the head of the next chunk
-    so the transcriber gets context bleed across boundaries.
+    Triggers on either CHUNK_DURATION (hard cap) or PAUSE_DURATION of tail
+    silence (natural sentence boundary). Pushes chunks to `_transcribe_queue`
+    rather than spawning per-chunk threads — the consumer thread drains the
+    queue serially.
     """
     overlap_samples = int(SAMPLE_RATE * OVERLAP)
-
     _prompt_chain.clear()
+    last_pause_state = False
 
     while _recording:
         time.sleep(0.3)
         if _paused:
+            # Edge: just entered pause → flush whatever's in the buffer so
+            # audio below the trigger threshold isn't lost. Done by the
+            # worker (not a separate thread) so it can't race the trigger.
+            if not last_pause_state:
+                _flush_pending_audio()
+            last_pause_state = True
             continue
+        last_pause_state = False
 
-        # Snapshot + decision + consume all happen under one lock acquisition.
-        # Otherwise a /pause-triggered flush thread can race in between
-        # snapshot and consume, and both threads transcribe the same audio.
-        # `_is_pause_boundary` is pure numpy on a snapshot, safe to call
-        # inside the lock.
         mixed = None
         with _buf_lock:
             sys_len = sum(len(x) for x in _sys_buf)
@@ -885,12 +971,12 @@ def _chunk_worker(api_key: str):
             mixed = _mix_buffers(sa, ma)
 
             if reason == "pause-check" and not _is_pause_boundary(mixed):
-                continue  # tail not actually silent — keep accumulating
+                continue
 
             # 'cap' keeps an overlap tail for context across the cut.
             # 'pause-check' clears everything — the sentence already ended,
-            # and a stale-speech tail would prime a phantom chunk on the next
-            # silence and Whisper would hallucinate.
+            # and a stale-speech tail would prime a phantom silent chunk
+            # and Whisper would hallucinate.
             if reason == "cap":
                 _sys_buf[:] = [sa[-overlap_samples:]] if len(sa) > overlap_samples else []
                 _mic_buf[:] = [ma[-overlap_samples:]] if len(ma) > overlap_samples else []
@@ -898,10 +984,36 @@ def _chunk_worker(api_key: str):
                 _sys_buf.clear()
                 _mic_buf.clear()
 
-        threading.Thread(target=_transcribe, args=(mixed, api_key), daemon=True).start()
+        try:
+            _transcribe_queue.put(mixed, timeout=2)
+        except queue.Full:
+            print("WARN: transcribe queue full, dropping chunk", file=sys.stderr)
+            _set_status("⚠ Transcribe 跟不上速度,跳過一段")
 
-    # Flush remaining audio after stop (uses shared helper that /pause also calls).
-    _flush_pending_audio(api_key)
+    # Final flush after /stop sets _recording=False.
+    _flush_pending_audio()
+
+
+def _transcribe_consumer(api_key: str):
+    """Single consumer that drains `_transcribe_queue` serially. Lives for
+    the full recording session — bounded so Groq slowness / local CPU
+    contention can't spawn unbounded threads."""
+    while True:
+        try:
+            audio = _transcribe_queue.get(timeout=0.5)
+        except queue.Empty:
+            # Drain done + recording stopped → exit. Otherwise keep waiting.
+            if not _recording:
+                break
+            continue
+        if audio is None:  # /stop sentinel
+            break
+        try:
+            _transcribe(audio, api_key)
+        except Exception as e:
+            print(f"transcribe failed: {e}", file=sys.stderr)
+        finally:
+            _transcribe_queue.task_done()
 
 
 def _transcribe(audio: np.ndarray, api_key: str):
@@ -912,13 +1024,12 @@ def _transcribe(audio: np.ndarray, api_key: str):
     # Two-layer silence gate against Whisper hallucination on near-silent input:
     #   (1) Overall RMS too low → entire chunk is quiet.
     #   (2) Voice-activity ratio: fraction of 100ms frames that exceed the
-    #       speech threshold. Whisper is prone to inventing content when fed
-    #       audio that has a brief speech burst followed by long silence —
-    #       require at least 25% of the chunk to be "active" frames.
+    #       speech threshold. Whisper hallucinates on brief-speech-then-silence.
+    # Thresholds tuned permissive (catch soft speech) — repetition_trim +
+    # loop detection still handle the false-positive case.
     rms = float(np.sqrt(np.mean(audio ** 2)))
-    if rms < 0.01:
-        if _recording:
-            _set_status("Recording…")
+    if rms < SILENCE_THRESHOLD:
+        _restore_idle_status()
         return
 
     frame = int(SAMPLE_RATE * 0.1)  # 100 ms frames
@@ -927,9 +1038,8 @@ def _transcribe(audio: np.ndarray, api_key: str):
         frames = audio[: frame_count * frame].reshape(frame_count, frame)
         frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
         active_ratio = float(np.mean(frame_rms > SILENCE_THRESHOLD))
-        if active_ratio < 0.25:
-            if _recording:
-                _set_status("Recording…")
+        if active_ratio < VOICE_ACTIVITY_RATIO:
+            _restore_idle_status()
             return
 
     ts = datetime.now().strftime("%H:%M:%S")
@@ -960,8 +1070,16 @@ def _transcribe(audio: np.ndarray, api_key: str):
         _transcribing = False
         _broadcast("transcribing", False)
 
-    if _recording:
-        _set_status("Recording…")
+    _restore_idle_status()
+
+
+def _restore_idle_status():
+    """Set the status bar back to the right ambient state — depends on
+    whether we're recording, paused, or idle. Called whenever a transient
+    "Transcribing…" needs to clear."""
+    if not _recording:
+        return
+    _set_status("暫停中" if _paused else "錄音中…")
 
 
 def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
@@ -1023,25 +1141,37 @@ if __name__ == "__main__":
         def trigger_screen_capture_permission(self):
             """Briefly spawn the audio binary to invoke macOS' permission prompt.
 
-            macOS only shows the screen recording permission dialog when an app
-            actually attempts to use ScreenCaptureKit — so we have to trigger
-            a real capture to get the prompt. The binary is terminated after
-            ~1.5s; the dialog stays up until the user responds.
+            macOS only shows the screen recording dialog when an app actually
+            attempts to use ScreenCaptureKit — so we trigger a real capture.
+
+            We don't treat an early exit as failure: ScreenCaptureKit also
+            exits immediately when the user hasn't granted permission yet
+            (which is the normal state during onboarding, before they click
+            through the System Settings flow). The polling loop is what
+            actually confirms grant — this trigger just kicks the dialog.
             """
             if not os.path.exists(BINARY):
-                return {"ok": False, "error": "Audio binary not built"}
+                return {"ok": False, "error": "音訊擷取程式找不到 — bundle 可能損壞"}
             try:
                 proc = subprocess.Popen(
                     [BINARY],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                 )
                 time.sleep(1.5)
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                # Log stderr for dev debugging (Intel Mac / arch mismatch /
+                # binary corruption) but don't surface it to the user — they
+                # may legitimately still be working through System Settings.
+                if proc.poll() is not None:
+                    err = (proc.stderr.read() or b"").decode(errors="replace").strip()
+                    if err:
+                        print(f"NOTE: coreaudio_tap exited during permission probe: {err[:200]}", file=sys.stderr)
+                else:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
                 return {"ok": True}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
@@ -1150,7 +1280,7 @@ if __name__ == "__main__":
 
     # Flask runs in a daemon thread; dies automatically when the window closes
     threading.Thread(
-        target=lambda: app.run(port=PORT, threaded=True, use_reloader=False, debug=False),
+        target=lambda: app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False, debug=False),
         daemon=True,
     ).start()
     time.sleep(0.6)  # let Flask start before opening the window
