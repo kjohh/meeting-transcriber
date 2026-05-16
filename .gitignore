@@ -6,3 +6,7 @@ native/.build/
 __pycache__/
 *.pyc
 *.pyo
+build/
+dist/
+*.egg-info/
+icon.icns

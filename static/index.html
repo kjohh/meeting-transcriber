@@ -15,6 +15,7 @@
   --text:     #1d1d1f;
   --text2:    #6e6e73;
   --accent:   #0071e3;
+  --link:     #0058b8;
   --red:      #ff3b30;
   --green:    #34c759;
   --orange:   #ff9500;
@@ -30,6 +31,7 @@
     --text:     #f5f5f7;
     --text2:    #8e8e93;
     --accent:   #0a84ff;
+    --link:     #6cb4ff;
     --red:      #ff453a;
     --green:    #30d158;
     --orange:   #ff9f0a;
@@ -47,6 +49,13 @@ body {
   gap: 12px;
   overflow: hidden;
 }
+
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+a:hover { filter: brightness(1.15); }
 
 /* ── header ── */
 .header { display: flex; align-items: center; gap: 10px; }
@@ -211,6 +220,25 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
 /* Onboarding step content */
 .ob-step { min-height: 240px; }
+.ob-perm-block {
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.ob-perm-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.ob-perm-badge {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--text2);
+}
+.ob-perm-badge.granted { background: rgba(52,199,89,0.18); color: var(--green); }
+.ob-perm-desc { font-size: 12px; color: var(--text2); line-height: 1.55; margin-bottom: 8px; }
+.ob-perm-actions { display: flex; gap: 6px; align-items: center; }
+.ob-perm-actions button { height: 30px; padding: 0 12px; font-size: 12px; }
 .ob-bullets {
   margin: 6px 0 0 0; padding: 0;
   list-style: none;
@@ -335,21 +363,46 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
       </div>
 
       <div class="ob-step" data-step="2" style="display:none">
-        <div style="font-size:36px;margin-bottom:12px">🎙</div>
-        <div style="font-size:14px;line-height:1.7">
-          <strong>螢幕錄製授權</strong><br><br>
-          要錄到電腦播放的聲音,macOS 需要你授權「螢幕錄製」權限。
-          這個工具只用音訊,不會錄你的畫面。<br><br>
-          點下面按鈕,macOS 會跳出對話框,點「打開系統設定」→
-          在清單找到 Meeting Transcriber → 開啟開關即可。
+        <div style="font-size:36px;margin-bottom:8px">🔓</div>
+        <div style="font-size:14px;line-height:1.6;margin-bottom:14px">
+          要錄製會議,Meeting Transcriber 需要兩個權限。分別點按鈕授權即可。
         </div>
-        <div style="display:flex;gap:8px;margin-top:14px;align-items:center">
-          <button class="btn-primary" onclick="triggerPermission()" style="height:34px;padding:0 16px">🔓 立即授權</button>
-          <button class="btn-secondary" onclick="openScreenRecordingSettings()" style="height:34px;padding:0 14px;font-size:13px">直接打開系統設定</button>
+
+        <!-- Screen Recording -->
+        <div class="ob-perm-block">
+          <div class="ob-perm-head">
+            <strong>📺 螢幕錄製</strong>
+            <span class="ob-perm-badge" id="ob-screen-badge">尚未授權</span>
+          </div>
+          <div class="ob-perm-desc">擷取電腦播放的聲音 — 線上會議對方的聲音 / 影片聲音。<strong>不會錄你的畫面。</strong></div>
+          <div class="ob-perm-actions">
+            <button class="btn-primary" onclick="triggerPermission()" id="ob-screen-trigger">立即授權</button>
+            <button class="btn-secondary" onclick="openScreenRecordingSettings()">打開系統設定</button>
+          </div>
         </div>
-        <div id="ob-permission-status" style="margin-top:10px;font-size:12px;color:var(--accent);min-height:16px;line-height:1.5"></div>
-        <div style="margin-top:8px;font-size:12px;color:var(--text2);line-height:1.6">
-          macOS 15 之後每個月會跳一次確認對話框(藍色舉手圖示),按「允許」即可,不影響使用。
+
+        <!-- Microphone -->
+        <div class="ob-perm-block">
+          <div class="ob-perm-head">
+            <strong>🎙 麥克風</strong>
+            <span class="ob-perm-badge" id="ob-mic-badge">尚未授權</span>
+          </div>
+          <div class="ob-perm-desc">擷取你的聲音(線上會議發言、實體會議錄音)。授權後會即時顯示波形讓你測試。</div>
+          <div class="ob-perm-actions">
+            <button class="btn-primary" onclick="triggerMicPermission()" id="ob-mic-trigger">授權並測試</button>
+          </div>
+          <div class="audio-wave ob-mic-wave" id="ob-mic-wave" style="display:none;margin-top:10px;height:18px">
+            <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+            <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+            <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+            <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+          </div>
+        </div>
+
+        <div id="ob-permission-status" style="margin-top:10px;font-size:12px;min-height:16px;line-height:1.5;color:var(--text2)"></div>
+
+        <div style="margin-top:6px;font-size:11px;color:var(--text2);line-height:1.6">
+          macOS 15 之後螢幕錄製每個月會跳一次確認對話框(藍色舉手圖示),按「允許」即可。
         </div>
       </div>
 
@@ -420,11 +473,12 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
       <!-- API Key section -->
       <div class="settings-section">
         <div class="settings-section-title">Groq API 金鑰</div>
-        <div class="hint">只有雲端模式需要。儲存在本機 <code>.config.json</code>(已加入 git-ignore)。</div>
+        <div class="hint">只有雲端模式需要。免費註冊金鑰:<a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a></div>
         <div style="display:flex;gap:6px;align-items:center;margin-top:8px">
           <input type="password" id="settings-api-key" placeholder="gsk_…" autocomplete="off" spellcheck="false" style="flex:1;height:32px;padding:0 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px">
-          <button class="btn-primary" onclick="saveKeyFromSettings()" style="height:32px;padding:0 14px">儲存</button>
+          <button class="btn-primary" onclick="saveKeyFromSettings()" style="height:32px;padding:0 14px">儲存並測試</button>
         </div>
+        <div id="settings-key-status" style="margin-top:6px;font-size:12px;min-height:16px;line-height:1.4;color:var(--text2)"></div>
       </div>
 
       <!-- Help section -->
@@ -500,30 +554,43 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   <span style="font-size:13px;color:var(--text2)">開始錄音後逐字稿會出現在這裡</span>
 </div>
 
+<div id="key-needed-banner" style="display:none;background:rgba(255,149,0,0.12);border:1px solid var(--orange);color:var(--orange);font-size:12px;padding:8px 12px;border-radius:var(--r);margin-bottom:8px;line-height:1.5">
+  ⚠ <strong>雲端模式需要 Groq 金鑰</strong> — 點右上角 <strong>⚙</strong> 填寫並測試。
+  <a href="https://console.groq.com/keys" target="_blank" style="color:var(--orange);text-decoration:underline">免費註冊</a>
+</div>
+<div id="sys-audio-warning" style="display:none;background:rgba(255,149,0,0.12);border:1px solid var(--orange);color:var(--orange);font-size:12px;padding:8px 12px;border-radius:var(--r);margin-bottom:8px;line-height:1.5">
+  ⚠ <strong>系統音無法擷取</strong>(僅麥克風錄音中)— 系統設定 → 隱私權與安全性 → 螢幕與系統聲音錄製,找到 Meeting Transcriber 並開啟,然後按 ↻ 新會議 重啟錄音。
+</div>
 <div class="status-bar" id="status">準備就緒 — 按 ● 開始錄音</div>
 
 <script>
 let recording = false, paused = false;
 
-// ── Audio waveform — short centered bars, RAF-driven so scroll stays smooth
-//    even though SSE level events only fire ~5x/sec.
+// SSE level events fire ~5x/sec; we RAF-tick at 30fps so the scroll stays smooth.
 const WAVE_BARS = 16;
+const MIC_TEST_BARS = 12;
 const waveHistory = new Array(WAVE_BARS).fill(0);
+const micTestHistory = new Array(MIC_TEST_BARS).fill(0);
 let _latestLevel = 0;
+let _micTestLatest = 0;
 let _lastWaveTick = 0;
 
 function setAudioLevel(level) { _latestLevel = level; }
 
+function _renderBars(selector, history, latest, maxH, scale) {
+  history.push(latest);
+  history.shift();
+  const bars = document.querySelectorAll(selector);
+  for (let i = 0; i < bars.length; i++) {
+    bars[i].style.height = Math.max(2, Math.min(maxH, history[i] * scale)) + 'px';
+  }
+}
+
 function _tickWave(now) {
-  if (now - _lastWaveTick > 33) {        // ~30 fps scroll
+  if (now - _lastWaveTick > 33) {
     _lastWaveTick = now;
-    waveHistory.push(_latestLevel);
-    waveHistory.shift();
-    const bars = document.querySelectorAll('#audio-wave .wave-bar');
-    for (let i = 0; i < bars.length; i++) {
-      const h = Math.max(2, Math.min(16, waveHistory[i] * 32));
-      bars[i].style.height = h + 'px';
-    }
+    if (recording) _renderBars('#audio-wave .wave-bar', waveHistory, _latestLevel, 16, 32);
+    if (_micTestRunning) _renderBars('#ob-mic-wave .wave-bar', micTestHistory, _micTestLatest, 14, 28);
   }
   requestAnimationFrame(_tickWave);
 }
@@ -544,6 +611,7 @@ es.onmessage = ({data}) => {
     if (msg.language) document.getElementById('lang-select').value = msg.language;
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
     if (msg.models) modelStatus = msg.models;
+    updateKeyBanner();
     document.getElementById('transcript').innerHTML = '';
     msg.lines.forEach(l => appendLine(l));
     if (!msg.lines.length) {
@@ -566,6 +634,10 @@ es.onmessage = ({data}) => {
     setAudioLevel(Math.max(msg.data.mic || 0, msg.data.sys || 0));
   } else if (msg.type === 'transcribing') {
     document.getElementById('loading-bar').className = 'loading-bar' + (msg.data ? ' active' : '');
+  } else if (msg.type === 'sys_audio') {
+    document.getElementById('sys-audio-warning').style.display = msg.data.ok ? 'none' : 'block';
+  } else if (msg.type === 'mic_test_level') {
+    _micTestLatest = msg.data;
   }
 };
 
@@ -700,6 +772,14 @@ function onBackendChange() {
       openSettings('models', required);
     }
   }
+  updateKeyBanner();
+}
+
+function updateKeyBanner() {
+  const backend = document.getElementById('backend-select').value;
+  const banner = document.getElementById('key-needed-banner');
+  if (!banner) return;
+  banner.style.display = (backend === 'cloud' && !cachedKey) ? 'block' : 'none';
 }
 
 function openSettings(focusSection, highlightModel) {
@@ -735,13 +815,18 @@ function openOnboarding() {
 
 function obNext() {
   if (obStep === 3) {
-    // Persist the backend choice the user picked on step 3, then advance.
     const choice = document.querySelector('input[name="ob-backend"]:checked');
-    if (choice) {
-      const backend = choice.value;
-      document.getElementById('backend-select').value = backend;
-      fetch('/backend', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({backend})});
+    if (!choice) return;
+    const backend = choice.value;
+
+    // Cloud requires a validated key before leaving step 3.
+    if (backend === 'cloud' && !cachedKey) {
+      _setStatusEl(document.getElementById('ob-cloud-status'), '請先輸入金鑰並點「儲存並測試」', 'err');
+      return;
     }
+
+    document.getElementById('backend-select').value = backend;
+    fetch('/backend', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({backend})});
   }
   if (obStep < OB_STEPS) {
     obStep++;
@@ -760,14 +845,13 @@ function renderOnboarding() {
     el.style.display = (parseInt(el.dataset.step) === obStep) ? 'block' : 'none';
   });
 
-  // Step 2 owns its own permission-polling lifecycle: start when entering,
-  // stop when leaving. Re-check current state immediately so users who
-  // already authorised on a previous run see the green ✓ right away.
+  // Step 2 owns the live mic preview + permission polling.
   if (obStep === 2) {
     refreshPermissionUI();
     startPermissionPolling();
   } else {
     stopPermissionPolling();
+    stopMicTest();
   }
 
   document.getElementById('ob-step-counter').textContent = `第 ${obStep} 步 / 共 ${OB_STEPS} 步`;
@@ -776,24 +860,66 @@ function renderOnboarding() {
   document.getElementById('ob-prev').disabled = (obStep === 1);
   document.getElementById('ob-next').textContent = (obStep === OB_STEPS) ? '開始使用' : '下一步';
 
-  // Step 3: show backend-specific quick setup hint inline
   if (obStep === 3) {
     const setup = document.getElementById('ob-backend-setup');
     const choice = (document.querySelector('input[name="ob-backend"]:checked') || {}).value;
     if (choice === 'cloud') {
-      setup.innerHTML = '<div class="hint">完成後請從右上角 <strong>⚙</strong> 設定 Groq 金鑰(<a href="https://console.groq.com/keys" target="_blank">點此註冊</a>,免費)。</div>';
+      const stateHint = cachedKey
+        ? '<span style="color:var(--text2)">之前已儲存金鑰,可直接進下一步,或按下面按鈕重新測試。</span>'
+        : '<span style="color:var(--text2)">免費註冊金鑰:<a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a></span>';
+      setup.innerHTML = `
+        <div style="font-size:12px;margin-bottom:6px">${stateHint}</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="password" id="ob-cloud-key" placeholder="gsk_…" autocomplete="off" spellcheck="false"
+                 style="flex:1;height:32px;padding:0 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px">
+          <button class="btn-primary" onclick="obSaveCloudKey()" style="height:32px;padding:0 14px;font-size:12px">儲存並測試</button>
+        </div>
+        <div id="ob-cloud-status" style="margin-top:6px;font-size:12px;min-height:16px;line-height:1.5;color:var(--text2)"></div>
+      `;
+      if (cachedKey) document.getElementById('ob-cloud-key').value = cachedKey;
     } else if (choice === 'local') {
-      setup.innerHTML = '<div class="hint">完成後按 ● 開始時若模型尚未下載,會自動引導你下載對應模型。</div>';
+      setup.innerHTML = '<div class="hint">完成後按 ● 開始錄音時,若所需模型尚未下載,會自動引導你下載。</div>';
     } else {
       setup.innerHTML = '';
     }
   }
 }
 
+function _setStatusEl(el, msg, tone) {
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = ({ ok: 'var(--green)', err: 'var(--red)', info: 'var(--accent)' })[tone] || 'var(--text2)';
+}
+
+function validateAndSaveKey(inputId, statusId, successMsg, onSuccess) {
+  const input = document.getElementById(inputId);
+  const statusEl = document.getElementById(statusId);
+  const key = (input?.value || '').trim();
+  if (!key) { _setStatusEl(statusEl, '請輸入金鑰', 'err'); return; }
+  _setStatusEl(statusEl, '測試中…', 'muted');
+  fetch('/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})})
+    .then(r => r.json())
+    .then(r => {
+      if (r.ok) {
+        cachedKey = key;
+        _setStatusEl(statusEl, successMsg, 'ok');
+        if (onSuccess) onSuccess();
+      } else {
+        _setStatusEl(statusEl, '✗ ' + (r.error || '驗證失敗'), 'err');
+      }
+    })
+    .catch(e => _setStatusEl(statusEl, '✗ 網路錯誤:' + e, 'err'));
+}
+
+function obSaveCloudKey() {
+  validateAndSaveKey('ob-cloud-key', 'ob-cloud-status', '✓ 金鑰已驗證,可以進入下一步');
+}
+
 function completeOnboarding() {
   fetch('/onboarding/complete', {method: 'POST'});
   document.getElementById('onboarding-modal').classList.remove('open');
   stopPermissionPolling();
+  stopMicTest();
 }
 
 function setObPermissionStatus(msg, color) {
@@ -813,23 +939,62 @@ async function checkPermissionState() {
   return await window.pywebview.api.check_screen_capture_permission();
 }
 
+function _setBadge(id, granted) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = granted ? '✓ 已授權' : '尚未授權';
+  el.className = 'ob-perm-badge' + (granted ? ' granted' : '');
+}
+
 async function refreshPermissionUI() {
-  const r = await checkPermissionState();
-  const triggerBtn = document.querySelector('[onclick="triggerPermission()"]');
-  if (!r) {
-    setObPermissionStatus('授權偵測功能僅在 .app 內可用。', 'var(--text2)');
-    return false;
+  // Screen + mic checks are independent — fire them in parallel.
+  // Mic fallback: if a mic test stream is running, sounddevice already
+  // proved access, so we trust that even if AVFoundation misreports.
+  const api = window.pywebview && window.pywebview.api;
+  const [screenR, micR] = await Promise.all([
+    checkPermissionState(),
+    api?.check_microphone_permission ? api.check_microphone_permission() : Promise.resolve(null),
+  ]);
+
+  const screenOK = !!(screenR && screenR.granted);
+  const micOK = !!(micR && micR.granted) || _micTestRunning;
+
+  _setBadge('ob-screen-badge', screenOK);
+  _setBadge('ob-mic-badge', micOK);
+
+  const screenBtn = document.getElementById('ob-screen-trigger');
+  if (screenBtn) screenBtn.disabled = screenOK;
+
+  const micBtn = document.getElementById('ob-mic-trigger');
+  if (micBtn) {
+    micBtn.disabled = micOK && _micTestRunning;
+    micBtn.textContent = micOK ? (_micTestRunning ? '測試中…' : '✓ 已授權') : '授權並測試';
   }
-  if (r.granted) {
-    setObPermissionStatus('✓ 已完成授權,可以進入下一步。', 'var(--green)');
-    if (triggerBtn) triggerBtn.disabled = true;
-    stopPermissionPolling();
-    return true;
-  } else {
-    setObPermissionStatus('尚未授權 — 點上面按鈕開始。', 'var(--text2)');
-    if (triggerBtn) triggerBtn.disabled = false;
-    return false;
+
+  if (screenOK) stopPermissionPolling();
+  return screenOK && micOK;
+}
+
+let _micTestRunning = false;
+
+async function triggerMicPermission() {
+  if (!(window.pywebview && window.pywebview.api && window.pywebview.api.start_mic_test)) return;
+  const r = await window.pywebview.api.start_mic_test();
+  if (!r.ok) return;
+  _micTestRunning = true;
+  document.getElementById('ob-mic-wave').style.display = 'flex';
+  // Re-check after 800ms — gives macOS time to show + dismiss its prompt.
+  setTimeout(refreshPermissionUI, 800);
+}
+
+async function stopMicTest() {
+  if (!_micTestRunning) return;
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.stop_mic_test) {
+    await window.pywebview.api.stop_mic_test();
   }
+  _micTestRunning = false;
+  const wave = document.getElementById('ob-mic-wave');
+  if (wave) wave.style.display = 'none';
 }
 
 function startPermissionPolling() {
@@ -887,13 +1052,7 @@ document.addEventListener('change', e => {
 });
 
 function saveKeyFromSettings() {
-  const key = document.getElementById('settings-api-key').value.trim();
-  if (!key) { setStatus('金鑰是空的,沒有儲存。'); return; }
-  fetch('/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})})
-    .then(() => {
-      cachedKey = key;
-      setStatus('金鑰已儲存。');
-    });
+  validateAndSaveKey('settings-api-key', 'settings-key-status', '✓ 金鑰已驗證並儲存', updateKeyBanner);
 }
 
 
@@ -952,9 +1111,6 @@ function handleDownloadEvent(state) {
   }
 }
 
-function togglePause() { fetch('/pause', {method:'POST'}); }
-function stopRecording() { fetch('/stop', {method:'POST'}); }
-
 function uploadFile(input) {
   const file = input.files[0]; if (!file) return;
   const key = getKey();
@@ -965,11 +1121,6 @@ function uploadFile(input) {
     .then(r => r.json())
     .then(d => { if (!d.ok) setStatus('錯誤:' + d.error); });
   input.value = '';
-}
-
-function clearTranscript() {
-  document.getElementById('transcript').innerHTML = '';
-  fetch('/clear', {method:'POST'});
 }
 
 function openVocab() {

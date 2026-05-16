@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -34,9 +35,35 @@ PAUSE_DURATION = 1.5            # seconds of silence required to trigger
 MIN_SPEECH = 2.0                # don't trigger before this much speech buffered
 
 PORT = 8765
-BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native/.build/release/coreaudio_tap")
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".config.json")
-VOCAB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vocab.local")
+
+
+def _is_frozen_bundle() -> bool:
+    """True when running inside a py2app-built .app bundle (read-only)."""
+    return getattr(sys, "frozen", False) or "RESOURCEPATH" in os.environ
+
+
+def _resource_dir() -> str:
+    """Where bundled read-only assets live (Swift binary, static files).
+    In source mode this is the project root; in a py2app bundle it's
+    Contents/Resources/."""
+    if _is_frozen_bundle():
+        return os.environ.get("RESOURCEPATH") or os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _user_data_dir() -> str:
+    """Where mutable per-user state goes (config, vocab).
+    Source mode: project root (gitignored). Bundle: ~/Library/Application Support/Meeting Transcriber/."""
+    if _is_frozen_bundle():
+        d = os.path.expanduser("~/Library/Application Support/Meeting Transcriber")
+        os.makedirs(d, exist_ok=True)
+        return d
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BINARY = os.path.join(_resource_dir(), "native/.build/release/coreaudio_tap")
+CONFIG_FILE = os.path.join(_user_data_dir(), ".config.json")
+VOCAB_FILE = os.path.join(_user_data_dir(), ".vocab.local")
 
 # Hugging Face model registry — borrowed from lazy-take-notes/hf_model_resolver.
 # Models are cached in pywhispercpp's MODELS_DIR so this app shares the cache
@@ -49,7 +76,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "breeze-q8":           (BREEZE_REPO, "ggml-model-q8_0.bin"),
 }
 
-app = Flask(__name__, static_folder="static")
+app = Flask(__name__, static_folder=os.path.join(_resource_dir(), "static"))
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 
@@ -57,6 +84,8 @@ _recording = False
 _paused = False
 _language = "zh-en"  # default: bilingual Chinese + English
 _backend = "cloud"   # "cloud" (Groq) or "local" (whisper.cpp)
+_chunk_worker_thread: Optional[threading.Thread] = None
+_mic_test_stream = None  # separate stream used by onboarding mic preview
 
 # Download state (local backend only). Lock-protected so SSE clients can poll.
 _download_state: dict = {"active": False, "percent": 0, "model": "", "error": ""}
@@ -325,7 +354,7 @@ def load_vocab() -> str:
 
 @app.route("/")
 def index():
-    return send_file("static/index.html")
+    return send_file(os.path.join(_resource_dir(), "static/index.html"))
 
 
 @app.route("/events")
@@ -356,15 +385,30 @@ def events():
 
 @app.route("/key", methods=["POST"])
 def route_key():
+    """Validate against Groq before persisting — saving an invalid key
+    silently is the worst UX failure mode here."""
     key = (request.json or {}).get("key", "").strip()
-    if key:
-        save_api_key(key)
+    if not key:
+        return jsonify({"ok": False, "error": "金鑰是空的"})
+
+    try:
+        Groq(api_key=key).models.list()
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        if "401" in msg or "invalid" in low or "auth" in low:
+            return jsonify({"ok": False, "error": "金鑰無效,請確認複製完整。"})
+        if "connection" in low or "network" in low or "timeout" in low:
+            return jsonify({"ok": False, "error": "無法連線到 Groq,請檢查網路。"})
+        return jsonify({"ok": False, "error": f"驗證失敗: {msg[:120]}"})
+
+    save_api_key(key)
     return jsonify({"ok": True})
 
 
 @app.route("/start", methods=["POST"])
 def route_start():
-    global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
+    global _recording, _paused, _swift_proc, _mic_stream, _language, _backend, _chunk_worker_thread
 
     data = request.json or {}
     key = data.get("key", "").strip()
@@ -397,7 +441,8 @@ def route_start():
         callback=_mic_cb, blocksize=int(SAMPLE_RATE * 0.1),
     )
     _mic_stream.start()
-    threading.Thread(target=_chunk_worker, args=(key,), daemon=True).start()
+    _chunk_worker_thread = threading.Thread(target=_chunk_worker, args=(key,), daemon=True)
+    _chunk_worker_thread.start()
 
     return jsonify({"ok": True})
 
@@ -405,15 +450,44 @@ def route_start():
 @app.route("/pause", methods=["POST"])
 def route_pause():
     global _paused
+    entering_pause = not _paused
     _paused = not _paused
     _broadcast("state", {"recording": _recording, "paused": _paused})
     _set_status("Paused" if _paused else "Recording…")
+
+    # On entering pause, flush whatever's in the merged buffer so audio that
+    # accumulated below the chunk trigger threshold doesn't get lost. The
+    # chunker normally only fires on hitting 25s OR detecting a 1.5s silence
+    # pause — speech that ends right when the user clicks pause hits neither.
+    if entering_pause and _recording:
+        api_key = load_api_key()
+        threading.Thread(
+            target=_flush_pending_audio, args=(api_key,), daemon=True
+        ).start()
+
     return jsonify({"ok": True, "paused": _paused})
+
+
+def _flush_pending_audio(api_key: str):
+    """Drain remaining audio from sys/mic buffers and transcribe it.
+
+    Used by /pause entry and /stop. Idempotent — if buffer is empty / too
+    short it returns silently. Voice-activity gate in _transcribe still
+    filters out pure-silence flushes.
+    """
+    with _buf_lock:
+        sa = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
+        ma = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
+        _sys_buf.clear()
+        _mic_buf.clear()
+    audio = _mix_buffers(sa, ma)
+    if len(audio) > SAMPLE_RATE // 2:  # at least 0.5s
+        _transcribe(audio, api_key)
 
 
 @app.route("/stop", methods=["POST"])
 def route_stop():
-    global _recording, _paused, _swift_proc, _mic_stream
+    global _recording, _paused, _swift_proc, _mic_stream, _chunk_worker_thread
 
     _recording = False
     _paused = False
@@ -425,6 +499,14 @@ def route_stop():
     if _swift_proc:
         _swift_proc.terminate()
         _swift_proc = None
+
+    # Wait for the chunk worker to fully exit (including its final flush
+    # transcription). Without this, /stop returns before the last chunk
+    # finishes transcribing — and a follow-up /clear (from New session) gets
+    # raced by the late _append_line, leaving stale text in the transcript.
+    if _chunk_worker_thread is not None and _chunk_worker_thread.is_alive():
+        _chunk_worker_thread.join(timeout=15)
+        _chunk_worker_thread = None
 
     _broadcast("state", {"recording": False, "paused": False})
     _set_status(f"Stopped — {len(_lines)} segment(s) transcribed")
@@ -618,12 +700,24 @@ def _watch_stderr():
     while _swift_proc and _swift_proc.poll() is None:
         line = _swift_proc.stderr.readline().decode().strip()
         if line == "READY":
-            _set_status("Recording…")
+            _set_status("錄音中…")
+            _broadcast("sys_audio", {"ok": True})
         elif line.startswith("ERROR"):
+            # ScreenCaptureKit failed — usually means the user denied or
+            # never granted screen recording permission. Mic is independent
+            # and may still be working, but the user must know we can't
+            # capture the remote side of meetings until they grant it.
             _set_status(
-                "Audio error — grant Screen Recording permission in "
-                "System Settings → Privacy & Security → Screen & System Audio Recording"
+                "⚠ 系統音抓不到 — 系統設定 → 隱私權 → 螢幕錄製 找到 Meeting Transcriber 並開啟"
             )
+            _broadcast("sys_audio", {"ok": False, "msg": line})
+
+
+def _mic_test_cb(indata, frames, time_info, status):
+    """Mic callback used by onboarding's live-preview mode (not recording)."""
+    samples = indata[:, 0]
+    rms = float(min(1.0, np.sqrt(np.mean(samples ** 2)) * 12))
+    _broadcast("mic_test_level", rms)
 
 
 def _mic_cb(indata, frames, time_info, status):
@@ -771,53 +865,43 @@ def _chunk_worker(api_key: str):
         if _paused:
             continue
 
+        # Snapshot + decision + consume all happen under one lock acquisition.
+        # Otherwise a /pause-triggered flush thread can race in between
+        # snapshot and consume, and both threads transcribe the same audio.
+        # `_is_pause_boundary` is pure numpy on a snapshot, safe to call
+        # inside the lock.
+        mixed = None
         with _buf_lock:
             sys_len = sum(len(x) for x in _sys_buf)
             mic_len = sum(len(x) for x in _mic_buf)
-            buf_len = sys_len if sys_len else mic_len  # whichever is active
+            buf_len = sys_len if sys_len else mic_len
 
-        trigger, reason = _should_trigger(buf_len)
-        if not trigger:
-            continue
+            trigger, reason = _should_trigger(buf_len)
+            if not trigger:
+                continue
 
-        # Take a snapshot of the merged buffer (peek; don't consume yet).
-        with _buf_lock:
             sa = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
             ma = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
-        mixed = _mix_buffers(sa, ma)
+            mixed = _mix_buffers(sa, ma)
 
-        if reason == "pause-check" and not _is_pause_boundary(mixed):
-            continue  # tail not actually silent — keep accumulating
+            if reason == "pause-check" and not _is_pause_boundary(mixed):
+                continue  # tail not actually silent — keep accumulating
 
-        # Overlap retention strategy:
-        #  - 'cap' (hit 25 s with continuous speech): retain overlap so the next
-        #    chunk has context for what was mid-sentence.
-        #  - 'pause-check' (sentence ended naturally at silence): DON'T retain.
-        #    The overlap would carry a stale-speech tail into the next buffer,
-        #    which combined with following silence triggers a phantom chunk
-        #    of mostly-silent audio → Whisper hallucinates.
-        if reason == "cap":
-            with _buf_lock:
+            # 'cap' keeps an overlap tail for context across the cut.
+            # 'pause-check' clears everything — the sentence already ended,
+            # and a stale-speech tail would prime a phantom chunk on the next
+            # silence and Whisper would hallucinate.
+            if reason == "cap":
                 _sys_buf[:] = [sa[-overlap_samples:]] if len(sa) > overlap_samples else []
                 _mic_buf[:] = [ma[-overlap_samples:]] if len(ma) > overlap_samples else []
-        else:
-            with _buf_lock:
+            else:
                 _sys_buf.clear()
                 _mic_buf.clear()
 
-        threading.Thread(
-            target=_transcribe, args=(mixed, api_key), daemon=True
-        ).start()
+        threading.Thread(target=_transcribe, args=(mixed, api_key), daemon=True).start()
 
-    # flush remaining audio after stop
-    with _buf_lock:
-        sa = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
-        ma = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
-        _sys_buf.clear()
-        _mic_buf.clear()
-    audio = _mix_buffers(sa, ma)
-    if len(audio) > SAMPLE_RATE // 2:  # at least 0.5 s
-        _transcribe(audio, api_key)
+    # Flush remaining audio after stop (uses shared helper that /pause also calls).
+    _flush_pending_audio(api_key)
 
 
 def _transcribe(audio: np.ndarray, api_key: str):
@@ -972,6 +1056,57 @@ if __name__ == "__main__":
                 return {"ok": True}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
+
+        def check_microphone_permission(self):
+            """Return current microphone authorisation status without
+            triggering the system prompt. Uses AVFoundation —
+            `AVCaptureDevice.authorizationStatusForMediaType_('soun')`.
+
+            Status codes:
+              0 = NotDetermined (never asked)
+              1 = Restricted (parental controls etc)
+              2 = Denied
+              3 = Authorized
+            """
+            try:
+                from AVFoundation import AVCaptureDevice
+                status = int(AVCaptureDevice.authorizationStatusForMediaType_("soun"))
+                return {"ok": True, "granted": status == 3, "status": status}
+            except Exception as e:
+                return {"ok": False, "granted": False, "error": str(e)}
+
+        def start_mic_test(self):
+            """Open a mic stream so the user can see live waveform feedback.
+            Triggers macOS' mic permission prompt the first time. Audio is
+            NOT recorded — the callback only broadcasts level events."""
+            global _mic_test_stream
+            if _mic_test_stream is not None:
+                return {"ok": True, "already_running": True}
+            try:
+                _mic_test_stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype=np.float32,
+                    callback=_mic_test_cb,
+                    blocksize=int(SAMPLE_RATE * 0.1),
+                )
+                _mic_test_stream.start()
+                return {"ok": True}
+            except Exception as e:
+                _mic_test_stream = None
+                return {"ok": False, "error": str(e)}
+
+        def stop_mic_test(self):
+            """Close the onboarding mic-preview stream."""
+            global _mic_test_stream
+            if _mic_test_stream is not None:
+                try:
+                    _mic_test_stream.stop()
+                    _mic_test_stream.close()
+                except Exception:
+                    pass
+                _mic_test_stream = None
+            return {"ok": True}
 
         def check_screen_capture_permission(self):
             """Query the current screen-capture permission state without

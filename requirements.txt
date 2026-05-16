@@ -5,3 +5,4 @@ flask>=3.0.0
 pywebview>=5.0
 pywhispercpp>=1.2.0
 huggingface_hub>=0.20.0
+pyobjc-framework-AVFoundation>=10.0
