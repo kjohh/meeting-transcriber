@@ -83,3 +83,7 @@ session 期間語言 / backend 鎖定（避免「UI 改了但 in-flight session 
 ## 未來計畫
 
 詳細待辦見 [TODO.md](TODO.md)。整體 UI / branding rebrand + Apple Developer 帳號簽章是計劃中下一階段。
+
+## 致謝
+
+本工具的核心引擎 — **silence-aware chunker、HF Hub model resolver、Whisper + Breeze ASR 整合** — 借鑒自同事 [@CJHwong](https://github.com/CJHwong) 的 [lazy-take-notes](https://github.com/CJHwong/lazy-take-notes)。lazy-take-notes 是一個極優秀的 terminal-based 會議轉錄工具,本專案算是基於它的概念延伸出一個有 UI、有 onboarding、能打包成 .app 給非技術朋友安裝的版本。模型 cache 路徑刻意與 lazy-take-notes 共用,如果兩個工具都裝,模型不會重複下載。
