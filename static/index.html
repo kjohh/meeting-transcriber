@@ -209,6 +209,75 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 }
 .settings-section-highlight { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: var(--r); transition: outline 0.4s; }
 
+/* Onboarding step content */
+.ob-step { min-height: 240px; }
+.ob-bullets {
+  margin: 6px 0 0 0; padding: 0;
+  list-style: none;
+  font-size: 12px; color: var(--text2); line-height: 1.65;
+}
+.ob-bullets li { position: relative; padding-left: 12px; }
+.ob-bullets li::before {
+  content: "・"; position: absolute; left: 0; color: var(--text2);
+}
+.info-icon {
+  position: relative;
+  display: inline-block;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--surface2);
+  color: var(--text2);
+  font-size: 10px;
+  text-align: center; line-height: 14px;
+  cursor: help;
+  user-select: none;
+}
+.info-icon:hover { background: var(--border); color: var(--text); }
+.info-icon::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1c1c1c;
+  color: #f0f0f0;
+  padding: 8px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  line-height: 1.55;
+  width: 260px;
+  white-space: normal;
+  text-align: left;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.15s, visibility 0.15s;
+  pointer-events: none;
+  z-index: 100;
+}
+.info-icon::before {
+  content: '';
+  position: absolute;
+  bottom: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: #1c1c1c;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.15s, visibility 0.15s;
+}
+.info-icon:hover::after,
+.info-icon:hover::before { visibility: visible; opacity: 1; }
+.ob-backend-option {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 12px; border: 1px solid var(--border); border-radius: var(--r);
+  cursor: pointer; transition: border-color 0.15s, background 0.15s;
+}
+.ob-backend-option:hover { background: var(--surface2); }
+.ob-backend-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; }
+.ob-backend-option:has(input:checked) { border-color: var(--accent); background: var(--surface2); }
+
 /* ── status ── */
 .status-bar {
   font-size: 12px; color: var(--text2);
@@ -223,52 +292,157 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
 <div class="header">
   <h1>Meeting Transcriber</h1>
-  <span class="badge" id="badge">Idle</span>
+  <span class="badge" id="badge">待機</span>
 </div>
 
 <div class="btn-row">
-  <button id="btn-record" class="btn-start" onclick="onRecordClick()">● Start</button>
-  <button id="btn-new" onclick="newSession()" title="End current session and start fresh">↻ New</button>
+  <button id="btn-record" class="btn-start" onclick="onRecordClick()">● 開始</button>
+  <button id="btn-new" onclick="newSession()" title="結束目前的會議,清空逐字稿開新場">↻ 新會議</button>
   <div class="divider"></div>
   <select id="lang-select" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
     <option value="zh-en">中英混合</option>
     <option value="zh">中文</option>
     <option value="en">English</option>
-    <option value="auto">Auto</option>
+    <option value="auto">自動偵測</option>
   </select>
   <select id="backend-select" onchange="onBackendChange()" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
-    <option value="cloud">☁ Cloud (Groq)</option>
-    <option value="local">💻 Local (whisper.cpp)</option>
+    <option value="local">🔒 本機</option>
+    <option value="cloud">🌐 雲端</option>
   </select>
   <div class="divider"></div>
-  <button id="btn-upload" onclick="document.getElementById('upload-input').click()">↑ Upload file</button>
+  <button id="btn-upload" onclick="document.getElementById('upload-input').click()">↑ 上傳檔案</button>
   <input type="file" id="upload-input" accept="audio/*,video/*" onchange="uploadFile(this)">
-  <button id="btn-vocab" onclick="openVocab()">Vocab</button>
-  <button id="btn-save" class="btn-save" onclick="saveTranscript()">Save .txt</button>
-  <button id="btn-settings" onclick="openSettings()" title="Settings" aria-label="Settings" style="margin-left:6px;width:32px;padding:0;font-size:16px">⚙</button>
+  <button id="btn-vocab" onclick="openVocab()">詞彙</button>
+  <button id="btn-save" class="btn-save" onclick="saveTranscript()">儲存 .txt</button>
+  <button id="btn-settings" onclick="openSettings()" title="設定" aria-label="設定" style="margin-left:6px;width:32px;padding:0;font-size:16px">⚙</button>
+</div>
+
+<div class="modal-backdrop" id="onboarding-modal">
+  <div class="modal" style="width:580px">
+    <div class="modal-header">
+      <span id="ob-step-title">歡迎</span>
+      <span style="float:right;font-weight:400;color:var(--text2);font-size:12px" id="ob-step-counter">第 1 步 / 共 4 步</span>
+    </div>
+    <div class="modal-body">
+
+      <div class="ob-step" data-step="1">
+        <div style="font-size:36px;margin-bottom:12px">👋</div>
+        <div style="font-size:15px;line-height:1.7">
+          <strong>Meeting Transcriber</strong> 會同時錄你的麥克風與電腦播放的聲音，即時轉成逐字稿。<br><br>
+          線上、實體、混合會議都能用。<br><br>
+          <span style="color:var(--text2);font-size:13px">接下來幾步帶你完成初始設定。</span>
+        </div>
+      </div>
+
+      <div class="ob-step" data-step="2" style="display:none">
+        <div style="font-size:36px;margin-bottom:12px">🎙</div>
+        <div style="font-size:14px;line-height:1.7">
+          <strong>螢幕錄製授權</strong><br><br>
+          要錄到電腦播放的聲音,macOS 需要你授權「螢幕錄製」權限。
+          這個工具只用音訊,不會錄你的畫面。<br><br>
+          點下面按鈕,macOS 會跳出對話框,點「打開系統設定」→
+          在清單找到 Meeting Transcriber → 開啟開關即可。
+        </div>
+        <div style="display:flex;gap:8px;margin-top:14px;align-items:center">
+          <button class="btn-primary" onclick="triggerPermission()" style="height:34px;padding:0 16px">🔓 立即授權</button>
+          <button class="btn-secondary" onclick="openScreenRecordingSettings()" style="height:34px;padding:0 14px;font-size:13px">直接打開系統設定</button>
+        </div>
+        <div id="ob-permission-status" style="margin-top:10px;font-size:12px;color:var(--accent);min-height:16px;line-height:1.5"></div>
+        <div style="margin-top:8px;font-size:12px;color:var(--text2);line-height:1.6">
+          macOS 15 之後每個月會跳一次確認對話框(藍色舉手圖示),按「允許」即可,不影響使用。
+        </div>
+      </div>
+
+      <div class="ob-step" data-step="3" style="display:none">
+        <div style="font-size:36px;margin-bottom:12px">⚙</div>
+        <div style="font-size:14px;line-height:1.7;margin-bottom:14px">
+          <strong>選擇轉錄方式</strong><br>
+          <span style="color:var(--text2);font-size:12px">兩種之後都可以再切換，先選一個開始即可。</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <label class="ob-backend-option">
+            <input type="radio" name="ob-backend" value="local" checked>
+            <div style="flex:1">
+              <div style="display:flex;align-items:center;gap:6px">
+                <span style="font-size:18px">🔒</span>
+                <strong>本機模式</strong>
+                <span style="color:var(--accent);font-size:11px;background:rgba(52,199,89,0.12);padding:1px 6px;border-radius:8px">建議敏感會議</span>
+                <span class="info-icon" data-tooltip="使用 whisper.cpp 在 macOS 本機推論。中英混合會議自動使用 Breeze ASR(約 1.5 GB),其他語言使用 Whisper turbo(約 834 MB)。Apple Silicon Mac 用 Metal 加速。">ⓘ</span>
+              </div>
+              <ul class="ob-bullets">
+                <li>會議錄音完全留在你電腦，不上傳任何地方</li>
+                <li>速度稍慢（每段約 1–3 秒）</li>
+                <li>第一次使用需先下載模型</li>
+              </ul>
+            </div>
+          </label>
+          <label class="ob-backend-option">
+            <input type="radio" name="ob-backend" value="cloud">
+            <div style="flex:1">
+              <div style="display:flex;align-items:center;gap:6px">
+                <span style="font-size:18px">🌐</span>
+                <strong>雲端模式</strong>
+                <span class="info-icon" data-tooltip="使用 Groq 的 Whisper API。Groq 服務條款明訂禁止用客戶輸入訓練 AI 模型,但音訊仍會經第三方伺服器處理。">ⓘ</span>
+              </div>
+              <ul class="ob-bullets">
+                <li>速度最快（每段約 1 秒）</li>
+                <li>音訊會傳到外部服務處理</li>
+                <li>需要網路 + 註冊免費金鑰</li>
+              </ul>
+            </div>
+          </label>
+        </div>
+        <div id="ob-backend-setup" style="margin-top:14px"></div>
+      </div>
+
+      <div class="ob-step" data-step="4" style="display:none">
+        <div style="font-size:36px;margin-bottom:12px">✅</div>
+        <div style="font-size:15px;line-height:1.7">
+          <strong>設定完成</strong><br><br>
+          按工具列的 <strong>● 開始</strong> 錄你的第一場會議。<br>
+          之後想改設定或重看這份說明，點右上角的 <strong>⚙</strong> 即可。
+        </div>
+      </div>
+
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="ob-prev" onclick="obPrev()">上一步</button>
+      <button class="btn-primary" id="ob-next" onclick="obNext()">下一步</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal-backdrop" id="settings-modal">
   <div class="modal" style="width:560px">
-    <div class="modal-header">Settings</div>
+    <div class="modal-header">設定</div>
     <div class="modal-body">
 
       <!-- API Key section -->
       <div class="settings-section">
-        <div class="settings-section-title">Groq API Key</div>
-        <div class="hint">Required only for Cloud backend. Stored locally in <code>.config.json</code> (git-ignored).</div>
+        <div class="settings-section-title">Groq API 金鑰</div>
+        <div class="hint">只有雲端模式需要。儲存在本機 <code>.config.json</code>(已加入 git-ignore)。</div>
         <div style="display:flex;gap:6px;align-items:center;margin-top:8px">
           <input type="password" id="settings-api-key" placeholder="gsk_…" autocomplete="off" spellcheck="false" style="flex:1;height:32px;padding:0 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px">
-          <button class="btn-primary" onclick="saveKeyFromSettings()" style="height:32px;padding:0 14px">Save</button>
+          <button class="btn-primary" onclick="saveKeyFromSettings()" style="height:32px;padding:0 14px">儲存</button>
+        </div>
+      </div>
+
+      <!-- Help section -->
+      <div class="settings-section">
+        <div class="settings-section-title">說明</div>
+        <div class="hint">忘了怎麼用?重新看一次引導。</div>
+        <div style="margin-top:8px">
+          <button class="btn-secondary" onclick="closeSettings(); openOnboarding();" style="height:30px;padding:0 14px;font-size:13px">重新看引導</button>
         </div>
       </div>
 
       <!-- Models section -->
       <div class="settings-section" id="settings-models-section">
-        <div class="settings-section-title">Local Models</div>
+        <div class="settings-section-title">本機模型</div>
         <div class="hint">
-          Download the model matching your meeting language. Models are cached in
-          <code>~/Library/Application Support/pywhispercpp/models/</code> and shared with lazy-take-notes.
+          下載符合你會議語言的模型。檔案存在
+          <code>~/Library/Application Support/pywhispercpp/models/</code>,
+          與 lazy-take-notes 共用同個資料夾。
         </div>
         <div id="model-list" style="display:flex;flex-direction:column;gap:8px;margin-top:10px"></div>
         <div id="download-progress" style="display:none;margin-top:14px">
@@ -281,24 +455,24 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary" onclick="closeSettings()">Close</button>
+      <button class="btn-secondary" onclick="closeSettings()">關閉</button>
     </div>
   </div>
 </div>
 
 <div class="modal-backdrop" id="vocab-modal">
   <div class="modal">
-    <div class="modal-header">Custom Vocabulary</div>
+    <div class="modal-header">自訂詞彙</div>
     <div class="modal-body">
       <div class="hint">
-        每行一個專有名詞 / 品牌 / 縮寫。# 開頭為註解。<br>
-        儲存後立即生效（下次 chunk 轉錄就會用到），檔案存在本機，已 git-ignored。
+        每行一個專有名詞 / 品牌 / 縮寫。以 # 開頭的行會被當註解忽略。<br>
+        儲存後下一段轉錄就會生效。檔案存在本機,已加入 git-ignore。
       </div>
       <textarea id="vocab-textarea" placeholder="GoFreight&#10;Loki&#10;HBL"></textarea>
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary" onclick="closeVocab()">Cancel</button>
-      <button class="btn-primary" onclick="saveVocab()">Save</button>
+      <button class="btn-secondary" onclick="closeVocab()">取消</button>
+      <button class="btn-primary" onclick="saveVocab()">儲存</button>
     </div>
   </div>
 </div>
@@ -316,17 +490,17 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
 <div class="transcript-card" id="transcript-card" style="display:none">
   <div class="transcript-header">
-    Transcript
-    <button class="btn-copy" onclick="copyTranscript()">Copy all</button>
+    逐字稿
+    <button class="btn-copy" onclick="copyTranscript()">複製全部</button>
   </div>
   <div id="transcript"></div>
 </div>
 
 <div id="transcript-empty" style="flex:1;display:flex;align-items:center;justify-content:center">
-  <span style="font-size:13px;color:var(--text2)">Transcript will appear here once recording starts</span>
+  <span style="font-size:13px;color:var(--text2)">開始錄音後逐字稿會出現在這裡</span>
 </div>
 
-<div class="status-bar" id="status">Ready — press ● Start to begin recording</div>
+<div class="status-bar" id="status">準備就緒 — 按 ● 開始錄音</div>
 
 <script>
 let recording = false, paused = false;
@@ -362,6 +536,11 @@ es.onmessage = ({data}) => {
   const msg = JSON.parse(data);
   if (msg.type === 'init') {
     if (msg.key) cachedKey = msg.key;
+    if (msg.onboarding_completed === false) {
+      // First launch — show onboarding once SSE init lands. Delay slightly so
+      // the rest of the UI has rendered first.
+      setTimeout(openOnboarding, 200);
+    }
     if (msg.language) document.getElementById('lang-select').value = msg.language;
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
     if (msg.models) modelStatus = msg.models;
@@ -411,16 +590,16 @@ function appendLine(text) {
 }
 
 function sync() {
-  // ── Record toggle (Start → Pause → Resume) ──
+  // ── Record toggle (開始 → 暫停 → 繼續) ──
   const btn = document.getElementById('btn-record');
   if (!recording) {
-    btn.textContent = '● Start';
+    btn.textContent = '● 開始';
     btn.className = 'btn-start';
   } else if (paused) {
-    btn.textContent = '▶ Resume';
+    btn.textContent = '▶ 繼續';
     btn.className = 'btn-start';
   } else {
-    btn.textContent = '⏸ Pause';
+    btn.textContent = '⏸ 暫停';
     btn.className = '';
   }
 
@@ -448,7 +627,7 @@ function sync() {
   document.getElementById('btn-new').disabled  = activeRecording || transcriptEmpty;
 
   const badge = document.getElementById('badge');
-  badge.textContent = recording ? (paused ? 'Paused' : 'Recording') : 'Idle';
+  badge.textContent = recording ? (paused ? '暫停' : '錄音中') : '待機';
   badge.className = 'badge' + (recording && !paused ? ' recording' : paused ? ' paused' : '');
   document.getElementById('audio-wave').className = 'audio-wave' + (recording && !paused ? ' visible' : '');
   if (!recording) {
@@ -476,12 +655,12 @@ function startRecording() {
   const key      = getKey();
 
   if (backend === 'cloud' && !key) {
-    setStatus('Enter your Groq API key first (or switch to Local backend).'); return;
+    setStatus('請先設定 Groq 金鑰(或切換到本機模式)。'); return;
   }
   if (backend === 'local') {
     const required = (language === 'zh' || language === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
     if (!modelStatus[required] || !modelStatus[required].downloaded) {
-      setStatus('Local model not downloaded — opening download dialog.');
+      setStatus('本機模型尚未下載 — 開啟下載視窗。');
       openSettings('models', required);
       return;
     }
@@ -489,7 +668,7 @@ function startRecording() {
 
   fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, language, backend})})
     .then(r => r.json())
-    .then(d => { if (!d.ok) setStatus('Error: ' + d.error); });
+    .then(d => { if (!d.ok) setStatus('錯誤:' + d.error); });
 }
 
 function newSession() {
@@ -501,7 +680,7 @@ function newSession() {
       document.getElementById('transcript').innerHTML = '';
       document.getElementById('transcript-card').style.display = 'none';
       document.getElementById('transcript-empty').style.display = 'flex';
-      setStatus('Ready for a new session.');
+      setStatus('準備就緒,可以開始新會議了。');
       sync();
     });
 }
@@ -513,7 +692,7 @@ function onBackendChange() {
   const backend = document.getElementById('backend-select').value;
   fetch('/backend', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({backend})})
     .then(r => r.json())
-    .then(() => setStatus('Backend: ' + (backend === 'local' ? 'Local (whisper.cpp)' : 'Cloud (Groq)')));
+    .then(() => setStatus('已切換到' + (backend === 'local' ? '本機模式' : '雲端模式')));
   if (backend === 'local') {
     const lang = document.getElementById('lang-select').value;
     const required = (lang === 'zh' || lang === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
@@ -544,21 +723,184 @@ function closeSettings() {
   document.getElementById('settings-modal').classList.remove('open');
 }
 
+/* ── Onboarding ── */
+let obStep = 1;
+const OB_STEPS = 4;
+
+function openOnboarding() {
+  obStep = 1;
+  renderOnboarding();
+  document.getElementById('onboarding-modal').classList.add('open');
+}
+
+function obNext() {
+  if (obStep === 3) {
+    // Persist the backend choice the user picked on step 3, then advance.
+    const choice = document.querySelector('input[name="ob-backend"]:checked');
+    if (choice) {
+      const backend = choice.value;
+      document.getElementById('backend-select').value = backend;
+      fetch('/backend', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({backend})});
+    }
+  }
+  if (obStep < OB_STEPS) {
+    obStep++;
+    renderOnboarding();
+  } else {
+    completeOnboarding();
+  }
+}
+
+function obPrev() {
+  if (obStep > 1) { obStep--; renderOnboarding(); }
+}
+
+function renderOnboarding() {
+  document.querySelectorAll('.ob-step').forEach(el => {
+    el.style.display = (parseInt(el.dataset.step) === obStep) ? 'block' : 'none';
+  });
+
+  // Step 2 owns its own permission-polling lifecycle: start when entering,
+  // stop when leaving. Re-check current state immediately so users who
+  // already authorised on a previous run see the green ✓ right away.
+  if (obStep === 2) {
+    refreshPermissionUI();
+    startPermissionPolling();
+  } else {
+    stopPermissionPolling();
+  }
+
+  document.getElementById('ob-step-counter').textContent = `第 ${obStep} 步 / 共 ${OB_STEPS} 步`;
+  const titles = {1: '歡迎', 2: '螢幕錄製授權', 3: '選擇轉錄方式', 4: '完成'};
+  document.getElementById('ob-step-title').textContent = titles[obStep];
+  document.getElementById('ob-prev').disabled = (obStep === 1);
+  document.getElementById('ob-next').textContent = (obStep === OB_STEPS) ? '開始使用' : '下一步';
+
+  // Step 3: show backend-specific quick setup hint inline
+  if (obStep === 3) {
+    const setup = document.getElementById('ob-backend-setup');
+    const choice = (document.querySelector('input[name="ob-backend"]:checked') || {}).value;
+    if (choice === 'cloud') {
+      setup.innerHTML = '<div class="hint">完成後請從右上角 <strong>⚙</strong> 設定 Groq 金鑰(<a href="https://console.groq.com/keys" target="_blank">點此註冊</a>,免費)。</div>';
+    } else if (choice === 'local') {
+      setup.innerHTML = '<div class="hint">完成後按 ● 開始時若模型尚未下載,會自動引導你下載對應模型。</div>';
+    } else {
+      setup.innerHTML = '';
+    }
+  }
+}
+
+function completeOnboarding() {
+  fetch('/onboarding/complete', {method: 'POST'});
+  document.getElementById('onboarding-modal').classList.remove('open');
+  stopPermissionPolling();
+}
+
+function setObPermissionStatus(msg, color) {
+  const el = document.getElementById('ob-permission-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = color || 'var(--accent)';
+}
+
+let permPollingInterval = null;
+let permPollingDeadline = 0;
+
+async function checkPermissionState() {
+  if (!(window.pywebview && window.pywebview.api && window.pywebview.api.check_screen_capture_permission)) {
+    return null;
+  }
+  return await window.pywebview.api.check_screen_capture_permission();
+}
+
+async function refreshPermissionUI() {
+  const r = await checkPermissionState();
+  const triggerBtn = document.querySelector('[onclick="triggerPermission()"]');
+  if (!r) {
+    setObPermissionStatus('授權偵測功能僅在 .app 內可用。', 'var(--text2)');
+    return false;
+  }
+  if (r.granted) {
+    setObPermissionStatus('✓ 已完成授權,可以進入下一步。', 'var(--green)');
+    if (triggerBtn) triggerBtn.disabled = true;
+    stopPermissionPolling();
+    return true;
+  } else {
+    setObPermissionStatus('尚未授權 — 點上面按鈕開始。', 'var(--text2)');
+    if (triggerBtn) triggerBtn.disabled = false;
+    return false;
+  }
+}
+
+function startPermissionPolling() {
+  stopPermissionPolling();
+  permPollingDeadline = Date.now() + 90_000; // give up after 90 sec idle
+  permPollingInterval = setInterval(async () => {
+    if (Date.now() > permPollingDeadline) { stopPermissionPolling(); return; }
+    const granted = await refreshPermissionUI();
+    if (granted) stopPermissionPolling();
+  }, 2000);
+}
+
+function stopPermissionPolling() {
+  if (permPollingInterval) { clearInterval(permPollingInterval); permPollingInterval = null; }
+}
+
+function triggerPermission() {
+  // Spawn the audio binary briefly so macOS invokes its screen-recording
+  // permission dialog. macOS will not show the dialog without a real
+  // capture attempt — there's no API to programmatically request it.
+  if (!(window.pywebview && window.pywebview.api && window.pywebview.api.trigger_screen_capture_permission)) {
+    setObPermissionStatus('授權功能僅在 .app 內可用。', 'var(--text2)');
+    return;
+  }
+  setObPermissionStatus('正在觸發授權對話框…', 'var(--accent)');
+  window.pywebview.api.trigger_screen_capture_permission().then(r => {
+    if (!r.ok) {
+      setObPermissionStatus('觸發失敗:' + r.error, 'var(--red)');
+      return;
+    }
+    setObPermissionStatus('macOS 對話框已彈出 — 完成系統設定後會自動偵測。', 'var(--accent)');
+    // Extend polling deadline so we keep checking while user navigates
+    // System Settings and toggles the switch.
+    permPollingDeadline = Date.now() + 120_000;
+    startPermissionPolling();
+  });
+}
+
+function openScreenRecordingSettings() {
+  if (!(window.pywebview && window.pywebview.api && window.pywebview.api.open_screen_recording_settings)) {
+    setObPermissionStatus('此功能僅限 .app 環境。', 'var(--text2)');
+    return;
+  }
+  window.pywebview.api.open_screen_recording_settings();
+  setObPermissionStatus('已開啟系統設定,完成授權後會自動偵測。', 'var(--accent)');
+  permPollingDeadline = Date.now() + 120_000;
+  startPermissionPolling();
+}
+
+// Step 3 backend radio change — refresh inline setup hint
+document.addEventListener('change', e => {
+  if (e.target && e.target.name === 'ob-backend' && obStep === 3) {
+    renderOnboarding();
+  }
+});
+
 function saveKeyFromSettings() {
   const key = document.getElementById('settings-api-key').value.trim();
-  if (!key) { setStatus('Empty key — not saved.'); return; }
+  if (!key) { setStatus('金鑰是空的,沒有儲存。'); return; }
   fetch('/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})})
     .then(() => {
       cachedKey = key;
-      setStatus('API key saved.');
+      setStatus('金鑰已儲存。');
     });
 }
 
 
 function renderModelList(highlight) {
   const labels = {
-    'large-v3-turbo-q8_0': {name: 'large-v3-turbo (general, multilingual)', size: '834 MB'},
-    'breeze-q8':           {name: 'Breeze ASR 25 (繁中 + 中英夾雜強化)',    size: '1.5 GB'},
+    'large-v3-turbo-q8_0': {name: '通用模型(英文 / 其他語言)', size: '834 MB'},
+    'breeze-q8':           {name: 'Breeze ASR 25(繁中 + 中英夾雜強化)', size: '1.5 GB'},
   };
   const root = document.getElementById('model-list');
   root.innerHTML = '';
@@ -573,8 +915,8 @@ function renderModelList(highlight) {
         <div style="font-size:11px;color:var(--text2)">${alias} · ${info.size}</div>
       </div>
       <div>${downloaded
-        ? '<span style="color:var(--green);font-size:12px">✓ Downloaded</span>'
-        : `<button class="btn-primary" style="height:28px;padding:0 12px;font-size:12px" onclick="downloadModel('${alias}')">Download</button>`}</div>
+        ? '<span style="color:var(--green);font-size:12px">✓ 已下載</span>'
+        : `<button class="btn-primary" style="height:28px;padding:0 12px;font-size:12px" onclick="downloadModel('${alias}')">下載</button>`}</div>
     `;
     root.appendChild(row);
   });
@@ -584,9 +926,9 @@ function downloadModel(alias) {
   fetch('/model/download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model: alias})})
     .then(r => r.json())
     .then(d => {
-      if (!d.ok) { setStatus('Download error: ' + d.error); return; }
+      if (!d.ok) { setStatus('下載錯誤:' + d.error); return; }
       document.getElementById('download-progress').style.display = 'block';
-      document.getElementById('download-label').textContent = 'Downloading ' + alias + '…';
+      document.getElementById('download-label').textContent = '正在下載 ' + alias + '…';
     });
 }
 
@@ -595,16 +937,16 @@ function handleDownloadEvent(state) {
   const label = document.getElementById('download-label');
   const wrap = document.getElementById('download-progress');
   if (!state.active && state.error) {
-    label.textContent = 'Error: ' + state.error;
+    label.textContent = '錯誤:' + state.error;
     return;
   }
   if (state.active) {
     wrap.style.display = 'block';
     bar.style.width = state.percent + '%';
-    label.textContent = 'Downloading ' + state.model + '… ' + state.percent + '%';
+    label.textContent = '正在下載 ' + state.model + '… ' + state.percent + '%';
   } else if (state.percent === 100) {
     bar.style.width = '100%';
-    label.textContent = '✓ ' + state.model + ' downloaded';
+    label.textContent = '✓ ' + state.model + ' 下載完成';
     // Refresh model list state
     fetch('/backend').then(r => r.json()).then(d => { modelStatus = d.models; renderModelList(); });
   }
@@ -616,12 +958,12 @@ function stopRecording() { fetch('/stop', {method:'POST'}); }
 function uploadFile(input) {
   const file = input.files[0]; if (!file) return;
   const key = getKey();
-  if (!key) { setStatus('Enter your Groq API key first.'); return; }
+  if (!key) { setStatus('請先設定 Groq 金鑰。'); return; }
   const fd = new FormData(); fd.append('file', file); fd.append('key', key);
-  setStatus(`Uploading ${file.name}…`);
+  setStatus(`正在上傳 ${file.name}…`);
   fetch('/upload', {method:'POST', body: fd})
     .then(r => r.json())
-    .then(d => { if (!d.ok) setStatus('Error: ' + d.error); });
+    .then(d => { if (!d.ok) setStatus('錯誤:' + d.error); });
   input.value = '';
 }
 
@@ -646,16 +988,16 @@ function saveVocab() {
     .then(r => r.json())
     .then(() => {
       closeVocab();
-      setStatus('Vocabulary saved.');
+      setStatus('詞彙已儲存。');
     });
 }
 
 function copyTranscript() {
   const text = document.getElementById('transcript').innerText;
-  if (!text.trim()) { setStatus('Nothing to copy.'); return; }
+  if (!text.trim()) { setStatus('沒有內容可以複製。'); return; }
   navigator.clipboard.writeText(text).then(
-    () => setStatus('Copied transcript to clipboard.'),
-    () => setStatus('Copy failed.')
+    () => setStatus('逐字稿已複製到剪貼簿。'),
+    () => setStatus('複製失敗。')
   );
 }
 
@@ -664,9 +1006,9 @@ function saveTranscript() {
   // when opened in a plain browser (no pywebview).
   if (window.pywebview && window.pywebview.api && window.pywebview.api.save_transcript) {
     window.pywebview.api.save_transcript().then(r => {
-      if (r.ok)               setStatus('Saved: ' + r.path);
-      else if (r.cancelled)   setStatus('Save cancelled.');
-      else                    setStatus('Save failed: ' + (r.error || 'unknown'));
+      if (r.ok)               setStatus('已儲存:' + r.path);
+      else if (r.cancelled)   setStatus('取消儲存。');
+      else                    setStatus('儲存失敗:' + (r.error || '未知錯誤'));
     });
   } else {
     window.location.href = '/transcript';

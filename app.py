@@ -148,6 +148,16 @@ def save_backend(backend: str):
     _write_config(cfg)
 
 
+def load_onboarding_completed() -> bool:
+    return bool(_read_config().get("onboarding_completed", False))
+
+
+def save_onboarding_completed(value: bool):
+    cfg = _read_config()
+    cfg["onboarding_completed"] = bool(value)
+    _write_config(cfg)
+
+
 # ─── Local whisper backend ────────────────────────────────────────────────────
 
 def pick_local_model(language: str) -> str:
@@ -326,7 +336,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -513,6 +523,12 @@ def route_backend_post():
         return jsonify({"ok": False, "error": "Invalid backend"})
     save_backend(backend)
     return jsonify({"ok": True, "backend": backend})
+
+
+@app.route("/onboarding/complete", methods=["POST"])
+def route_onboarding_complete():
+    save_onboarding_completed(True)
+    return jsonify({"ok": True})
 
 
 @app.route("/model/download", methods=["POST"])
@@ -919,6 +935,61 @@ if __name__ == "__main__":
 
     class JSAPI:
         """Bridge exposed to the webview JS as `window.pywebview.api`."""
+
+        def trigger_screen_capture_permission(self):
+            """Briefly spawn the audio binary to invoke macOS' permission prompt.
+
+            macOS only shows the screen recording permission dialog when an app
+            actually attempts to use ScreenCaptureKit — so we have to trigger
+            a real capture to get the prompt. The binary is terminated after
+            ~1.5s; the dialog stays up until the user responds.
+            """
+            if not os.path.exists(BINARY):
+                return {"ok": False, "error": "Audio binary not built"}
+            try:
+                proc = subprocess.Popen(
+                    [BINARY],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(1.5)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        def open_screen_recording_settings(self):
+            """Open System Settings → Privacy → Screen Recording directly."""
+            try:
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                ])
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        def check_screen_capture_permission(self):
+            """Query the current screen-capture permission state without
+            triggering the permission dialog. Used by the onboarding modal to
+            poll for completion after the user grants access in System Settings.
+
+            Uses Quartz's `CGPreflightScreenCaptureAccess` — a documented
+            preflight API that returns the current grant state without
+            requesting it. Screen recording + system audio share the same
+            TCC service (`kTCCServiceScreenCapture`), so this is accurate
+            for our case.
+            """
+            try:
+                from Quartz import CGPreflightScreenCaptureAccess
+                granted = bool(CGPreflightScreenCaptureAccess())
+                return {"ok": True, "granted": granted}
+            except Exception as e:
+                return {"ok": False, "granted": False, "error": str(e)}
 
         def save_transcript(self):
             """Show native macOS save dialog and write transcript to chosen path."""
