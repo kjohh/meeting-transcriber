@@ -519,10 +519,11 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
     <div class="modal-header">自訂詞彙</div>
     <div class="modal-body">
       <div class="hint">
-        每行一個專有名詞 / 品牌 / 縮寫。以 # 開頭的行會被當註解忽略。<br>
-        儲存後下一段轉錄就會生效。檔案存在本機,已加入 git-ignore。
+        會議常出現的<strong>專有名詞、品牌、縮寫、人名</strong>放這裡,
+        Whisper 模型會優先辨識成這些詞,避免被聽成相似發音的字。<br>
+        每行一個,以 <code>#</code> 開頭的行是註解。儲存後下一段轉錄就會生效。
       </div>
-      <textarea id="vocab-textarea" placeholder="GoFreight&#10;Loki&#10;HBL"></textarea>
+      <textarea id="vocab-textarea" placeholder="Figma&#10;ChatGPT&#10;Anthropic&#10;OKR&#10;PRD&#10;Notion&#10;TestFlight"></textarea>
     </div>
     <div class="modal-footer">
       <button class="btn-secondary" onclick="closeVocab()">取消</button>
