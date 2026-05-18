@@ -112,7 +112,7 @@ def _enforce_origin():
 
 _recording = False
 _paused = False
-_language = "zh-en"  # default: bilingual Chinese + English
+_language = "auto"   # default: let Whisper detect per chunk
 _backend = "cloud"   # "cloud" (Groq) or "local" (whisper.cpp)
 _chunk_worker_thread: Optional[threading.Thread] = None
 _transcribe_consumer_thread: Optional[threading.Thread] = None
@@ -240,11 +240,11 @@ def save_onboarding_completed(value: bool):
 def pick_local_model(language: str) -> str:
     """Choose best local model for a given language.
 
-    - Mandarin/bilingual → Breeze ASR 25 (fine-tuned on Traditional Chinese,
-      noticeably better on code-switched zh/en).
-    - English / auto → general large-v3-turbo-q8_0.
+    - Force-Chinese → Breeze ASR 25 (繁中 fine-tuned)
+    - Auto / English → large-v3-turbo-q8_0 (general, handles every language
+      via Whisper's auto-detect)
     """
-    if language in ("zh", "zh-en"):
+    if language == "zh":
         return "breeze-q8"
     return "large-v3-turbo-q8_0"
 
@@ -461,7 +461,7 @@ def route_start():
 
     data = request.json or {}
     key = data.get("key", "").strip()
-    language = data.get("language", "zh-en")
+    language = data.get("language", "auto")
     backend = data.get("backend", "cloud")
 
     if backend == "cloud" and not key:
@@ -613,15 +613,15 @@ def route_upload():
             vocab = load_vocab()
             with open(tmp.name, "rb") as af:
                 kw = dict(model="whisper-large-v3-turbo", file=(fname, af))
-                if _language == "zh-en":
-                    kw["language"] = "zh"
-                    kw["prompt"] = (_BILINGUAL_PROMPT + " " + vocab).strip()
-                elif _language != "auto":
+                if _language != "auto":
                     kw["language"] = _language
-                    if vocab:
-                        kw["prompt"] = vocab
-                elif vocab:
-                    kw["prompt"] = vocab
+                prompt_parts = []
+                if vocab:
+                    prompt_parts.append(vocab)
+                if _language == "zh":
+                    prompt_parts.append(_BILINGUAL_PROMPT)
+                if prompt_parts:
+                    kw["prompt"] = " ".join(prompt_parts).strip()
                 result = client.audio.transcriptions.create(**kw)
             _append_line(f"[{ts}] [{fname}]\n{result.text.strip()}")
             _set_status("Upload transcribed.")
@@ -861,16 +861,20 @@ def _is_pause_boundary(audio: np.ndarray) -> bool:
 
 
 def _build_prompt(vocab: str) -> str:
-    """Compose the Whisper conditioning prompt: vocab + bilingual style demo +
-    last segment(s) from the prompt chain (for cross-chunk continuity)."""
+    """Compose the Whisper conditioning prompt: vocab + (zh-only) bilingual
+    style demo + last segment from the prompt chain.
+
+    The bilingual prime only goes in when language is forced zh — under auto
+    it would bias the decoder toward Chinese tokens and turn pure-English
+    chunks into garbled CJK. Under forced en it's irrelevant."""
     parts: list[str] = []
     if vocab:
         parts.append(vocab)
-    if _language == "zh-en":
+    if _language == "zh":
         parts.append(_BILINGUAL_PROMPT)
     if _prompt_chain:
-        # Cap aggressively at 80 chars — longer context makes Whisper much more
-        # likely to enter a repetition loop on tokens that appear in the prompt.
+        # Cap aggressively — long prompts make Whisper much more likely to
+        # enter a repetition loop on tokens that appear in the prompt.
         parts.append(_prompt_chain[-1][-80:])
     return " ".join(parts).strip()
 
@@ -1094,9 +1098,7 @@ def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
             wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
         kwargs: dict = dict(model="whisper-large-v3-turbo")
-        if _language == "zh-en":
-            kwargs["language"] = "zh"
-        elif _language != "auto":
+        if _language != "auto":
             kwargs["language"] = _language
         if prompt:
             kwargs["prompt"] = prompt
@@ -1115,9 +1117,7 @@ def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
     model = get_local_model(alias)
 
     kwargs: dict = {}
-    if _language == "zh-en":
-        kwargs["language"] = "zh"
-    elif _language != "auto":
+    if _language != "auto":
         kwargs["language"] = _language
     if prompt:
         kwargs["initial_prompt"] = prompt

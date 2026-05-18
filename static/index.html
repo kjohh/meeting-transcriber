@@ -328,10 +328,9 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   <button id="btn-new" onclick="newSession()" title="結束目前的會議,清空逐字稿開新場">↻ 新會議</button>
   <div class="divider"></div>
   <select id="lang-select" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
-    <option value="zh-en">中英混合</option>
-    <option value="zh">中文</option>
-    <option value="en">English</option>
-    <option value="auto">自動偵測</option>
+    <option value="auto">自動</option>
+    <option value="zh">強制中文</option>
+    <option value="en">強制英文</option>
   </select>
   <select id="backend-select" onchange="onBackendChange()" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
     <option value="local">🔒 本機</option>
@@ -420,7 +419,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
                 <span style="font-size:18px">🔒</span>
                 <strong>本機模式</strong>
                 <span style="color:var(--accent);font-size:11px;background:rgba(52,199,89,0.12);padding:1px 6px;border-radius:8px">建議敏感會議</span>
-                <span class="info-icon" data-tooltip="使用 whisper.cpp 在 macOS 本機推論。中英混合會議自動使用 Breeze ASR(約 1.5 GB),其他語言使用 Whisper turbo(約 834 MB)。Apple Silicon Mac 用 Metal 加速。">ⓘ</span>
+                <span class="info-icon" data-tooltip="使用 whisper.cpp 在 macOS 本機推論。預設用 Whisper turbo(約 834 MB)處理所有語言,當你在工具列切「強制中文」時才換用 Breeze ASR(約 1.5 GB,繁中強化)。Apple Silicon Mac 用 Metal 加速。">ⓘ</span>
               </div>
               <ul class="ob-bullets">
                 <li>會議錄音完全留在你電腦，不上傳任何地方</li>
@@ -609,7 +608,11 @@ es.onmessage = ({data}) => {
       // the rest of the UI has rendered first.
       setTimeout(openOnboarding, 200);
     }
-    if (msg.language) document.getElementById('lang-select').value = msg.language;
+    if (msg.language) {
+      // Migrate stale "zh-en" config from previous versions → "auto".
+      const lang = (msg.language === 'zh-en') ? 'auto' : msg.language;
+      document.getElementById('lang-select').value = lang;
+    }
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
     if (msg.models) modelStatus = msg.models;
     updateKeyBanner();
@@ -732,7 +735,7 @@ function startRecording() {
     setStatus('請先設定 Groq 金鑰(或切換到本機模式)。'); return;
   }
   if (backend === 'local') {
-    const required = (language === 'zh' || language === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
+    const required = (language === 'zh') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
     if (!modelStatus[required] || !modelStatus[required].downloaded) {
       setStatus('本機模型尚未下載 — 開啟下載視窗。');
       openSettings('models', required);
@@ -769,7 +772,7 @@ function onBackendChange() {
     .then(() => setStatus('已切換到' + (backend === 'local' ? '本機模式' : '雲端模式')));
   if (backend === 'local') {
     const lang = document.getElementById('lang-select').value;
-    const required = (lang === 'zh' || lang === 'zh-en') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
+    const required = (lang === 'zh') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
     if (!modelStatus[required] || !modelStatus[required].downloaded) {
       openSettings('models', required);
     }
