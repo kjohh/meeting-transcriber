@@ -513,6 +513,29 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   </div>
 </div>
 
+<div class="modal-backdrop" id="translocation-modal">
+  <div class="modal" style="width:560px">
+    <div class="modal-header">需要先把 App 拖到「應用程式」資料夾</div>
+    <div class="modal-body">
+      <div style="font-size:36px;margin-bottom:12px">📦</div>
+      <div style="font-size:14px;line-height:1.7">
+        Meeting Transcriber 目前是從<strong>下載資料夾</strong>執行,macOS 把它放在一個隨機的<strong>唯讀路徑</strong>跑(保護機制)。<br>
+        在這種狀態下,<strong>權限永遠無法生效</strong> — 不管系統設定授權幾次,App 都會說沒授權。<br><br>
+        請依以下步驟:
+        <ol style="margin:8px 0 10px 18px;padding:0;line-height:1.7">
+          <li>關閉這個視窗</li>
+          <li>從 Finder 找到 <strong>Meeting Transcriber.app</strong>(在「下載」資料夾)</li>
+          <li>把它<strong>拖到「應用程式」</strong>資料夾</li>
+          <li>從「應用程式」資料夾雙擊打開</li>
+        </ol>
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--text2);line-height:1.6">
+        如果系統提示「無法驗證」→ 點「完成」→ 系統設定 → 隱私權與安全性 → 拉到底點「仍要打開」。
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop" id="revalidation-modal">
   <div class="modal" style="width:540px">
     <div class="modal-header">更新後重新確認權限</div>
@@ -622,14 +645,15 @@ es.onmessage = ({data}) => {
   const msg = JSON.parse(data);
   if (msg.type === 'init') {
     if (msg.key) cachedKey = msg.key;
-    if (msg.onboarding_completed === false) {
-      // First launch — show onboarding once SSE init lands. Delay slightly so
-      // the rest of the UI has rendered first.
+    if (msg.translocated) {
+      // App is running under macOS App Translocation (left in Downloads).
+      // Permission grants can never stick. This blocks onboarding and
+      // revalidation modals — the user has to move the app first or
+      // nothing else matters.
+      setTimeout(() => document.getElementById('translocation-modal').classList.add('open'), 200);
+    } else if (msg.onboarding_completed === false) {
       setTimeout(openOnboarding, 200);
     } else if (msg.needs_revalidation) {
-      // Existing user whose grants died with the previous code signature
-      // (post-update flow). Don't show during onboarding — onboarding owns
-      // the permission UX for first-timers.
       setTimeout(openRevalidation, 300);
     }
     if (msg.language) {
@@ -664,7 +688,7 @@ es.onmessage = ({data}) => {
     document.getElementById('loading-bar').className = 'loading-bar' + (msg.data ? ' active' : '');
   } else if (msg.type === 'sys_audio') {
     const warn = document.getElementById('sys-audio-warning');
-    warn.style.display = (msg.data.ok || _isOnboardingOpen() || _isRevalidationOpen()) ? 'none' : 'block';
+    warn.style.display = (msg.data.ok || _anyBlockingModalOpen()) ? 'none' : 'block';
   } else if (msg.type === 'mic_test_level') {
     _micTestLatest = msg.data;
   }
@@ -875,13 +899,20 @@ function _isRevalidationOpen() {
   return !!(m && m.classList.contains('open'));
 }
 
+function _isTranslocationOpen() {
+  const m = document.getElementById('translocation-modal');
+  return !!(m && m.classList.contains('open'));
+}
+
+function _anyBlockingModalOpen() {
+  return _isOnboardingOpen() || _isRevalidationOpen() || _isTranslocationOpen();
+}
+
 function updateKeyBanner() {
   const backend = document.getElementById('backend-select').value;
   const banner = document.getElementById('key-needed-banner');
   if (!banner) return;
-  // Don't bleed through behind a modal — they own the user's attention.
-  banner.style.display = (backend === 'cloud' && !cachedKey
-                          && !_isOnboardingOpen() && !_isRevalidationOpen()) ? 'block' : 'none';
+  banner.style.display = (backend === 'cloud' && !cachedKey && !_anyBlockingModalOpen()) ? 'block' : 'none';
 }
 
 function openSettings(focusSection, highlightModel) {

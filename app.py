@@ -232,6 +232,24 @@ def load_onboarding_completed() -> bool:
     return bool(_read_config().get("onboarding_completed", False))
 
 
+def is_translocated() -> bool:
+    """True if running from macOS App Translocation path.
+
+    macOS sandboxes downloaded apps still in their original Downloads
+    location by running them from a random read-only path under
+    /private/var/folders/.../AppTranslocation/. The path can change on
+    every launch, so TCC treats it as a different app each time and
+    grants never stick — manifests as an endless re-authorisation loop.
+
+    Fix is for the user: drag the .app into /Applications, which strips
+    the quarantine bit and escapes translocation."""
+    try:
+        path = os.path.realpath(sys.executable)
+        return ("AppTranslocation" in path) or (".translocation/" in path.lower())
+    except Exception:
+        return False
+
+
 def needs_revalidation() -> bool:
     """True iff onboarding was completed but at least one permission is now
     missing. This is the classic 'user updated the app' signature — macOS
@@ -439,7 +457,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'needs_revalidation':needs_revalidation()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'needs_revalidation':needs_revalidation(),'translocated':is_translocated()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
