@@ -30,12 +30,15 @@ SAMPLE_RATE = 16000
 # transcription gets context.
 CHUNK_DURATION = 25.0           # seconds — hard cap when speech is continuous
 OVERLAP = 1.0                   # seconds — retained tail for context bleed
-SILENCE_THRESHOLD = 0.005       # RMS below this counts as silence (was 0.01 —
-                                # 0.005 catches soft speech where the user is
-                                # speaking but their mic gain is low; trade-off
-                                # is slightly more hallucination risk, but
-                                # repetition_trim + loop detection still handle
-                                # those.)
+SILENCE_THRESHOLD = 0.005       # Voice-activity gate — RMS below this in a
+                                # given frame doesn't count as "speech". Low
+                                # threshold catches soft-spoken input.
+PAUSE_SILENCE_THRESHOLD = 0.015 # Pause-boundary detection — tail-RMS below
+                                # this counts as "silence" for chunk cutting.
+                                # Higher than SILENCE_THRESHOLD so ambient
+                                # noise (fan / keyboard / room) reliably
+                                # qualifies as a pause; otherwise the chunker
+                                # only ever fires on the 25s hard cap.
 PAUSE_DURATION = 1.5            # seconds of silence required to trigger
 MIN_SPEECH = 2.0                # don't trigger before this much speech buffered
 VOICE_ACTIVITY_RATIO = 0.15     # min fraction of 100ms frames that must be
@@ -229,6 +232,29 @@ def load_onboarding_completed() -> bool:
     return bool(_read_config().get("onboarding_completed", False))
 
 
+def needs_revalidation() -> bool:
+    """True iff onboarding was completed but at least one permission is now
+    missing. This is the classic 'user updated the app' signature — macOS
+    TCC binds grants to code signature hash, so a new build looks like an
+    unauthorised app even though the bundle id is unchanged.
+
+    For first-time users (onboarding incomplete) we return False — onboarding
+    will handle permissions itself."""
+    if not load_onboarding_completed():
+        return False
+    try:
+        from Quartz import CGPreflightScreenCaptureAccess
+        screen_ok = bool(CGPreflightScreenCaptureAccess())
+    except Exception:
+        return False
+    try:
+        from AVFoundation import AVCaptureDevice
+        mic_ok = int(AVCaptureDevice.authorizationStatusForMediaType_("soun")) == 3
+    except Exception:
+        mic_ok = True
+    return not (screen_ok and mic_ok)
+
+
 def save_onboarding_completed(value: bool):
     cfg = _read_config()
     cfg["onboarding_completed"] = bool(value)
@@ -413,7 +439,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'needs_revalidation':needs_revalidation()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -857,7 +883,10 @@ def _is_pause_boundary(audio: np.ndarray) -> bool:
     body = audio[:-pause_samples]
     tail_rms = float(np.sqrt(np.mean(tail ** 2)))
     body_rms = float(np.sqrt(np.mean(body ** 2)))
-    return tail_rms < SILENCE_THRESHOLD and body_rms >= SILENCE_THRESHOLD
+    # PAUSE_SILENCE_THRESHOLD (looser) for "is the tail silent" — ambient
+    # noise still counts as silence. SILENCE_THRESHOLD (stricter) for "does
+    # the body have actual speech" — soft speech still counts.
+    return tail_rms < PAUSE_SILENCE_THRESHOLD and body_rms >= SILENCE_THRESHOLD
 
 
 def _build_prompt(vocab: str) -> str:
@@ -1186,6 +1215,26 @@ if __name__ == "__main__":
                 return {"ok": True}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
+
+        def reset_and_request_permission(self):
+            """Trigger fresh macOS permission prompts for the new build's
+            signature. We deliberately DO NOT `tccutil reset` here — doing
+            so would wipe a grant the user just earned the first time they
+            went through this flow, causing a loop where the System Settings
+            toggle silently flips off on every click. macOS itself prompts
+            when the new code-signature hash has no TCC entry, so we just
+            need to attempt the protected operations.
+
+            Both screen and mic prompts are triggered together so the user
+            can resolve everything in one System Settings trip rather than
+            seeing the modal twice."""
+            # Screen: spawn the audio binary briefly
+            screen_result = self.trigger_screen_capture_permission()
+            # Mic: opening an sd.InputStream is what triggers macOS' mic
+            # permission dialog. The stream auto-closes a moment later.
+            self.start_mic_test()
+            threading.Timer(1.0, self.stop_mic_test).start()
+            return screen_result
 
         def check_microphone_permission(self):
             """Return current microphone authorisation status without

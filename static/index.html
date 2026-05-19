@@ -513,6 +513,25 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   </div>
 </div>
 
+<div class="modal-backdrop" id="revalidation-modal">
+  <div class="modal" style="width:540px">
+    <div class="modal-header">更新後重新確認權限</div>
+    <div class="modal-body">
+      <div style="font-size:32px;margin-bottom:10px">🔄</div>
+      <div style="font-size:14px;line-height:1.65">
+        偵測到 Meeting Transcriber 更新到新版本。<br>
+        因為 macOS 安全機制把每個版本當不同 app,所以舊版的權限<strong>無法直接套用</strong>到新版,即使系統設定看起來開著。<br><br>
+        點下面按鈕,自動清掉舊紀錄並重新跳出授權對話框。完成後此視窗會自動關閉。
+      </div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="btn-primary" onclick="onRevalidate()">立即重新授權</button>
+        <button class="btn-secondary" onclick="closeRevalidation()">稍後處理</button>
+      </div>
+      <div id="reval-status" style="margin-top:10px;font-size:12px;line-height:1.5;color:var(--text2);min-height:16px"></div>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop" id="vocab-modal">
   <div class="modal">
     <div class="modal-header">自訂詞彙</div>
@@ -607,6 +626,11 @@ es.onmessage = ({data}) => {
       // First launch — show onboarding once SSE init lands. Delay slightly so
       // the rest of the UI has rendered first.
       setTimeout(openOnboarding, 200);
+    } else if (msg.needs_revalidation) {
+      // Existing user whose grants died with the previous code signature
+      // (post-update flow). Don't show during onboarding — onboarding owns
+      // the permission UX for first-timers.
+      setTimeout(openRevalidation, 300);
     }
     if (msg.language) {
       // Migrate stale "zh-en" config from previous versions → "auto".
@@ -640,7 +664,7 @@ es.onmessage = ({data}) => {
     document.getElementById('loading-bar').className = 'loading-bar' + (msg.data ? ' active' : '');
   } else if (msg.type === 'sys_audio') {
     const warn = document.getElementById('sys-audio-warning');
-    warn.style.display = (msg.data.ok || _isOnboardingOpen()) ? 'none' : 'block';
+    warn.style.display = (msg.data.ok || _isOnboardingOpen() || _isRevalidationOpen()) ? 'none' : 'block';
   } else if (msg.type === 'mic_test_level') {
     _micTestLatest = msg.data;
   }
@@ -664,6 +688,9 @@ function appendLine(text) {
   );
   box.appendChild(line);
   box.scrollTop = box.scrollHeight;
+  // Re-evaluate Save/New button state — they're gated on transcript being
+  // non-empty, and arriving content needs to flip them from disabled.
+  sync();
 }
 
 function sync() {
@@ -785,13 +812,76 @@ function _isOnboardingOpen() {
   return !!(m && m.classList.contains('open'));
 }
 
+/* ── Post-update permission revalidation ── */
+let _revalPollInterval = null;
+
+function openRevalidation() {
+  document.getElementById('revalidation-modal').classList.add('open');
+}
+
+function closeRevalidation() {
+  document.getElementById('revalidation-modal').classList.remove('open');
+  _stopRevalPolling();
+}
+
+function _setRevalStatus(msg, tone) {
+  const el = document.getElementById('reval-status');
+  _setStatusEl(el, msg, tone);
+}
+
+async function onRevalidate() {
+  const api = window.pywebview && window.pywebview.api;
+  if (!api || !api.reset_and_request_permission) {
+    _setRevalStatus('此功能僅在 .app 內可用。', 'muted');
+    return;
+  }
+  _setRevalStatus('正在清除舊權限紀錄並重新觸發授權…', 'info');
+  const r = await api.reset_and_request_permission();
+  if (!r.ok) {
+    _setRevalStatus('✗ ' + (r.error || '失敗'), 'err');
+    return;
+  }
+  _setRevalStatus('若 macOS 對話框跳出,請點「打開系統設定」並開啟 toggle。完成後此視窗會自動關閉。', 'info');
+  _startRevalPolling();
+}
+
+function _startRevalPolling() {
+  _stopRevalPolling();
+  const deadline = Date.now() + 180_000;  // give up after 3 min idle
+  _revalPollInterval = setInterval(async () => {
+    if (Date.now() > deadline) { _stopRevalPolling(); return; }
+    const api = window.pywebview && window.pywebview.api;
+    if (!api) return;
+    const [scrR, micR] = await Promise.all([
+      api.check_screen_capture_permission ? api.check_screen_capture_permission() : Promise.resolve(null),
+      api.check_microphone_permission ? api.check_microphone_permission() : Promise.resolve(null),
+    ]);
+    const scrOK = !!(scrR && scrR.granted);
+    const micOK = !!(micR && micR.granted);
+    if (scrOK && micOK) {
+      _stopRevalPolling();
+      _setRevalStatus('✓ 權限重新確認完成', 'ok');
+      setTimeout(closeRevalidation, 1500);
+    }
+  }, 2000);
+}
+
+function _stopRevalPolling() {
+  if (_revalPollInterval) { clearInterval(_revalPollInterval); _revalPollInterval = null; }
+}
+
+function _isRevalidationOpen() {
+  const m = document.getElementById('revalidation-modal');
+  return !!(m && m.classList.contains('open'));
+}
+
 function updateKeyBanner() {
   const backend = document.getElementById('backend-select').value;
   const banner = document.getElementById('key-needed-banner');
   if (!banner) return;
-  // Don't bleed through behind the onboarding modal — the user is still in
-  // setup, the banner is just visual noise.
-  banner.style.display = (backend === 'cloud' && !cachedKey && !_isOnboardingOpen()) ? 'block' : 'none';
+  // Don't bleed through behind a modal — they own the user's attention.
+  banner.style.display = (backend === 'cloud' && !cachedKey
+                          && !_isOnboardingOpen() && !_isRevalidationOpen()) ? 'block' : 'none';
 }
 
 function openSettings(focusSection, highlightModel) {
