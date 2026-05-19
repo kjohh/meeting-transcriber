@@ -546,11 +546,16 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
         因為 macOS 安全機制把每個版本當不同 app,所以舊版的權限<strong>無法直接套用</strong>到新版,即使系統設定看起來開著。<br><br>
         點下面按鈕,自動清掉舊紀錄並重新跳出授權對話框。完成後此視窗會自動關閉。
       </div>
-      <div style="display:flex;gap:8px;margin-top:14px">
+      <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
         <button class="btn-primary" onclick="onRevalidate()">立即重新授權</button>
         <button class="btn-secondary" onclick="closeRevalidation()">稍後處理</button>
       </div>
       <div id="reval-status" style="margin-top:10px;font-size:12px;line-height:1.5;color:var(--text2);min-height:16px"></div>
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text2);line-height:1.6">
+        如果你確定權限其實有開、錄音也能用,可以
+        <a href="#" onclick="dismissRevalidation(); return false;" style="text-decoration:underline">永久關閉這個提示</a>
+        (macOS 對 ad-hoc 簽章的 app 偶爾偵測會失準)。
+      </div>
     </div>
   </div>
 </div>
@@ -600,8 +605,9 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   ⚠ <strong>雲端模式需要 Groq 金鑰</strong> — 點右上角 <strong>⚙</strong> 填寫並測試。
   <a href="https://console.groq.com/keys" target="_blank" style="color:var(--orange);text-decoration:underline">免費註冊</a>
 </div>
-<div id="sys-audio-warning" style="display:none;background:rgba(255,149,0,0.12);border:1px solid var(--orange);color:var(--orange);font-size:12px;padding:8px 12px;border-radius:var(--r);margin-bottom:8px;line-height:1.5">
+<div id="sys-audio-warning" style="display:none;background:rgba(255,149,0,0.12);border:1px solid var(--orange);color:var(--orange);font-size:12px;padding:8px 12px;border-radius:var(--r);margin-bottom:8px;line-height:1.5;position:relative">
   ⚠ <strong>系統音無法擷取</strong>(僅麥克風錄音中)— 系統設定 → 隱私權與安全性 → 螢幕與系統聲音錄製,找到 Meeting Transcriber 並開啟,然後按 ↻ 新會議 重啟錄音。
+  <span onclick="dismissSysAudioWarning()" style="position:absolute;top:6px;right:10px;cursor:pointer;font-size:14px;line-height:1;opacity:0.7">✕</span>
 </div>
 <div class="status-bar" id="status">準備就緒 — 按 ● 開始錄音</div>
 
@@ -688,7 +694,8 @@ es.onmessage = ({data}) => {
     document.getElementById('loading-bar').className = 'loading-bar' + (msg.data ? ' active' : '');
   } else if (msg.type === 'sys_audio') {
     const warn = document.getElementById('sys-audio-warning');
-    warn.style.display = (msg.data.ok || _anyBlockingModalOpen()) ? 'none' : 'block';
+    const shouldHide = msg.data.ok || _anyBlockingModalOpen() || _sysAudioWarningDismissed;
+    warn.style.display = shouldHide ? 'none' : 'block';
   } else if (msg.type === 'mic_test_level') {
     _micTestLatest = msg.data;
   }
@@ -846,6 +853,21 @@ function openRevalidation() {
 function closeRevalidation() {
   document.getElementById('revalidation-modal').classList.remove('open');
   _stopRevalPolling();
+}
+
+async function dismissRevalidation() {
+  if (window.pywebview?.api?.dismiss_revalidation) {
+    await window.pywebview.api.dismiss_revalidation();
+  }
+  closeRevalidation();
+  setStatus('已永久關閉重新授權提示 — 之後不會再跳。');
+}
+
+let _sysAudioWarningDismissed = false;
+
+function dismissSysAudioWarning() {
+  _sysAudioWarningDismissed = true;
+  document.getElementById('sys-audio-warning').style.display = 'none';
 }
 
 function _setRevalStatus(msg, tone) {

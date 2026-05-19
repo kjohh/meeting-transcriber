@@ -66,8 +66,9 @@ try:
 except Exception:
     cfg = {}
 cfg.pop("onboarding_completed", None)
+cfg.pop("revalidation_dismissed", None)  # let dev see the modal again on next build
 json.dump(cfg, open(p, "w"))
-print("✓ Onboarding flag reset — next launch will show the first-run flow")
+print("✓ Onboarding + revalidation-dismiss flags reset — next launch shows first-run flow")
 EOF
 fi
 

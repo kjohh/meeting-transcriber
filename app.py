@@ -250,26 +250,61 @@ def is_translocated() -> bool:
         return False
 
 
-def needs_revalidation() -> bool:
-    """True iff onboarding was completed but at least one permission is now
-    missing. This is the classic 'user updated the app' signature — macOS
-    TCC binds grants to code signature hash, so a new build looks like an
-    unauthorised app even though the bundle id is unchanged.
+def _screen_capture_actually_works() -> bool:
+    """Ground-truth check: spawn coreaudio_tap briefly and watch stderr for
+    READY / ERROR. CGPreflight is unreliable on ad-hoc signed apps (can
+    return false-negative even when user has granted permission), so when
+    Preflight says no we verify by actually attempting capture."""
+    if not os.path.exists(BINARY):
+        return False
+    try:
+        import select
+        proc = subprocess.Popen([BINARY], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        line = None
+        ready, _, _ = select.select([proc.stderr], [], [], 1.5)
+        if ready:
+            line = proc.stderr.readline().decode(errors="replace").strip()
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return line == "READY"
+    except Exception:
+        return False
 
-    For first-time users (onboarding incomplete) we return False — onboarding
-    will handle permissions itself."""
+
+def needs_revalidation() -> bool:
+    """True iff onboarding was completed but at least one permission is
+    missing — classic 'user updated the app' signature.
+
+    Two escape hatches handle macOS quirks:
+      1. User can dismiss permanently if they're confident permissions
+         actually work (config flag `revalidation_dismissed`).
+      2. CGPreflight false-negative on ad-hoc apps: when Preflight says
+         no for screen, spawn the binary as ground truth.
+    """
     if not load_onboarding_completed():
         return False
+    if _read_config().get("revalidation_dismissed", False):
+        return False
+
     try:
         from Quartz import CGPreflightScreenCaptureAccess
         screen_ok = bool(CGPreflightScreenCaptureAccess())
     except Exception:
-        return False
+        screen_ok = True
     try:
         from AVFoundation import AVCaptureDevice
         mic_ok = int(AVCaptureDevice.authorizationStatusForMediaType_("soun")) == 3
     except Exception:
         mic_ok = True
+
+    if screen_ok and mic_ok:
+        return False
+    # Ad-hoc TCC false-negative fallback — verify by actually spawning.
+    if not screen_ok and _screen_capture_actually_works():
+        screen_ok = True
     return not (screen_ok and mic_ok)
 
 
@@ -1253,6 +1288,16 @@ if __name__ == "__main__":
             self.start_mic_test()
             threading.Timer(1.0, self.stop_mic_test).start()
             return screen_result
+
+        def dismiss_revalidation(self):
+            """Persistent escape hatch — user knows they have permissions
+            even if our detection is reporting false-negative. Writes a
+            flag to config; needs_revalidation() reads it and returns
+            False forever after."""
+            cfg = _read_config()
+            cfg["revalidation_dismissed"] = True
+            _write_config(cfg)
+            return {"ok": True}
 
         def check_microphone_permission(self):
             """Return current microphone authorisation status without
