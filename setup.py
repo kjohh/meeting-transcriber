@@ -77,8 +77,8 @@ OPTIONS = {
         "CFBundleName": "Meeting Transcriber",
         "CFBundleDisplayName": "Meeting Transcriber",
         "CFBundleIdentifier": "com.kylehsia.meeting-transcriber",
-        "CFBundleVersion": "1.0.0",
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleVersion": "0.1.6",
+        "CFBundleShortVersionString": "0.1.6",
         "NSMicrophoneUsageDescription":
             "Meeting Transcriber needs microphone access to transcribe your voice during meetings.",
         "NSScreenCaptureDescription":

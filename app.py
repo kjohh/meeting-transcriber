@@ -30,20 +30,22 @@ SAMPLE_RATE = 16000
 # transcription gets context.
 CHUNK_DURATION = 25.0           # seconds — hard cap when speech is continuous
 OVERLAP = 1.0                   # seconds — retained tail for context bleed
-SILENCE_THRESHOLD = 0.005       # Voice-activity gate — RMS below this in a
-                                # given frame doesn't count as "speech". Low
-                                # threshold catches soft-spoken input.
-PAUSE_SILENCE_THRESHOLD = 0.015 # Pause-boundary detection — tail-RMS below
-                                # this counts as "silence" for chunk cutting.
-                                # Higher than SILENCE_THRESHOLD so ambient
-                                # noise (fan / keyboard / room) reliably
-                                # qualifies as a pause; otherwise the chunker
-                                # only ever fires on the 25s hard cap.
+SILENCE_THRESHOLD = 0.005       # Per-frame voice-activity threshold. Low so
+                                # individual frames of soft speech still
+                                # register as active.
+TRANSCRIBE_MIN_RMS = 0.012      # Whole-chunk RMS gate. Below this the chunk
+                                # is mostly ambient noise — don't send to
+                                # Whisper (it would hallucinate "字幕視聴",
+                                # "ご視聴ありがとうございました", etc).
+PAUSE_BODY_THRESHOLD = 0.012    # For pause-boundary detection: body must
+                                # have real speech (not just ambient noise).
+PAUSE_TAIL_THRESHOLD = 0.015    # Tail counts as silence when RMS is below
+                                # this — tolerates ambient noise.
 PAUSE_DURATION = 1.5            # seconds of silence required to trigger
 MIN_SPEECH = 2.0                # don't trigger before this much speech buffered
 VOICE_ACTIVITY_RATIO = 0.15     # min fraction of 100ms frames that must be
                                 # "active" (above SILENCE_THRESHOLD) before we
-                                # send a chunk to Whisper (was 0.25)
+                                # send a chunk to Whisper
 
 PORT = 8765
 
@@ -250,62 +252,31 @@ def is_translocated() -> bool:
         return False
 
 
-def _screen_capture_actually_works() -> bool:
-    """Ground-truth check: spawn coreaudio_tap briefly and watch stderr for
-    READY / ERROR. CGPreflight is unreliable on ad-hoc signed apps (can
-    return false-negative even when user has granted permission), so when
-    Preflight says no we verify by actually attempting capture."""
-    if not os.path.exists(BINARY):
-        return False
-    try:
-        import select
-        proc = subprocess.Popen([BINARY], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        line = None
-        ready, _, _ = select.select([proc.stderr], [], [], 1.5)
-        if ready:
-            line = proc.stderr.readline().decode(errors="replace").strip()
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        return line == "READY"
-    except Exception:
-        return False
+APP_VERSION = "0.1.6"  # Bumped on each release. Used to gate one-time
+                       # `tccutil reset` of stale entries across upgrades.
+
+
+def handle_version_change():
+    """On version change, allow one fresh permission reset.
+
+    Stale TCC entries (granted to the previous build's hash) make the new
+    build silently fail capture even though System Settings shows toggle ON.
+    `tccutil reset` clears them once per version — gated by config flag so
+    repeated clicks of "立即重新授權" don't keep wiping fresh grants."""
+    cfg = _read_config()
+    if cfg.get("last_seen_version") != APP_VERSION:
+        cfg["last_seen_version"] = APP_VERSION
+        cfg["first_perm_trigger_done"] = False
+        _write_config(cfg)
 
 
 def needs_revalidation() -> bool:
-    """True iff onboarding was completed but at least one permission is
-    missing — classic 'user updated the app' signature.
-
-    Two escape hatches handle macOS quirks:
-      1. User can dismiss permanently if they're confident permissions
-         actually work (config flag `revalidation_dismissed`).
-      2. CGPreflight false-negative on ad-hoc apps: when Preflight says
-         no for screen, spawn the binary as ground truth.
-    """
-    if not load_onboarding_completed():
-        return False
-    if _read_config().get("revalidation_dismissed", False):
-        return False
-
-    try:
-        from Quartz import CGPreflightScreenCaptureAccess
-        screen_ok = bool(CGPreflightScreenCaptureAccess())
-    except Exception:
-        screen_ok = True
-    try:
-        from AVFoundation import AVCaptureDevice
-        mic_ok = int(AVCaptureDevice.authorizationStatusForMediaType_("soun")) == 3
-    except Exception:
-        mic_ok = True
-
-    if screen_ok and mic_ok:
-        return False
-    # Ad-hoc TCC false-negative fallback — verify by actually spawning.
-    if not screen_ok and _screen_capture_actually_works():
-        screen_ok = True
-    return not (screen_ok and mic_ok)
+    """Disabled — startup modal proved unreliable on ad-hoc signed apps
+    because CGPreflight and ground-truth spawn both have edge cases that
+    cause false positives. We surface permission issues reactively now —
+    the sys-audio-warning banner is triggered by the Swift binary's own
+    stderr, which is the only reliable signal."""
+    return False
 
 
 def save_onboarding_completed(value: bool):
@@ -936,10 +907,7 @@ def _is_pause_boundary(audio: np.ndarray) -> bool:
     body = audio[:-pause_samples]
     tail_rms = float(np.sqrt(np.mean(tail ** 2)))
     body_rms = float(np.sqrt(np.mean(body ** 2)))
-    # PAUSE_SILENCE_THRESHOLD (looser) for "is the tail silent" — ambient
-    # noise still counts as silence. SILENCE_THRESHOLD (stricter) for "does
-    # the body have actual speech" — soft speech still counts.
-    return tail_rms < PAUSE_SILENCE_THRESHOLD and body_rms >= SILENCE_THRESHOLD
+    return tail_rms < PAUSE_TAIL_THRESHOLD and body_rms >= PAUSE_BODY_THRESHOLD
 
 
 def _build_prompt(vocab: str) -> str:
@@ -1114,7 +1082,7 @@ def _transcribe(audio: np.ndarray, api_key: str):
     # Thresholds tuned permissive (catch soft speech) — repetition_trim +
     # loop detection still handle the false-positive case.
     rms = float(np.sqrt(np.mean(audio ** 2)))
-    if rms < SILENCE_THRESHOLD:
+    if rms < TRANSCRIBE_MIN_RMS:
         _restore_idle_status()
         return
 
@@ -1216,47 +1184,46 @@ if __name__ == "__main__":
     import webview
 
     cleanup_orphan_tempfiles()
+    handle_version_change()
 
     class JSAPI:
         """Bridge exposed to the webview JS as `window.pywebview.api`."""
 
         def trigger_screen_capture_permission(self):
-            """Briefly spawn the audio binary to invoke macOS' permission prompt.
+            """Spawn the audio binary so macOS surfaces the screen-recording
+            dialog, and keep it alive long enough for the user to read +
+            click "Open System Settings" / "Allow".
 
-            macOS only shows the screen recording dialog when an app actually
-            attempts to use ScreenCaptureKit — so we trigger a real capture.
-
-            We don't treat an early exit as failure: ScreenCaptureKit also
-            exits immediately when the user hasn't granted permission yet
-            (which is the normal state during onboarding, before they click
-            through the System Settings flow). The polling loop is what
-            actually confirms grant — this trigger just kicks the dialog.
-            """
+            Earlier 1.5s timeout was too short — the binary would terminate
+            before the user could respond, and the entry never got added to
+            System Settings. We spawn in a background thread and let it run
+            up to 20s, returning immediately so the JS API call doesn't
+            block the UI. Polling picks up the grant state separately."""
             if not os.path.exists(BINARY):
                 return {"ok": False, "error": "音訊擷取程式找不到 — bundle 可能損壞"}
-            try:
-                proc = subprocess.Popen(
-                    [BINARY],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-                time.sleep(1.5)
-                # Log stderr for dev debugging (Intel Mac / arch mismatch /
-                # binary corruption) but don't surface it to the user — they
-                # may legitimately still be working through System Settings.
-                if proc.poll() is not None:
-                    err = (proc.stderr.read() or b"").decode(errors="replace").strip()
-                    if err:
-                        print(f"NOTE: coreaudio_tap exited during permission probe: {err[:200]}", file=sys.stderr)
-                else:
-                    proc.terminate()
+
+            def _probe():
+                try:
+                    proc = subprocess.Popen(
+                        [BINARY], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
+                    # Live up to 20s. Exit early if the binary self-terminates
+                    # (e.g. ScreenCaptureKit threw immediately because TCC said
+                    # no after user declined).
+                    for _ in range(200):
+                        time.sleep(0.1)
+                        if proc.poll() is not None:
+                            break
                     try:
+                        proc.terminate()
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                return {"ok": True}
-            except Exception as e:
-                return {"ok": False, "error": str(e)}
+                except Exception as e:
+                    print(f"NOTE: permission probe error: {e}", file=sys.stderr)
+
+            threading.Thread(target=_probe, daemon=True).start()
+            return {"ok": True}
 
         def open_screen_recording_settings(self):
             """Open System Settings → Privacy → Screen Recording directly."""
@@ -1270,23 +1237,44 @@ if __name__ == "__main__":
                 return {"ok": False, "error": str(e)}
 
         def reset_and_request_permission(self):
-            """Trigger fresh macOS permission prompts for the new build's
-            signature. We deliberately DO NOT `tccutil reset` here — doing
-            so would wipe a grant the user just earned the first time they
-            went through this flow, causing a loop where the System Settings
-            toggle silently flips off on every click. macOS itself prompts
-            when the new code-signature hash has no TCC entry, so we just
-            need to attempt the protected operations.
+            """Trigger fresh macOS permission prompts.
 
-            Both screen and mic prompts are triggered together so the user
-            can resolve everything in one System Settings trip rather than
-            seeing the modal twice."""
-            # Screen: spawn the audio binary briefly
+            On the first click after an app version change, also `tccutil
+            reset` stale entries from the previous build's signature —
+            without that step macOS may silently apply the stale grant to
+            our new hash and ScreenCaptureKit will still fail. The version
+            gate (`first_perm_trigger_done`) ensures we only reset once per
+            version, so repeat clicks don't wipe a grant the user just
+            earned."""
+            cfg = _read_config()
+            if not cfg.get("first_perm_trigger_done", False):
+                for service in ("ScreenCapture", "Microphone"):
+                    try:
+                        subprocess.run(
+                            ["tccutil", "reset", service, "com.kylehsia.meeting-transcriber"],
+                            check=False, timeout=5, capture_output=True,
+                        )
+                    except Exception as e:
+                        print(f"NOTE: tccutil reset {service} failed: {e}", file=sys.stderr)
+                cfg["first_perm_trigger_done"] = True
+                _write_config(cfg)
+
             screen_result = self.trigger_screen_capture_permission()
-            # Mic: opening an sd.InputStream is what triggers macOS' mic
-            # permission dialog. The stream auto-closes a moment later.
-            self.start_mic_test()
-            threading.Timer(1.0, self.stop_mic_test).start()
+
+            # Mic prompt — use AVFoundation's dedicated permission-request API
+            # rather than implicitly via sd.InputStream. More reliable
+            # because we don't have to keep a mic stream open + the API
+            # is purpose-built for this prompt.
+            def _trigger_mic_prompt():
+                try:
+                    from AVFoundation import AVCaptureDevice
+                    AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                        "soun", lambda granted: None,
+                    )
+                except Exception as e:
+                    print(f"NOTE: mic prompt trigger failed: {e}", file=sys.stderr)
+
+            threading.Thread(target=_trigger_mic_prompt, daemon=True).start()
             return screen_result
 
         def dismiss_revalidation(self):
