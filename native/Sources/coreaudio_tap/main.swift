@@ -2,14 +2,27 @@ import Foundation
 import ScreenCaptureKit
 import AVFoundation
 
-signal(SIGTERM) { _ in exit(0) }
-signal(SIGPIPE) { _ in exit(0) }
-
 @available(macOS 13.0, *)
 final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var stream: SCStream?
     private var converter: AVAudioConverter?
+
+    func stop() async {
+        // CRITICAL: stopCapture() tells replayd to release the SCStream
+        // session on its side. Skipping this (e.g. raw exit() from a signal
+        // handler) leaves replayd holding the capture reference and
+        // spinning a busy loop indefinitely — observed on macOS as a
+        // /usr/libexec/replayd process consuming a few % CPU for days
+        // after the parent process is already gone.
+        guard let stream = stream else { return }
+        do {
+            try await stream.stopCapture()
+        } catch {
+            fputs("WARN stopCapture: \(error.localizedDescription)\n", stderr)
+        }
+        self.stream = nil
+    }
 
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
@@ -145,10 +158,35 @@ guard #available(macOS 13.0, *) else {
 }
 
 let capture = SystemAudioCapture()
+
+// Signal handling via DispatchSource (not raw signal()) so the handler
+// runs on a GCD queue where async/await is legal. The raw signal()
+// approach forces exit(0) in signal context, which skips stopCapture()
+// and leaves replayd holding the SCStream reference.
+func installGracefulShutdown(for sig: Int32) {
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler {
+        Task {
+            await capture.stop()
+            exit(0)
+        }
+    }
+    src.resume()
+    // Tell the kernel to deliver to the DispatchSource, not the default
+    // disposition (which on macOS for SIGTERM/SIGPIPE is process kill).
+    signal(sig, SIG_IGN)
+}
+installGracefulShutdown(for: SIGTERM)
+installGracefulShutdown(for: SIGINT)
+installGracefulShutdown(for: SIGPIPE)
+
+// Keep a strong reference so ARC doesn't drop the dispatch sources.
+_ = capture
+
 Task {
     do {
         try await capture.start()
-        // Keep alive until terminated
+        // Keep alive until a signal handler triggers cleanup + exit.
         await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
     } catch {
         fputs("ERROR:\(error.localizedDescription)\n", stderr)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import atexit
 import io
 import json
+import multiprocessing as mp
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,7 +15,8 @@ import threading
 import time
 import wave
 from datetime import datetime
-from typing import Optional
+from multiprocessing.connection import Connection
+from typing import Any, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -138,9 +142,11 @@ _transcribe_queue: "queue.Queue" = queue.Queue(maxsize=8)
 _download_state: dict = {"active": False, "percent": 0, "model": "", "error": ""}
 _download_lock = threading.Lock()
 
-# Lazy-loaded local whisper model cache: {model_alias: pywhispercpp.Model}
-_local_models: dict = {}
-_local_models_lock = threading.Lock()
+# Whisper inference runs in a spawn subprocess so heavy compute doesn't pin
+# P-cores via the parent GUI process's user-interactive QoS. One worker
+# per recording session, started at /start and reaped at /stop.
+_local_worker: Optional["LocalWhisperWorker"] = None
+_local_worker_lock = threading.Lock()
 
 # Prompt chain — last N transcript segments fed back as conditioning. Whisper's
 # prompt window is ~224 tokens, so we cap by char count and keep only recent.
@@ -365,36 +371,148 @@ def _make_progress_tqdm(callback):
     return _Progress
 
 
-def get_local_model(alias: str):
-    """Return a loaded pywhispercpp.Model for *alias*. Loads on first use."""
-    with _local_models_lock:
-        if alias in _local_models:
-            return _local_models[alias]
+def _whisper_subprocess_main(model_path: str, conn: Any) -> None:
+    """Subprocess entry: load model once, then loop on transcription requests.
 
-    path = model_local_path(alias)
-    if path is None:
-        raise FileNotFoundError(f"Model {alias} not downloaded")
+    Runs inside a `multiprocessing.spawn` child so whisper.cpp inference
+    can't compete with the parent's WKWebView + Flask for the GIL, and so
+    macOS's QoS / thermal scheduler isn't forced to keep inference on a
+    P-core just because the parent is a user-interactive GUI app. Result:
+    sustained transcription stops pinning P-cores and the Mac stops
+    getting hot.
 
-    from pywhispercpp.model import Model
-    # Suppress whisper.cpp's C-level stdout so it doesn't pollute Flask logs.
-    import contextlib
+    Permanently redirects C-level stdout/stderr to /dev/null so whisper.cpp's
+    fprintf() calls don't escape to the parent's Flask log.
+    """
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
 
-    @contextlib.contextmanager
-    def _quiet():
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        old_out, old_err = os.dup(1), os.dup(2)
+    try:
+        from pywhispercpp.model import Model
+        model = Model(model_path, print_progress=False, print_realtime=False)
+    except Exception as e:
         try:
-            os.dup2(devnull, 1); os.dup2(devnull, 2); yield
+            conn.send({"status": "error", "error": f"model load failed: {e}"})
         finally:
-            os.dup2(old_out, 1); os.dup2(old_err, 2)
-            os.close(devnull); os.close(old_out); os.close(old_err)
+            conn.close()
+        return
 
-    with _quiet():
-        m = Model(path, print_progress=False, print_realtime=False)
+    conn.send({"status": "ready"})
 
-    with _local_models_lock:
-        _local_models[alias] = m
-    return m
+    while True:
+        try:
+            req = conn.recv()
+        except EOFError:
+            break
+        if req is None:
+            break
+        try:
+            kw: dict = {}
+            if req.get("language") and req["language"] != "auto":
+                kw["language"] = req["language"]
+            if req.get("prompt"):
+                kw["initial_prompt"] = req["prompt"]
+            audio = req["audio"].astype(np.float32)
+            segments = model.transcribe(audio, **kw)
+            text = " ".join(s.text.strip() for s in segments if s.text.strip())
+            conn.send({"status": "ok", "text": text})
+        except Exception as e:
+            conn.send({"status": "error", "error": str(e)})
+
+    conn.close()
+
+
+class LocalWhisperWorker:
+    """Owns the whisper inference subprocess.
+
+    Lifecycle: ``start()`` spawns a child, loads the model, blocks until ready.
+    ``transcribe()`` is the synchronous request/response over the pipe.
+    ``close()`` signals the child to exit and reaps it.
+
+    Worker is **app-scoped, not session-scoped** — first /start with a
+    given model path spawns and pays the ~1-3s model load; subsequent
+    /start calls (same language → same model path) reuse the still-alive
+    worker so the user doesn't wait for model load between sessions. A
+    language change picks a different model alias, which we detect via
+    model_path mismatch and respawn.
+    """
+
+    # Hard caps. Model load over Pipe handshake is fast (a few seconds at
+    # most); transcription of a 25s chunk on M-series with q8 is under 10s
+    # in the bad case. 120s leaves margin without hanging forever if the
+    # child wedges.
+    _LOAD_TIMEOUT = 120.0
+    _TRANSCRIBE_TIMEOUT = 180.0
+
+    def __init__(self, model_path: str) -> None:
+        self.model_path = model_path  # public — caller compares for reuse
+        self._process: Optional[Any] = None
+        self._conn: Optional[Connection] = None
+        self._lock = threading.Lock()
+
+    def is_alive(self) -> bool:
+        """True if the subprocess is up and the pipe is healthy."""
+        return (
+            self._process is not None
+            and self._process.is_alive()
+            and self._conn is not None
+        )
+
+    def start(self) -> None:
+        ctx = mp.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
+        self._process = ctx.Process(
+            target=_whisper_subprocess_main,
+            args=(self.model_path, child_conn),
+            daemon=True,
+        )
+        self._process.start()
+        child_conn.close()
+        self._conn = parent_conn
+
+        if not self._conn.poll(timeout=self._LOAD_TIMEOUT):
+            self.close()
+            raise RuntimeError("whisper subprocess: timeout loading model")
+        msg = self._conn.recv()
+        if msg.get("status") != "ready":
+            err = msg.get("error", "unknown")
+            self.close()
+            raise RuntimeError(f"whisper subprocess: {err}")
+
+    def transcribe(self, audio: np.ndarray, language: str, prompt: str) -> str:
+        if self._conn is None:
+            raise RuntimeError("Worker not started")
+        # Pipe is duplex but single send/recv pair — serialise so two
+        # _transcribe calls (shouldn't happen with single consumer, but
+        # defensive) can't interleave bytes on the same Connection.
+        with self._lock:
+            self._conn.send({"audio": audio, "language": language, "prompt": prompt})
+            if not self._conn.poll(timeout=self._TRANSCRIBE_TIMEOUT):
+                raise RuntimeError("whisper subprocess: transcribe timeout")
+            result = self._conn.recv()
+        if result.get("status") == "error":
+            raise RuntimeError(result["error"])
+        return result.get("text", "")
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.send(None)
+            except Exception:
+                pass
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        if self._process is not None:
+            self._process.join(timeout=5)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=2)
+            self._process = None
 
 
 def save_vocab(text: str):
@@ -427,6 +545,73 @@ def cleanup_orphan_tempfiles():
                 os.unlink(os.path.join(tmp_dir, name))
             except OSError:
                 pass
+
+
+def _terminate_process(proc: subprocess.Popen, name: str, soft_timeout: float = 2.0):
+    """Send SIGTERM, wait briefly, escalate to SIGKILL if still alive.
+
+    `Popen.terminate()` is non-blocking and macOS lets a child trap or stall
+    on SIGTERM — without a kill fallback the child becomes an orphan, which
+    is exactly how the Swift coreaudio_tap binary kept holding a
+    ScreenCaptureKit audio tap after the app appeared to stop recording."""
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=soft_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    print(f"WARN: {name} ignored SIGTERM after {soft_timeout}s — sending SIGKILL", file=sys.stderr)
+    try:
+        proc.kill()
+        proc.wait(timeout=1.0)
+    except Exception:
+        pass
+
+
+def reap_orphan_audio_taps():
+    """Kill any leftover coreaudio_tap processes from prior crashed runs.
+
+    macOS does NOT auto-clean the Swift audio-capture binary when the
+    parent Python app crashes or gets force-quit before /stop runs. Every
+    leftover process keeps ScreenCaptureKit + a CoreAudio tap alive and
+    contributes to sustained CPU + heat. Run this at app startup.
+
+    Matches by absolute path so we only kill our own binary, never a
+    similarly-named user process."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", BINARY],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return
+    if result.returncode != 0:
+        return  # pgrep returns 1 when no matches
+    my_pid = os.getpid()
+    killed = 0
+    for line in result.stdout.strip().splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid == my_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.2)
+            try:
+                os.kill(pid, 0)  # still alive?
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    if killed:
+        print(f"INFO: reaped {killed} orphan coreaudio_tap process(es)", file=sys.stderr)
 
 
 def load_vocab() -> str:
@@ -507,7 +692,7 @@ def route_key():
 @app.route("/start", methods=["POST"])
 def route_start():
     global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
-    global _chunk_worker_thread, _transcribe_consumer_thread
+    global _chunk_worker_thread, _transcribe_consumer_thread, _local_worker
 
     data = request.json or {}
     key = data.get("key", "").strip()
@@ -518,7 +703,8 @@ def route_start():
         return jsonify({"ok": False, "error": "No API key (required for cloud backend)"})
     if backend == "local":
         alias = pick_local_model(language)
-        if model_local_path(alias) is None:
+        model_path = model_local_path(alias)
+        if model_path is None:
             return jsonify({"ok": False, "error": f"Local model not downloaded: {alias}"})
     if not os.path.exists(BINARY):
         return jsonify({"ok": False, "error": "Binary missing — run: cd native && swift build -c release"})
@@ -542,6 +728,32 @@ def route_start():
             except queue.Empty: break
 
         _broadcast("state", {"recording": True, "paused": False})
+
+        # Local backend: ensure a whisper subprocess is up with the right
+        # model. Worker is app-scoped, not session-scoped — reuse if still
+        # alive on the same model path, so back-to-back sessions don't pay
+        # the ~1-3s model load every time. Only respawn when the model
+        # path changed (language switched) or the previous worker died.
+        if backend == "local":
+            try:
+                with _local_worker_lock:
+                    needs_spawn = (
+                        _local_worker is None
+                        or not _local_worker.is_alive()
+                        or _local_worker.model_path != model_path
+                    )
+                    if needs_spawn:
+                        if _local_worker is not None:
+                            _local_worker.close()
+                        _set_status("Loading local whisper model…")
+                        _local_worker = LocalWhisperWorker(model_path)
+                        _local_worker.start()
+            except Exception as e:
+                _recording = False
+                _broadcast("state", {"recording": False, "paused": False})
+                _set_status(f"⚠ 模型啟動失敗: {e}")
+                return jsonify({"ok": False, "error": f"Whisper subprocess failed to start: {e}"})
+
         _set_status("Starting system audio capture…")
 
         _swift_proc = subprocess.Popen([BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
@@ -615,7 +827,7 @@ def route_stop():
             _mic_stream.close()
             _mic_stream = None
         if _swift_proc:
-            _swift_proc.terminate()
+            _terminate_process(_swift_proc, "coreaudio_tap")
             _swift_proc = None
 
         chunk_worker = _chunk_worker_thread
@@ -634,6 +846,11 @@ def route_stop():
         try: _transcribe_queue.put_nowait(None)
         except queue.Full: pass
         consumer.join(timeout=30)
+
+    # NOTE: do NOT close the whisper subprocess here. Worker is now
+    # app-scoped — keeping it alive across sessions skips the 2-3s model
+    # reload between recordings. atexit + the next /start's mismatch
+    # check still handle cleanup on app exit / language switch.
 
     _broadcast("state", {"recording": False, "paused": False})
     _set_status(f"Stopped — {len(_lines)} segment(s) transcribed")
@@ -941,6 +1158,48 @@ def _update_prompt_chain(text: str):
 
 _SENT_SPLIT_RE = re.compile(r'(?<=[。\.!?！？])\s*')
 
+# Hallucinated dialogue labels Whisper emits during fast turn-taking
+# ("余婷:", "Brad:", "OK，余婷：先講…"). Matches 1-4 CJK chars OR
+# 1-12 latin chars followed by full-width / half-width colon, at sentence
+# boundaries only (lookbehind on whitespace / punctuation / start).
+_SPEAKER_LABEL_RE = re.compile(
+    r'(?:^|(?<=[\s。\.\?\!,，、;；]))'
+    r'(?:[一-鿿]{1,4}|[A-Za-z][A-Za-z\s]{0,11})[：:]\s*'
+)
+# Whisper non-speech markers: "*Piano*", "*Music*", "[Music]", "[Applause]".
+# These never come from real meeting audio in our use case.
+_NONSPEECH_MARK_RE = re.compile(r'\*[A-Za-z][A-Za-z\s]*\*|\[[A-Za-z][A-Za-z\s]*\]')
+_CJK_RE = re.compile(r'[一-鿿]')
+
+
+def _strip_speaker_labels(text: str) -> str:
+    """Strip hallucinated speaker labels before feeding to prompt chain.
+
+    Whisper occasionally prepends dialogue labels for fast turn-taking
+    sections. Once the format leaks into the chain, the decoder copies it
+    forward and attributes everything to the same name. Stripping at the
+    chain boundary breaks the propagation without altering what the user
+    sees in the transcript."""
+    return _SPEAKER_LABEL_RE.sub('', text).strip()
+
+
+def _drop_hallucinations(text: str, language: str) -> str:
+    """Filter Whisper hallucinations that survived the audio gates.
+
+    Two patterns covered:
+      1. Non-speech markers (``*Piano*``, ``[Music]``) — always dropped.
+      2. All-English chunks under ``language="zh"`` lock — almost always
+         the decoder filling silence with boilerplate ("I'm not sure.",
+         "Thank you.", "I hope you all do it.") rather than a real
+         language switch. Auto / en modes are left alone (the user
+         signalled they might speak English)."""
+    text = _NONSPEECH_MARK_RE.sub('', text).strip()
+    if not text:
+        return ""
+    if language == "zh" and not _CJK_RE.search(text):
+        return ""
+    return text
+
 
 def _trim_repetition(text: str, max_repeat: int = 2) -> str:
     """Trim consecutive sentence-level repetitions in *text*.
@@ -1110,14 +1369,16 @@ def _transcribe(audio: np.ndarray, api_key: str):
         else:
             text = _transcribe_cloud(audio, api_key, prompt)
 
-        text = (text or "").strip()
+        text = _drop_hallucinations((text or "").strip(), _language)
         if text:
             cleaned = _trim_repetition(text)
             _append_line(f"[{ts}] {cleaned}")
             # If the result still shows a repetition loop after trimming, the
             # chunk was unreliable — don't poison the next chunk's prompt chain.
+            # Also strip speaker labels before chaining so a hallucinated
+            # "余婷:" prefix doesn't prime the next chunk to copy the format.
             if not _is_repetition_loop(text):
-                _update_prompt_chain(cleaned)
+                _update_prompt_chain(_strip_speaker_labels(cleaned))
     except Exception as e:
         _append_line(f"[{ts}] Error: {e}")
     finally:
@@ -1162,29 +1423,45 @@ def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
 
 
 def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
-    """Local backend — pywhispercpp on-device inference."""
-    alias = pick_local_model(_language)
-    model = get_local_model(alias)
+    """Local backend — inference runs in the LocalWhisperWorker subprocess.
 
-    kwargs: dict = {}
-    if _language != "auto":
-        kwargs["language"] = _language
-    if prompt:
-        kwargs["initial_prompt"] = prompt
-
-    # pywhispercpp expects float32 numpy at 16kHz mono — which is exactly our
-    # internal format, so no resampling needed.
-    segments = model.transcribe(audio.astype(np.float32), **kwargs)
-    return " ".join(s.text.strip() for s in segments if s.text.strip())
+    See module-level comments on _local_worker for why this isn't in-process."""
+    worker = _local_worker
+    if worker is None:
+        raise RuntimeError("Local worker not started — was /start called with backend=local?")
+    return worker.transcribe(audio, _language, prompt)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # MUST be first — under py2app's frozen bundle, spawn re-enters the entry
+    # point with a sentinel argv. freeze_support() detects that and runs the
+    # child target then exits, instead of falling through to launch the full
+    # app again. Required even though our worker target is a module-level
+    # function, because spawn always re-executes the main module.
+    mp.freeze_support()
+
     import webview
 
     cleanup_orphan_tempfiles()
+    reap_orphan_audio_taps()
     handle_version_change()
+
+    # Belt-and-braces shutdown hook: if the user force-quits, closes the
+    # webview window, or we hit an unhandled exception, atexit runs and
+    # both the Swift audio binary and the whisper subprocess get reaped.
+    # /stop already cleans these up on the happy path — this catches the
+    # paths where /stop never fires.
+    def _shutdown_cleanup():
+        if _swift_proc is not None:
+            _terminate_process(_swift_proc, "coreaudio_tap", soft_timeout=1.0)
+        if _local_worker is not None:
+            try:
+                _local_worker.close()
+            except Exception:
+                pass
+    atexit.register(_shutdown_cleanup)
 
     class JSAPI:
         """Bridge exposed to the webview JS as `window.pywebview.api`."""

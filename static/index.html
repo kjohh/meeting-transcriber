@@ -137,6 +137,53 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   border-radius: 2px;
   animation: slide 1.2s ease-in-out infinite;
 }
+
+/* ── center busy overlay (model load, session reset) ── */
+.busy-overlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 9000;
+  animation: busy-fade 0.15s ease-out;
+}
+.busy-overlay.open { display: flex; }
+.busy-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 32px 40px;
+  min-width: 280px;
+  max-width: 420px;
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+}
+.busy-spinner {
+  width: 38px;
+  height: 38px;
+  margin: 0 auto 16px;
+  border: 3px solid var(--surface2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: busy-spin 0.9s linear infinite;
+}
+.busy-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.busy-hint {
+  font-size: 12px;
+  color: var(--text2);
+  line-height: 1.5;
+}
+@keyframes busy-spin { to { transform: rotate(360deg); } }
+@keyframes busy-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes slide {
   0%   { transform: translateX(-150%); }
   100% { transform: translateX(350%); }
@@ -589,6 +636,14 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
 <div class="loading-bar" id="loading-bar"></div>
 
+<div class="busy-overlay" id="busy-overlay">
+  <div class="busy-card">
+    <div class="busy-spinner"></div>
+    <div class="busy-title" id="busy-title">處理中…</div>
+    <div class="busy-hint" id="busy-hint"></div>
+  </div>
+</div>
+
 <div class="transcript-card" id="transcript-card" style="display:none">
   <div class="transcript-header">
     逐字稿
@@ -760,7 +815,10 @@ function sync() {
   // Save + New: usable in Paused (checkpoint / end), off during Active recording
   // and Idle-empty (nothing to save / end).
   document.getElementById('btn-save').disabled = activeRecording || transcriptEmpty;
-  document.getElementById('btn-new').disabled  = activeRecording || transcriptEmpty;
+  // New-session button: always available when paused (user may want to
+  // abort and restart, even before anything has been transcribed). Only
+  // disabled while actively recording or in pure Idle with no transcript.
+  document.getElementById('btn-new').disabled  = activeRecording || (!sessionInProgress && transcriptEmpty);
 
   const badge = document.getElementById('badge');
   badge.textContent = recording ? (paused ? '暫停' : '錄音中') : '待機';
@@ -774,6 +832,21 @@ function sync() {
 }
 
 function getKey() { return cachedKey; }
+
+function showBusy(title, hint) {
+  document.getElementById('busy-title').textContent = title || '處理中…';
+  document.getElementById('busy-hint').textContent  = hint  || '';
+  document.getElementById('busy-overlay').classList.add('open');
+}
+function hideBusy() {
+  document.getElementById('busy-overlay').classList.remove('open');
+  // Clear the transient disables we set when busy started — sync() will
+  // re-disable buttons based on actual state (e.g. btn-new stays disabled
+  // when transcript is empty).
+  document.getElementById('btn-record').disabled = false;
+  document.getElementById('btn-new').disabled    = false;
+  sync();
+}
 
 function onRecordClick() {
   // Single button cycles Start → Pause → Resume.
@@ -802,14 +875,42 @@ function startRecording() {
     }
   }
 
+  // /start blocks on (1) starting the Swift audio binary and (2) for local
+  // backend, loading the whisper model into a spawn subprocess (~2-3s on
+  // first run). Without a visible overlay the user thinks the button is
+  // dead and clicks again. Disable the button + show a center modal so
+  // the wait is obvious.
+  document.getElementById('btn-record').disabled = true;
+  if (backend === 'local') {
+    showBusy('啟動本機語音模型', '第一次需要幾秒鐘載入模型,請稍候');
+  } else {
+    showBusy('連線中', '初始化錄音…');
+  }
+
   fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, language, backend})})
     .then(r => r.json())
-    .then(d => { if (!d.ok) setStatus('錯誤:' + d.error); });
+    .then(d => {
+      if (!d.ok) {
+        setStatus('錯誤:' + d.error);
+        document.getElementById('btn-record').disabled = false;
+      }
+      hideBusy();
+    })
+    .catch(e => {
+      setStatus('連線錯誤:' + e);
+      document.getElementById('btn-record').disabled = false;
+      hideBusy();
+    });
 }
 
 function newSession() {
   // End current recording (if any) and clear the transcript.
-  // The model+backend selectors unlock automatically via sync().
+  // /stop joins worker threads and reaps the whisper subprocess — can
+  // take a couple of seconds. Block the UI with a clear overlay so the
+  // user doesn't keep clicking thinking it didn't register.
+  document.getElementById('btn-new').disabled = true;
+  showBusy('整理本場會議', '完成最後一段轉錄並結束模型…');
+
   fetch('/stop', {method:'POST'})
     .then(() => fetch('/clear', {method:'POST'}))
     .then(() => {
@@ -818,6 +919,12 @@ function newSession() {
       document.getElementById('transcript-empty').style.display = 'flex';
       setStatus('準備就緒,可以開始新會議了。');
       sync();
+      hideBusy();
+    })
+    .catch(e => {
+      setStatus('結束會議時發生錯誤:' + e);
+      document.getElementById('btn-new').disabled = false;
+      hideBusy();
     });
 }
 
