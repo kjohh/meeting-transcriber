@@ -53,6 +53,10 @@ VOICE_ACTIVITY_RATIO = 0.15     # min fraction of 100ms frames that must be
 
 PORT = 8765
 
+# Consecutive failed system-audio (re)connects before we stop retrying and
+# fall back to mic-only for the rest of the session.
+MAX_SYS_RECONNECT = 5
+
 
 def _is_frozen_bundle() -> bool:
     """True when running inside a py2app-built .app bundle (read-only)."""
@@ -174,6 +178,7 @@ _mic_buf: list[np.ndarray] = []
 _buf_lock = threading.Lock()
 _lines: list[str] = []
 _swift_proc: Optional[subprocess.Popen] = None
+_sys_capture_thread: Optional[threading.Thread] = None
 _mic_stream = None
 _sse_clients: list[queue.Queue] = []
 _transcribing = False  # True while waiting for Groq response
@@ -715,6 +720,7 @@ def _ensure_local_worker(model_path: str) -> "LocalWhisperWorker":
 def route_start():
     global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
     global _chunk_worker_thread, _transcribe_consumer_thread, _local_worker
+    global _sys_capture_thread
 
     data = request.json or {}
     key = data.get("key", "").strip()
@@ -763,14 +769,10 @@ def route_start():
                 _set_status(f"⚠ 模型啟動失敗: {e}")
                 return jsonify({"ok": False, "error": f"Whisper subprocess failed to start: {e}"})
 
-        # Open the capture streams. If either throws (most commonly the mic
-        # InputStream when permission is denied), roll the half-started state
-        # back — otherwise _recording stays True and every future /start is
-        # rejected with "Already recording" until the app is relaunched.
+        # Mic stream — its failure (denied mic permission) is what should abort
+        # /start. Roll the half-started state back so _recording doesn't stay
+        # True and wedge every future /start on "Already recording".
         try:
-            _swift_proc = subprocess.Popen(
-                [BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-            )
             _mic_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype=np.float32,
                 callback=_mic_cb, blocksize=int(SAMPLE_RATE * 0.1),
@@ -781,18 +783,18 @@ def route_start():
                 try: _mic_stream.close()
                 except Exception: pass
                 _mic_stream = None
-            if _swift_proc:
-                try: _terminate_process(_swift_proc, "coreaudio_tap")
-                except Exception: pass
-                _swift_proc = None
             _recording = False
             _broadcast("state", {"recording": False, "paused": False})
             _set_status(f"啟動失敗:{e}")
             return jsonify({"ok": False, "error": f"無法啟動錄音:{e}"})
 
-        # Streams are live — wire up the reader + worker threads.
-        threading.Thread(target=_read_sys_audio, daemon=True).start()
-        threading.Thread(target=_watch_stderr, daemon=True).start()
+        # System audio runs under a supervisor thread that re-spawns the Swift
+        # capture if macOS stops the ScreenCaptureKit stream mid-recording
+        # (the monthly re-confirm / system stop). A transient drop self-heals
+        # in ~1s instead of silently losing the rest of the meeting; only a
+        # persistent failure (e.g. permission revoked) falls back to mic-only.
+        _sys_capture_thread = threading.Thread(target=_sys_capture_supervisor, daemon=True)
+        _sys_capture_thread.start()
 
         _broadcast("state", {"recording": True, "paused": False})
         _set_status("Starting system audio capture…")
@@ -1062,23 +1064,19 @@ def route_transcript():
 
 # ─── Audio threads ────────────────────────────────────────────────────────────
 
-def _read_sys_audio():
+def _read_sys_stdout(proc):
+    """Pump *proc*'s stdout (float32 PCM from the Swift capture) into _sys_buf
+    until EOF (proc died / was killed) or we stop recording. Returns either
+    way — the supervisor decides whether that was a stop or a drop to reconnect."""
     global _sys_level
     chunk = int(SAMPLE_RATE * 0.1) * 4  # 100ms of float32
     tick = 0
-    # Snapshot the handle: a concurrent /stop nulls `_swift_proc`, which would
-    # otherwise turn the `.stdout` access below into an AttributeError mid-read.
-    proc = _swift_proc
-    while _recording and proc and proc.poll() is None:
-        data = proc.stdout.read(chunk)
+    while _recording and proc.poll() is None:
+        try:
+            data = proc.stdout.read(chunk)
+        except Exception:
+            return
         if not data:
-            # EOF on the pipe. If we're already stopping, this is the normal
-            # teardown (/stop terminated the binary) — stay silent. Only warn
-            # when the stream collapses while we still expect to be recording,
-            # otherwise every normal stop flashes a false "capture failed".
-            if _recording:
-                _broadcast("sys_audio", {"ok": False, "msg": "system audio stream stopped"})
-                _set_status("⚠ 系統音擷取中斷,僅麥克風錄音中")
             return
         if not _paused:
             samples = np.frombuffer(data, dtype=np.float32).copy()
@@ -1089,22 +1087,70 @@ def _read_sys_audio():
                 _sys_level = float(min(1.0, np.sqrt(np.mean(samples ** 2)) * 12))
 
 
-def _watch_stderr():
-    proc = _swift_proc
-    while proc and proc.poll() is None:
-        line = proc.stderr.readline().decode().strip()
+def _watch_sys_stderr(proc, ready: threading.Event):
+    """Watch *proc*'s stderr. READY → flag success + recording status. ERROR
+    (ScreenCaptureKit's didStopWithError, or a start failure) → kill the proc
+    so the stdout reader unblocks and the supervisor can reconnect (the Swift
+    side leaves the process alive but the stream dead after didStopWithError)."""
+    while proc.poll() is None:
+        try:
+            line = proc.stderr.readline().decode(errors="replace").strip()
+        except Exception:
+            return
+        if not line:
+            continue
         if line == "READY":
+            ready.set()
             _set_status("錄音中…")
             _broadcast("sys_audio", {"ok": True})
         elif line.startswith("ERROR"):
-            # ScreenCaptureKit failed — usually means the user denied or
-            # never granted screen recording permission. Mic is independent
-            # and may still be working, but the user must know we can't
-            # capture the remote side of meetings until they grant it.
-            _set_status(
-                "⚠ 系統音抓不到 — 系統設定 → 隱私權 → 螢幕錄製 找到 Meeting Transcriber 並開啟"
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return
+
+
+def _sys_capture_supervisor():
+    """Own system-audio capture for the whole session and auto-reconnect on a
+    mid-recording stream stop.
+
+    macOS can stop an in-flight ScreenCaptureKit stream (the monthly
+    screen-recording re-confirm, display sleep, or a system stop). Previously
+    that ended capture for the rest of the session — the remote side of the
+    meeting was silently lost. Here we re-spawn the Swift binary and resume,
+    with backoff, so a transient stop self-heals. A run that never reaches
+    READY is treated as a hard failure (permission likely missing) and we give
+    up after MAX_SYS_RECONNECT tries rather than retry-storming."""
+    global _swift_proc
+    fails = 0  # consecutive (re)connects that never started capturing
+    while _recording:
+        try:
+            proc = subprocess.Popen(
+                [BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
             )
-            _broadcast("sys_audio", {"ok": False, "msg": line})
+        except Exception as e:
+            _broadcast("sys_audio", {"ok": False, "msg": f"spawn failed: {e}"})
+            _set_status("⚠ 系統音擷取程式啟動失敗,僅麥克風錄音中")
+            return
+        _swift_proc = proc
+        ready = threading.Event()
+        threading.Thread(target=_watch_sys_stderr, args=(proc, ready), daemon=True).start()
+
+        _read_sys_stdout(proc)  # blocks until the stream ends or we stop
+
+        if not _recording:
+            return  # normal /stop teardown — /stop already terminated the proc
+        _terminate_process(proc, "coreaudio_tap")
+
+        fails = 0 if ready.is_set() else fails + 1
+        if fails > MAX_SYS_RECONNECT:
+            _broadcast("sys_audio", {"ok": False, "msg": "system audio stopped"})
+            _set_status("⚠ 系統音抓不到 — 系統設定 → 隱私權 → 螢幕錄製 找到 Meeting Transcriber 並開啟")
+            return
+        _broadcast("sys_audio", {"ok": False, "msg": "reconnecting"})
+        _set_status("⚠ 系統音中斷,重新連線中…")
+        time.sleep(min(2 ** fails, 8) if fails else 1)
 
 
 def _mic_test_cb(indata, frames, time_info, status):
