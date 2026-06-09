@@ -769,10 +769,19 @@ function appendLine(text) {
   const box = document.getElementById('transcript');
   const line = document.createElement('div');
   line.style.marginBottom = '6px';
-  line.innerHTML = text.replace(
-    /^\[(\d{2}:\d{2}:\d{2})\]\s*/,
-    '<span class="ts">[$1]</span> '
-  );
+  // Build via DOM nodes, never innerHTML — transcript text is raw model output
+  // and may contain "<", ">" etc. Style only the leading timestamp; the body
+  // goes in as a text node so it can't be parsed as markup.
+  const m = text.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*([\s\S]*)$/);
+  if (m) {
+    const tsSpan = document.createElement('span');
+    tsSpan.className = 'ts';
+    tsSpan.textContent = `[${m[1]}]`;
+    line.appendChild(tsSpan);
+    line.appendChild(document.createTextNode(' ' + m[2]));
+  } else {
+    line.textContent = text;
+  }
   box.appendChild(line);
   box.scrollTop = box.scrollHeight;
   // Re-evaluate Save/New button state — they're gated on transcript being
@@ -1382,9 +1391,27 @@ function handleDownloadEvent(state) {
 
 function uploadFile(input) {
   const file = input.files[0]; if (!file) return;
-  const key = getKey();
-  if (!key) { setStatus('請先設定 Groq 金鑰。'); return; }
-  const fd = new FormData(); fd.append('file', file); fd.append('key', key);
+  const backend  = document.getElementById('backend-select').value;
+  const language = document.getElementById('lang-select').value;
+  const key      = getKey();
+
+  // Cloud needs a key; local does not (transcribes on-device).
+  if (backend === 'cloud' && !key) {
+    setStatus('雲端模式上傳需要 Groq 金鑰(或切到本機模式)。'); input.value = ''; return;
+  }
+  if (backend === 'local') {
+    const required = (language === 'zh') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
+    if (!modelStatus[required] || !modelStatus[required].downloaded) {
+      setStatus('本機模型尚未下載 — 開啟下載視窗。');
+      openSettings('models', required);
+      input.value = ''; return;
+    }
+  }
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('key', key || '');
+  fd.append('language', language);
   setStatus(`正在上傳 ${file.name}…`);
   fetch('/upload', {method:'POST', body: fd})
     .then(r => r.json())

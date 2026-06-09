@@ -36,6 +36,11 @@ rm -rf build dist
 
 # 4. Deep ad-hoc sign
 APP="dist/Meeting Transcriber.app"
+# py2app copies some site-packages (e.g. pydantic) as read-only (mode 444),
+# which makes `xattr -cr` fail with "Permission denied" and — under
+# `set -e` — aborts the build before codesign runs. Make the tree writable
+# first so xattr/codesign can rewrite metadata.
+chmod -R u+w "$APP"
 xattr -cr "$APP"
 codesign --force --deep --sign - "$APP"
 

@@ -138,6 +138,11 @@ _lifecycle_lock = threading.Lock()
 # from contending for CPU at the same time.
 _transcribe_queue: "queue.Queue" = queue.Queue(maxsize=8)
 
+# Set by /stop AFTER the chunk worker is joined (its final flush already
+# enqueued). The consumer only checks this on an empty queue, so it always
+# drains the last flushed chunk before exiting — fixes a dropped-tail race.
+_consumer_should_exit = threading.Event()
+
 # Download state (local backend only). Lock-protected so SSE clients can poll.
 _download_state: dict = {"active": False, "percent": 0, "model": "", "error": ""}
 _download_lock = threading.Lock()
@@ -689,6 +694,23 @@ def route_key():
     return jsonify({"ok": True})
 
 
+def _ensure_local_worker(model_path: str) -> "LocalWhisperWorker":
+    """Return a live whisper worker bound to *model_path*, (re)spawning as
+    needed. App-scoped and reused across recording sessions AND uploads, so
+    the ~1-3s model load is paid at most once per model. The caller handles
+    the spawn exception (model-load failure)."""
+    global _local_worker
+    with _local_worker_lock:
+        if (_local_worker is None
+                or not _local_worker.is_alive()
+                or _local_worker.model_path != model_path):
+            if _local_worker is not None:
+                _local_worker.close()
+            _local_worker = LocalWhisperWorker(model_path)
+            _local_worker.start()
+        return _local_worker
+
+
 @app.route("/start", methods=["POST"])
 def route_start():
     global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
@@ -726,45 +748,54 @@ def route_start():
         while not _transcribe_queue.empty():
             try: _transcribe_queue.get_nowait()
             except queue.Empty: break
-
-        _broadcast("state", {"recording": True, "paused": False})
+        _consumer_should_exit.clear()
 
         # Local backend: ensure a whisper subprocess is up with the right
-        # model. Worker is app-scoped, not session-scoped — reuse if still
-        # alive on the same model path, so back-to-back sessions don't pay
-        # the ~1-3s model load every time. Only respawn when the model
-        # path changed (language switched) or the previous worker died.
+        # model (app-scoped — reused across sessions so back-to-back
+        # recordings don't re-pay the ~1-3s model load).
         if backend == "local":
             try:
-                with _local_worker_lock:
-                    needs_spawn = (
-                        _local_worker is None
-                        or not _local_worker.is_alive()
-                        or _local_worker.model_path != model_path
-                    )
-                    if needs_spawn:
-                        if _local_worker is not None:
-                            _local_worker.close()
-                        _set_status("Loading local whisper model…")
-                        _local_worker = LocalWhisperWorker(model_path)
-                        _local_worker.start()
+                _set_status("Loading local whisper model…")
+                _ensure_local_worker(model_path)
             except Exception as e:
                 _recording = False
                 _broadcast("state", {"recording": False, "paused": False})
                 _set_status(f"⚠ 模型啟動失敗: {e}")
                 return jsonify({"ok": False, "error": f"Whisper subprocess failed to start: {e}"})
 
-        _set_status("Starting system audio capture…")
+        # Open the capture streams. If either throws (most commonly the mic
+        # InputStream when permission is denied), roll the half-started state
+        # back — otherwise _recording stays True and every future /start is
+        # rejected with "Already recording" until the app is relaunched.
+        try:
+            _swift_proc = subprocess.Popen(
+                [BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            )
+            _mic_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype=np.float32,
+                callback=_mic_cb, blocksize=int(SAMPLE_RATE * 0.1),
+            )
+            _mic_stream.start()
+        except Exception as e:
+            if _mic_stream:
+                try: _mic_stream.close()
+                except Exception: pass
+                _mic_stream = None
+            if _swift_proc:
+                try: _terminate_process(_swift_proc, "coreaudio_tap")
+                except Exception: pass
+                _swift_proc = None
+            _recording = False
+            _broadcast("state", {"recording": False, "paused": False})
+            _set_status(f"啟動失敗:{e}")
+            return jsonify({"ok": False, "error": f"無法啟動錄音:{e}"})
 
-        _swift_proc = subprocess.Popen([BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        # Streams are live — wire up the reader + worker threads.
         threading.Thread(target=_read_sys_audio, daemon=True).start()
         threading.Thread(target=_watch_stderr, daemon=True).start()
 
-        _mic_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype=np.float32,
-            callback=_mic_cb, blocksize=int(SAMPLE_RATE * 0.1),
-        )
-        _mic_stream.start()
+        _broadcast("state", {"recording": True, "paused": False})
+        _set_status("Starting system audio capture…")
 
         _transcribe_consumer_thread = threading.Thread(
             target=_transcribe_consumer, args=(key,), daemon=True,
@@ -841,10 +872,11 @@ def route_stop():
     # after every late _append_line has landed, or /clear will race them.
     if chunk_worker and chunk_worker.is_alive():
         chunk_worker.join(timeout=15)
+    # Signal the consumer to exit only NOW — the chunk worker has flushed its
+    # final chunk into the queue, so the consumer drains that (and anything
+    # else queued) before it sees an empty queue + this flag and quits.
+    _consumer_should_exit.set()
     if consumer and consumer.is_alive():
-        # Sentinel wakes the consumer; it then exits the loop.
-        try: _transcribe_queue.put_nowait(None)
-        except queue.Full: pass
         consumer.join(timeout=30)
 
     # NOTE: do NOT close the whisper subprocess here. Worker is now
@@ -859,9 +891,17 @@ def route_stop():
 
 @app.route("/upload", methods=["POST"])
 def route_upload():
+    # Honour the current backend instead of always going to Groq — a
+    # local-only / no-key user must be able to transcribe an uploaded file too,
+    # which is the whole point of the privacy-preserving local mode.
+    backend = load_backend()
     key = request.form.get("key", "").strip()
-    if not key:
-        return jsonify({"ok": False, "error": "No API key"})
+    language = request.form.get("language", "auto")
+    if language not in ("auto", "zh", "en"):
+        language = "auto"
+
+    if backend == "cloud" and not key:
+        return jsonify({"ok": False, "error": "雲端模式需要 Groq 金鑰(或切到本機模式)"})
 
     f = request.files.get("file")
     if not f:
@@ -876,21 +916,15 @@ def route_upload():
         ts = datetime.now().strftime("%H:%M:%S")
         _set_status(f"Transcribing {fname}…")
         try:
-            client = Groq(api_key=key)
             vocab = load_vocab()
-            with open(tmp.name, "rb") as af:
-                kw = dict(model="whisper-large-v3-turbo", file=(fname, af))
-                if _language != "auto":
-                    kw["language"] = _language
-                prompt_parts = []
-                if vocab:
-                    prompt_parts.append(vocab)
-                if _language == "zh":
-                    prompt_parts.append(_BILINGUAL_PROMPT)
-                if prompt_parts:
-                    kw["prompt"] = " ".join(prompt_parts).strip()
-                result = client.audio.transcriptions.create(**kw)
-            _append_line(f"[{ts}] [{fname}]\n{result.text.strip()}")
+            prompt = vocab
+            if language == "zh":
+                prompt = (vocab + " " + _BILINGUAL_PROMPT).strip()
+            if backend == "local":
+                text = _transcribe_file_local(tmp.name, language, prompt)
+            else:
+                text = _transcribe_file_cloud(tmp.name, fname, key, language, prompt)
+            _append_line(f"[{ts}] [{fname}]\n{(text or '').strip()}")
             _set_status("Upload transcribed.")
         except Exception as e:
             _append_line(f"[{ts}] Upload error: {e}")
@@ -1032,13 +1066,19 @@ def _read_sys_audio():
     global _sys_level
     chunk = int(SAMPLE_RATE * 0.1) * 4  # 100ms of float32
     tick = 0
-    while _recording and _swift_proc and _swift_proc.poll() is None:
-        data = _swift_proc.stdout.read(chunk)
+    # Snapshot the handle: a concurrent /stop nulls `_swift_proc`, which would
+    # otherwise turn the `.stdout` access below into an AttributeError mid-read.
+    proc = _swift_proc
+    while _recording and proc and proc.poll() is None:
+        data = proc.stdout.read(chunk)
         if not data:
-            # Swift binary EOF'd mid-recording — stream collapsed without
-            # process exit. Tell the user and stop the busy-loop.
-            _broadcast("sys_audio", {"ok": False, "msg": "system audio stream stopped"})
-            _set_status("⚠ 系統音擷取中斷,僅麥克風錄音中")
+            # EOF on the pipe. If we're already stopping, this is the normal
+            # teardown (/stop terminated the binary) — stay silent. Only warn
+            # when the stream collapses while we still expect to be recording,
+            # otherwise every normal stop flashes a false "capture failed".
+            if _recording:
+                _broadcast("sys_audio", {"ok": False, "msg": "system audio stream stopped"})
+                _set_status("⚠ 系統音擷取中斷,僅麥克風錄音中")
             return
         if not _paused:
             samples = np.frombuffer(data, dtype=np.float32).copy()
@@ -1050,8 +1090,9 @@ def _read_sys_audio():
 
 
 def _watch_stderr():
-    while _swift_proc and _swift_proc.poll() is None:
-        line = _swift_proc.stderr.readline().decode().strip()
+    proc = _swift_proc
+    while proc and proc.poll() is None:
+        line = proc.stderr.readline().decode().strip()
         if line == "READY":
             _set_status("錄音中…")
             _broadcast("sys_audio", {"ok": True})
@@ -1310,17 +1351,19 @@ def _chunk_worker(api_key: str):
 def _transcribe_consumer(api_key: str):
     """Single consumer that drains `_transcribe_queue` serially. Lives for
     the full recording session — bounded so Groq slowness / local CPU
-    contention can't spawn unbounded threads."""
+    contention can't spawn unbounded threads.
+
+    Exits only when /stop sets `_consumer_should_exit` AND the queue has been
+    fully drained. /stop sets that flag after joining the chunk worker, so the
+    worker's final flush is already enqueued and gets transcribed here before
+    we quit — the trailing segment of a meeting is never dropped."""
     while True:
         try:
             audio = _transcribe_queue.get(timeout=0.5)
         except queue.Empty:
-            # Drain done + recording stopped → exit. Otherwise keep waiting.
-            if not _recording:
+            if _consumer_should_exit.is_set():
                 break
             continue
-        if audio is None:  # /stop sentinel
-            break
         try:
             _transcribe(audio, api_key)
         except Exception as e:
@@ -1430,6 +1473,39 @@ def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
     if worker is None:
         raise RuntimeError("Local worker not started — was /start called with backend=local?")
     return worker.transcribe(audio, _language, prompt)
+
+
+# ─── Upload (whole-file) transcription ──────────────────────────────────────────
+# Distinct from the streaming `_transcribe_*` helpers above: those take a numpy
+# chunk from the live recording loop, these take an uploaded file on disk.
+
+def _transcribe_file_cloud(path: str, fname: str, api_key: str,
+                           language: str, prompt: str) -> str:
+    """Cloud upload — hand the original file straight to Groq, which accepts
+    common audio/video containers, so no local decode is needed."""
+    kw: dict = dict(model="whisper-large-v3-turbo")
+    if language != "auto":
+        kw["language"] = language
+    if prompt:
+        kw["prompt"] = prompt
+    with open(path, "rb") as af:
+        kw["file"] = (fname, af)
+        result = Groq(api_key=api_key).audio.transcriptions.create(**kw)
+    return result.text
+
+
+def _transcribe_file_local(path: str, language: str, prompt: str) -> str:
+    """Local upload — decode the file to mono-16k numpy (pywhispercpp's static
+    loader: WAV natively, other formats via ffmpeg) then run it through the
+    same app-scoped whisper subprocess used for live recording."""
+    alias = pick_local_model(language)
+    model_path = model_local_path(alias)
+    if model_path is None:
+        raise RuntimeError(f"本機模型尚未下載:{alias}")
+    from pywhispercpp.model import Model
+    audio = Model._load_audio(path)
+    worker = _ensure_local_worker(model_path)
+    return worker.transcribe(audio, language, prompt)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

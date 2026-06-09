@@ -14,9 +14,19 @@ Notes:
   when running from the bundle.
 - The Swift coreaudio_tap binary is bundled under Contents/Resources/native/.
 """
+import re
+
 from setuptools import setup
 
 APP = ["app.py"]
+
+# Single source of truth for the version is APP_VERSION in app.py. Read it via
+# regex (not import — that would pull in flask/groq/etc.) so the bundle's
+# CFBundleVersion can never drift from the runtime version-change gate.
+_m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', open("app.py", encoding="utf-8").read(), re.M)
+if not _m:
+    raise SystemExit("setup.py: could not find APP_VERSION in app.py")
+APP_VERSION = _m.group(1)
 
 DATA_FILES = [
     ("static", ["static/index.html"]),
@@ -77,8 +87,8 @@ OPTIONS = {
         "CFBundleName": "Meeting Transcriber",
         "CFBundleDisplayName": "Meeting Transcriber",
         "CFBundleIdentifier": "com.kylehsia.meeting-transcriber",
-        "CFBundleVersion": "0.1.6",
-        "CFBundleShortVersionString": "0.1.6",
+        "CFBundleVersion": APP_VERSION,
+        "CFBundleShortVersionString": APP_VERSION,
         "NSMicrophoneUsageDescription":
             "Meeting Transcriber needs microphone access to transcribe your voice during meetings.",
         "NSScreenCaptureDescription":

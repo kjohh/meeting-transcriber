@@ -9,7 +9,7 @@
 | 🌐 Cloud (Groq) | `whisper-large-v3-turbo` | 0.5–1s | 音訊經 Groq server | 免費 Groq API key |
 | 🔒 Local (whisper.cpp) | `large-v3-turbo-q8_0` / `breeze-q8` | 1–3s（Apple Silicon Mac） | 完全本機 | 模型檔（首次自動下載） |
 
-Local 模式下，中文 / 中英混合會自動使用 **Breeze ASR 25**（聯發科繁中強化版），辨識中英夾雜場景顯著優於通用 Whisper。
+Local 模式預設用通用 Whisper turbo 處理所有語言；當你在工具列把語言切成「強制中文」時，才會自動換用 **Breeze ASR 25**（聯發科繁中強化版），辨識中文 / 中英夾雜場景顯著優於通用 Whisper。
 
 ## 安裝（給使用者）
 
@@ -65,7 +65,7 @@ cd native && swift build -c release && cd ..
 
 ## 主要功能
 
-- **中英混合辨識**：預設語言 `zh-en`，強制 `language="zh"` + bilingual prompt 範例 prime decoder，避免英文段被翻譯成中文或亂碼
+- **三種語言模式**：`自動`（預設，Whisper 逐段自動偵測，純英文 / 純中文 / 混合都不用先設定）/ `強制中文`（force `language="zh"` + bilingual prompt 範例 prime decoder + 本機換 Breeze ASR，適合中文 / 中英夾雜會議）/ `強制英文`
 - **Silence-aware chunking**：句子不會被死板的計時器切兩半。25 秒上限或 1.5 秒靜音偵測才切片
 - **Repetition trim**：Whisper 經典的「同句重複 N 次」hallucination 自動截斷為最多 2 次
 - **自訂詞彙表**：UI 內編輯 → `.vocab.local`（gitignored）→ 每次 chunk 即時讀取，prime Whisper 認識專有名詞 / 品牌 / 縮寫 / 人名

@@ -73,7 +73,7 @@
 ### 核心功能
 - Local backend 透過 pywhispercpp,自動從 HF Hub 下載模型
 - 模型 cache 與 lazy-take-notes 共用路徑
-- 中英混合自動使用 Breeze ASR 25
+- 強制中文模式使用 Breeze ASR 25（預設「自動」模式用通用 Whisper turbo）
 - Silence-aware chunker(取代死板 10s 切片)
 - Repetition trim + loop detection(解 Whisper hallucination)
 - Voice activity ratio gate

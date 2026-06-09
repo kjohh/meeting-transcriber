@@ -60,7 +60,7 @@ ScreenCaptureKit 是 macOS 13+ 原生 API，不需安裝虛擬音訊裝置。Swi
 
 - **`CHUNK_DURATION = 25.0`** — 滿 25s 強制切（避免長句無限累積）
 - **`PAUSE_DURATION = 1.5`** — 尾部連續 1.5s 靜音才認定句末
-- **`SILENCE_THRESHOLD = 0.01`** — RMS 閾值
+- **`SILENCE_THRESHOLD = 0.005`** — 逐 frame voice-activity 閾值（低，讓輕聲講話的 frame 仍算 active）
 - **`MIN_SPEECH = 2.0`** — buffer 至少 2s 語音才考慮 silence-trigger
 - **`OVERLAP = 1.0`** — 僅「hard-cap」trigger 保留 overlap tail；silence-trigger 句子已結束，不保留（避免 stale audio 拖到下一輪觸發鬼影 chunk）
 
@@ -82,7 +82,7 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 
 ### Voice activity ratio gate
 
-`_transcribe` 開頭有兩層 silence gate：(1) 整體 RMS < 0.01 跳過；(2) 100ms frames 的 active 比例 < 25% 跳過。第二層特別重要——silence-aware chunker 偶爾會被「1s 真語音 + 4s 靜音」騙過 RMS check，frame-level 抓得到。
+`_transcribe` 開頭有兩層 silence gate：(1) 整體 RMS < `TRANSCRIBE_MIN_RMS`（0.012）跳過；(2) 100ms frames 的 active 比例 < `VOICE_ACTIVITY_RATIO`（0.15，即 15%）跳過。第二層特別重要——silence-aware chunker 偶爾會被「1s 真語音 + 4s 靜音」騙過 RMS check，frame-level 抓得到。
 
 ### Backend 模型自動選擇
 
