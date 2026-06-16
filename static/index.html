@@ -214,6 +214,24 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   user-select: text; -webkit-user-select: text; cursor: text;
 }
 #transcript .ts { color: var(--text2); font-size: 12px; user-select: none; }
+#transcript .line { margin-bottom: 6px; }
+
+/* Translation mode: split each line into original (left) + 中文 (right). */
+#cols-head { display: none; }
+.transcript-card.translating #cols-head {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  padding: 6px 14px; font-size: 11px; font-weight: 600;
+  color: var(--text2); text-transform: uppercase; letter-spacing: .04em;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.col-zh { display: none; }
+.transcript-card.translating #transcript .line {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border);
+}
+.transcript-card.translating .col-en { color: var(--text2); }  /* original = reference */
+.transcript-card.translating .col-zh { display: block; color: var(--text); }
+.btn-toggle-on { background: var(--accent) !important; color: #fff !important; }
 .transcript-header { display: flex; align-items: center; }
 .btn-copy {
   margin-left: auto; height: 26px; padding: 0 10px;
@@ -356,7 +374,10 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 /* ── status ── */
 .status-bar {
   font-size: 12px; color: var(--text2);
-  height: 18px; overflow: hidden;
+  min-height: 18px; line-height: 1.5;
+  flex-shrink: 0;
+  /* Wrap instead of clipping — some error guidance (e.g. the screen-recording
+     re-enable path) is a full sentence and was previously cut off. */
 }
 
 /* ── file input hidden ── */
@@ -374,7 +395,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   <button id="btn-record" class="btn-start" onclick="onRecordClick()">● 開始</button>
   <button id="btn-new" onclick="newSession()" title="結束目前的會議,清空逐字稿開新場">↻ 新會議</button>
   <div class="divider"></div>
-  <select id="lang-select" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
+  <select id="lang-select" onchange="onLangChange()" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
     <option value="auto">自動</option>
     <option value="zh">強制中文</option>
     <option value="en">強制英文</option>
@@ -383,6 +404,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
     <option value="local">🔒 本機</option>
     <option value="cloud">🌐 雲端</option>
   </select>
+  <button id="btn-translate" onclick="toggleTranslate()" title="開啟後逐字稿多一欄即時中文翻譯(英文→中文,走 Groq 雲端,需金鑰)">🌐 翻譯</button>
   <div class="divider"></div>
   <button id="btn-upload" onclick="document.getElementById('upload-input').click()">↑ 上傳檔案</button>
   <input type="file" id="upload-input" accept="audio/*,video/*" onchange="uploadFile(this)">
@@ -448,6 +470,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
         <div id="ob-permission-status" style="margin-top:10px;font-size:12px;min-height:16px;line-height:1.5;color:var(--text2)"></div>
 
         <div style="margin-top:6px;font-size:11px;color:var(--text2);line-height:1.6">
+          💡 建議戴耳機 — 不戴的話對方的聲音會從喇叭被你的麥克風再收一次,造成回音、辨識會變差。<br>
           macOS 15 之後螢幕錄製每個月會跳一次確認對話框(藍色舉手圖示),按「允許」即可。
         </div>
       </div>
@@ -585,12 +608,12 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
 <div class="modal-backdrop" id="revalidation-modal">
   <div class="modal" style="width:540px">
-    <div class="modal-header">更新後重新確認權限</div>
+    <div class="modal-header">重新確認權限</div>
     <div class="modal-body">
       <div style="font-size:32px;margin-bottom:10px">🔄</div>
       <div style="font-size:14px;line-height:1.65">
-        偵測到 Meeting Transcriber 更新到新版本。<br>
-        因為 macOS 安全機制把每個版本當不同 app,所以舊版的權限<strong>無法直接套用</strong>到新版,即使系統設定看起來開著。<br><br>
+        系統音抓不到,通常是螢幕錄製權限失效了 — 可能因為 App 更新版本,或 macOS 每月一次的權限重確認。<br>
+        macOS 安全機制下,舊的授權紀錄<strong>不一定會套用</strong>到目前這版,即使系統設定看起來開著。<br><br>
         點下面按鈕,自動清掉舊紀錄並重新跳出授權對話框。完成後此視窗會自動關閉。
       </div>
       <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
@@ -649,6 +672,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
     逐字稿
     <button class="btn-copy" onclick="copyTranscript()">複製全部</button>
   </div>
+  <div id="cols-head"><div>英文原文</div><div>中文翻譯</div></div>
   <div id="transcript"></div>
 </div>
 
@@ -715,15 +739,17 @@ es.onmessage = ({data}) => {
       setTimeout(() => document.getElementById('translocation-modal').classList.add('open'), 200);
     } else if (msg.onboarding_completed === false) {
       setTimeout(openOnboarding, 200);
-    } else if (msg.needs_revalidation) {
-      setTimeout(openRevalidation, 300);
     }
+    // Permission revalidation is no longer auto-opened on launch (detection
+    // was unreliable). It's reached on demand from the sys-audio-warning
+    // banner's "立即重新授權" button instead.
     if (msg.language) {
       // Migrate stale "zh-en" config from previous versions → "auto".
       const lang = (msg.language === 'zh-en') ? 'auto' : msg.language;
       document.getElementById('lang-select').value = lang;
     }
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
+    if (typeof msg.translate === 'boolean') setTranslateUI(msg.translate);
     if (msg.models) modelStatus = msg.models;
     updateKeyBanner();
     document.getElementById('transcript').innerHTML = '';
@@ -757,7 +783,10 @@ es.onmessage = ({data}) => {
   }
 };
 
-function appendLine(text) {
+function appendLine(line) {
+  // line: {ts, text, tr, tag}. (Defensive: wrap a bare string.)
+  if (typeof line === 'string') line = {ts: '', text: line, tr: '', tag: ''};
+
   // Show transcript card on first line
   const card = document.getElementById('transcript-card');
   const empty = document.getElementById('transcript-empty');
@@ -767,22 +796,31 @@ function appendLine(text) {
   }
 
   const box = document.getElementById('transcript');
-  const line = document.createElement('div');
-  line.style.marginBottom = '6px';
+  const row = document.createElement('div');
+  row.className = 'line';
+
   // Build via DOM nodes, never innerHTML — transcript text is raw model output
-  // and may contain "<", ">" etc. Style only the leading timestamp; the body
-  // goes in as a text node so it can't be parsed as markup.
-  const m = text.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*([\s\S]*)$/);
-  if (m) {
+  // and may contain "<", ">" etc. Only the leading timestamp is styled; bodies
+  // go in as text nodes so they can't be parsed as markup.
+  const en = document.createElement('div');
+  en.className = 'col-en';
+  if (line.ts) {
     const tsSpan = document.createElement('span');
     tsSpan.className = 'ts';
-    tsSpan.textContent = `[${m[1]}]`;
-    line.appendChild(tsSpan);
-    line.appendChild(document.createTextNode(' ' + m[2]));
+    tsSpan.textContent = `[${line.ts}]` + (line.tag ? ` [${line.tag}]` : '');
+    en.appendChild(tsSpan);
+    en.appendChild(document.createTextNode(' ' + (line.text || '')));
   } else {
-    line.textContent = text;
+    en.textContent = line.text || '';
   }
-  box.appendChild(line);
+  row.appendChild(en);
+
+  const zh = document.createElement('div');
+  zh.className = 'col-zh';
+  zh.textContent = line.tr || '';
+  row.appendChild(zh);
+
+  box.appendChild(row);
   box.scrollTop = box.scrollHeight;
   // Re-evaluate Save/New button state — they're gated on transcript being
   // non-empty, and arriving content needs to flip them from disabled.
@@ -944,7 +982,10 @@ function onBackendChange() {
   const backend = document.getElementById('backend-select').value;
   fetch('/backend', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({backend})})
     .then(r => r.json())
-    .then(() => setStatus('已切換到' + (backend === 'local' ? '本機模式' : '雲端模式')));
+    .then(() => {
+      // Cloud+zh hint wins over the generic "已切換" message when relevant.
+      if (!maybeWarnCloudZh()) setStatus('已切換到' + (backend === 'local' ? '本機模式' : '雲端模式'));
+    });
   if (backend === 'local') {
     const lang = document.getElementById('lang-select').value;
     const required = (lang === 'zh') ? 'breeze-q8' : 'large-v3-turbo-q8_0';
@@ -953,6 +994,47 @@ function onBackendChange() {
     }
   }
   updateKeyBanner();
+}
+
+function onLangChange() {
+  maybeWarnCloudZh();
+}
+
+function maybeWarnCloudZh() {
+  // Cloud zh runs on Groq's general turbo model — local zh swaps in Breeze
+  // ASR (繁中 fine-tuned), which is noticeably better. The UI hid this, so a
+  // user picking 強制中文 on cloud silently got the weaker model.
+  const backend = document.getElementById('backend-select').value;
+  const lang    = document.getElementById('lang-select').value;
+  if (backend === 'cloud' && lang === 'zh') {
+    setStatus('提示:雲端的中文用 Groq 通用模型;要最佳繁中辨識請切「🔒 本機」(會自動用 Breeze ASR)。');
+    return true;
+  }
+  return false;
+}
+
+/* ── Live EN→ZH translation toggle ── */
+let translateOn = false;
+
+function setTranslateUI(on) {
+  // Reflect state in the button + transcript layout. Does NOT hit the server —
+  // used both by the user toggle and the SSE init sync.
+  translateOn = on;
+  const btn = document.getElementById('btn-translate');
+  if (btn) btn.className = on ? 'btn-toggle-on' : '';
+  document.getElementById('transcript-card').classList.toggle('translating', on);
+}
+
+function toggleTranslate() {
+  const on = !translateOn;
+  // Translation always runs on Groq (needs the key) regardless of ASR backend.
+  if (on && !cachedKey) {
+    setStatus('翻譯需要 Groq 金鑰(即時翻譯走 Groq 雲端)— 點右上角 ⚙ 填寫。');
+    return;
+  }
+  setTranslateUI(on);
+  fetch('/translate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: on})});
+  setStatus(on ? '已開啟即時翻譯(英文 → 中文,逐句出現)。' : '已關閉翻譯。');
 }
 
 function _isOnboardingOpen() {
@@ -977,6 +1059,9 @@ async function dismissRevalidation() {
     await window.pywebview.api.dismiss_revalidation();
   }
   closeRevalidation();
+  // The sys-audio-warning banner is what surfaces this modal, so silence it
+  // too — the user has told us permissions are actually fine.
+  dismissSysAudioWarning();
   setStatus('已永久關閉重新授權提示 — 之後不會再跳。');
 }
 
@@ -1080,6 +1165,13 @@ let obStep = 1;
 const OB_STEPS = 4;
 
 function openOnboarding() {
+  // Onboarding step 2 opens a mic-test stream and spawns the audio binary to
+  // trigger permission dialogs — both fight a live recording for the mic /
+  // ScreenCaptureKit tap. Refuse while a session is in progress.
+  if (recording) {
+    setStatus('錄音進行中無法重看引導 — 請先按「新會議」結束目前的會議。');
+    return;
+  }
   obStep = 1;
   renderOnboarding();
   document.getElementById('onboarding-modal').classList.add('open');
@@ -1131,7 +1223,7 @@ function renderOnboarding() {
   }
 
   document.getElementById('ob-step-counter').textContent = `第 ${obStep} 步 / 共 ${OB_STEPS} 步`;
-  const titles = {1: '歡迎', 2: '螢幕錄製授權', 3: '選擇轉錄方式', 4: '完成'};
+  const titles = {1: '歡迎', 2: '螢幕錄製 + 麥克風授權', 3: '選擇轉錄方式', 4: '完成'};
   document.getElementById('ob-step-title').textContent = titles[obStep];
   document.getElementById('ob-prev').disabled = (obStep === 1);
   document.getElementById('ob-next').textContent = (obStep === OB_STEPS) ? '開始使用' : '下一步';
@@ -1440,7 +1532,16 @@ function saveVocab() {
 }
 
 function copyTranscript() {
-  const text = document.getElementById('transcript').innerText;
+  // Walk the rows so the translation column is included (original ↳ 譯文)
+  // rather than relying on innerText, which would jam the two columns together.
+  const rows = [...document.querySelectorAll('#transcript .line')];
+  const text = rows.length
+    ? rows.map(r => {
+        const en = (r.querySelector('.col-en')?.innerText || '').trim();
+        const zh = (r.querySelector('.col-zh')?.innerText || '').trim();
+        return zh ? en + '\n  ↳ ' + zh : en;
+      }).join('\n')
+    : document.getElementById('transcript').innerText;
   if (!text.trim()) { setStatus('沒有內容可以複製。'); return; }
   navigator.clipboard.writeText(text).then(
     () => setStatus('逐字稿已複製到剪貼簿。'),

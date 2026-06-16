@@ -62,7 +62,7 @@ ScreenCaptureKit 是 macOS 13+ 原生 API，不需安裝虛擬音訊裝置。Swi
 - **`PAUSE_DURATION = 1.5`** — 尾部連續 1.5s 靜音才認定句末
 - **`SILENCE_THRESHOLD = 0.005`** — 逐 frame voice-activity 閾值（低，讓輕聲講話的 frame 仍算 active）
 - **`MIN_SPEECH = 2.0`** — buffer 至少 2s 語音才考慮 silence-trigger
-- **`OVERLAP = 1.0`** — 僅「hard-cap」trigger 保留 overlap tail；silence-trigger 句子已結束，不保留（避免 stale audio 拖到下一輪觸發鬼影 chunk）
+- **`OVERLAP = 1.0`** — 僅「hard-cap」trigger 保留 overlap tail；silence-trigger 句子已結束，不保留（避免 stale audio 拖到下一輪觸發鬼影 chunk）。保留的 1s overlap 會被轉錄兩次，由 `_dedup_boundary` 在 append 前砍掉接縫重複（見下）
 
 **`_chunk_worker` 把 snapshot + decision + consume 包在同一個 `_buf_lock` block 內** — 否則 `/pause` 觸發的 flush thread 跟 chunker 會 race 出 double transcribe。
 
@@ -76,13 +76,25 @@ Whisper 的 `prompt` 參數**不是 instruction，是 conditioning context**。�
 
 Prompt chain 太長會誘發 Whisper 進入 **repetition loop**（複製 prompt 內容當輸出）。所以 chain 只留 1 段、上限 80 字元；偵測到輸出有 repetition loop 時不更新 chain。
 
-### `_trim_repetition` / `_is_repetition_loop`
+### `_trim_repetition` / `_is_repetition_loop` / `_dedup_boundary`
 
 Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / repetitive priming）會吐出同一句話 N 次。後處理：連續相同 sentence > 2 次截斷；≥ 3 次視為 loop 不更新 prompt chain。
+
+`_dedup_boundary` 是 **cross-chunk** 去重（與 `_trim_repetition` 的 chunk 內去重不同）：找「上一行結尾」與「這段開頭」的最長字級重疊（≥5 字、限 60 字窗），砍掉重複前綴。專治 hard-cap 保留的 1s overlap 被轉兩次的接縫重複。同樣套用在 `/upload` 的整檔結果上。
+
+### `_drop_hallucinations` 的 zh-lock 英文判斷
+
+`language="zh"` 鎖定下、整段無中文字時，**只丟**落在 `_EN_HALLUCINATION` 清單的 stock filler（"thank you"、"thanks for watching"…），不再無條件丟掉所有英文 —— 中英夾雜會議裡真正的英文句子（"let me share my screen"）必須保留。
 
 ### Voice activity ratio gate
 
 `_transcribe` 開頭有兩層 silence gate：(1) 整體 RMS < `TRANSCRIBE_MIN_RMS`（0.012）跳過；(2) 100ms frames 的 active 比例 < `VOICE_ACTIVITY_RATIO`（0.15，即 15%）跳過。第二層特別重要——silence-aware chunker 偶爾會被「1s 真語音 + 4s 靜音」騙過 RMS check，frame-level 抓得到。
+
+### EN→ZH 即時翻譯（opt-in）
+
+工具列「🌐 翻譯」toggle（預設關,存 config `translate`,可錄音中即時切 —— 純後處理不碰 ASR pipeline）。開啟後 `_transcribe` 在 append 前對轉出的文字呼叫 `_maybe_translate` → `_translate_text`（Groq chat,`TRANSLATE_MODEL`,system prompt = 會議口譯英→台灣繁中、保留專有名詞、已是中文則原樣）。逐字稿轉成左右兩欄（左原文/右譯文,`_lines` 升級成 `list[dict]` 存 `ts/text/tr/tag`）。
+
+關鍵限制:翻譯**一律走 Groq**(需金鑰),與 ASR backend 無關 —— 本機 ASR + 雲端翻譯仍會把文字上傳 Groq。Whisper 內建 translate 只能 X→英文,做不到英→中,所以走 LLM。延遲 = ASR + 翻譯,逐句非逐字。`_format_line` 統一 save/download 的雙語輸出格式。
 
 ### Backend 模型自動選擇
 
@@ -146,6 +158,10 @@ Mic 偵測 fallback：若 `_micTestRunning`（sd.InputStream 已成功開），�
 
 `/stop` 必須 `join()` 等 chunk_worker 完整退出（含最後 flush transcribe），否則 `newSession`（前端） chain `stop → clear → UI reset` 會被 late `_append_line` race，殘留文字到下一個 session 的 transcript。
 
+### Pause 會釋放系統音擷取
+
+`/pause` 期間 `_sys_capture_supervisor` 會 terminate Swift proc 並 idle（不持有 ScreenCaptureKit tap，避免 replayd 持續燒 CPU），resume 時自動重 spawn。代價：resume 後系統音有 ~1s 重連空窗。`_read_sys_stdout` 在 `_paused` 時也會 return（迴圈條件含 `not _paused`），這正是觸發 supervisor 釋放的訊號。麥克風 stream 不釋放（很輕、resume 要立即可用）。
+
 ## 已知坑與限制
 
 ### macOS TCC 跟 py2app rebuild
@@ -154,7 +170,7 @@ Mic 偵測 fallback：若 `_micTestRunning`（sd.InputStream 已成功開），�
 
 ### Whisper hallucination
 
-Mitigations 已寫進 code：silence trigger 不保留 overlap、voice activity ratio gate、repetition trim + loop 偵測 + 隔離 prompt chain。殘留 case：環境噪音穩定大（持續打字 / 風扇）可能讓 silence 偵測失靈 → buffer 一直長到 25s hard cap。對 personal 用沒影響。
+Mitigations 已寫進 code：silence trigger 不保留 overlap、voice activity gate（ratio + 絕對語音時長 `MIN_ACTIVE_SPEECH` 下限，短插話不被誤丟）、repetition trim + loop 偵測 + 隔離 prompt chain、cross-chunk `_dedup_boundary`、zh-lock 只丟 stock-filler 英文。殘留 case：環境噪音穩定大（持續打字 / 風扇）可能讓 silence 偵測失靈 → buffer 一直長到 25s hard cap。對 personal 用沒影響。
 
 ### macOS 螢幕錄製授權
 

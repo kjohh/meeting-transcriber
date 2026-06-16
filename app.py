@@ -50,12 +50,20 @@ MIN_SPEECH = 2.0                # don't trigger before this much speech buffered
 VOICE_ACTIVITY_RATIO = 0.15     # min fraction of 100ms frames that must be
                                 # "active" (above SILENCE_THRESHOLD) before we
                                 # send a chunk to Whisper
+MIN_ACTIVE_SPEECH = 0.6         # seconds — absolute floor of real speech. A
+                                # short interjection ("對", "OK") sitting in a
+                                # long quiet 25s cap chunk has a low active
+                                # ratio but enough real speech to keep; the
+                                # ratio gate alone would discard it.
 
 PORT = 8765
 
 # Consecutive failed system-audio (re)connects before we stop retrying and
 # fall back to mic-only for the rest of the session.
 MAX_SYS_RECONNECT = 5
+
+# Groq chat model used for EN→ZH live translation. Swap if Groq retires it.
+TRANSLATE_MODEL = "llama-3.3-70b-versatile"
 
 
 def _is_frozen_bundle() -> bool:
@@ -126,7 +134,8 @@ def _enforce_origin():
 _recording = False
 _paused = False
 _language = "auto"   # default: let Whisper detect per chunk
-_backend = "cloud"   # "cloud" (Groq) or "local" (whisper.cpp)
+_backend = "local"   # "cloud" (Groq) or "local" (whisper.cpp). Default local
+                     # to match onboarding's privacy-first preselection.
 _chunk_worker_thread: Optional[threading.Thread] = None
 _transcribe_consumer_thread: Optional[threading.Thread] = None
 _mic_test_stream = None  # separate stream used by onboarding mic preview
@@ -167,16 +176,23 @@ _prompt_chain: list[str] = []
 # and provide example sentences that demonstrate the expected style. The
 # decoder mimics the style of the prompt, not its semantic content.
 _BILINGUAL_PROMPT = (
-    "以下是一段繁體中文與英文混合的設計討論會議逐字稿。"
-    "我覺得這個 component 的 hover state 太 subtle 了。"
-    "我們等等 review 一下 design system 的 token。"
-    "Loki 的 Modal 要用 ModalHeader 包標題,不要直接放 ModalBody。"
-    "請 follow 既有的 pattern,不要自己造輪子。"
+    "以下是一段繁體中文與英文混合的工作會議逐字稿。"
+    "我覺得這個方案的 timeline 有點趕,我們先 sync 一下。"
+    "這個 feature 的 spec 還沒 finalize,等等 review 完再 follow up。"
+    "OK,那我們 align 一下 priority,下週 update 進度。"
+    "麻煩照之前的 format 處理,有問題隨時 ping 我。"
 )
 _sys_buf: list[np.ndarray] = []
 _mic_buf: list[np.ndarray] = []
 _buf_lock = threading.Lock()
-_lines: list[str] = []
+# Transcript lines. Each entry: {"ts", "text", "tr", "tag"} — text is the
+# original transcription, tr is the (optional) translation, tag is an optional
+# source label (e.g. an uploaded filename).
+_lines: list[dict] = []
+
+# EN→ZH live translation toggle. Off by default — the user opts in per session.
+# Mirrors the config "translate" flag; set on launch and via /translate.
+_translate_enabled = False
 _swift_proc: Optional[subprocess.Popen] = None
 _sys_capture_thread: Optional[threading.Thread] = None
 _mic_stream = None
@@ -199,9 +215,28 @@ def _set_status(msg: str):
     _broadcast("status", msg)
 
 
-def _append_line(line: str):
+def _append_line(text: str, tr: str = "", tag: str = "", ts: Optional[str] = None):
+    line = {
+        "ts": ts or datetime.now().strftime("%H:%M:%S"),
+        "text": text,
+        "tr": tr,
+        "tag": tag,
+    }
     _lines.append(line)
     _broadcast("transcript", line)
+
+
+def _format_line(line: dict) -> str:
+    """Flatten a transcript line to plain text for save / download. When a
+    translation is present, the original and translation go on two lines."""
+    head = f"[{line['ts']}]"
+    if line.get("tag"):
+        head += f" [{line['tag']}]"
+    text = line.get("text", "")
+    tr = line.get("tr", "")
+    if tr:
+        return f"{head} {text}\n    ↳ {tr}"
+    return f"{head} {text}"
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -237,12 +272,22 @@ def save_api_key(key: str):
 
 
 def load_backend() -> str:
-    return _read_config().get("backend", "cloud")
+    return _read_config().get("backend", "local")
 
 
 def save_backend(backend: str):
     cfg = _read_config()
     cfg["backend"] = backend
+    _write_config(cfg)
+
+
+def load_translate() -> bool:
+    return bool(_read_config().get("translate", False))
+
+
+def save_translate(value: bool):
+    cfg = _read_config()
+    cfg["translate"] = bool(value)
     _write_config(cfg)
 
 
@@ -286,13 +331,13 @@ def handle_version_change():
         _write_config(cfg)
 
 
-def needs_revalidation() -> bool:
-    """Disabled — startup modal proved unreliable on ad-hoc signed apps
-    because CGPreflight and ground-truth spawn both have edge cases that
-    cause false positives. We surface permission issues reactively now —
-    the sys-audio-warning banner is triggered by the Swift binary's own
-    stderr, which is the only reliable signal."""
-    return False
+# NOTE: there is intentionally no startup "needs revalidation" check. It
+# proved unreliable on ad-hoc-signed apps (CGPreflight + ground-truth spawn
+# both false-positive). Permission problems are surfaced reactively instead:
+# the sys-audio-warning banner fires off the Swift binary's own stderr (the
+# only reliable signal), and its "立即重新授權" button opens the revalidation
+# modal on demand. handle_version_change() still arms a one-shot tccutil reset
+# for the first revalidation click after an upgrade.
 
 
 def save_onboarding_completed(value: bool):
@@ -658,7 +703,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'needs_revalidation':needs_revalidation(),'translocated':is_translocated()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'translate':load_translate(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -926,10 +971,17 @@ def route_upload():
                 text = _transcribe_file_local(tmp.name, language, prompt)
             else:
                 text = _transcribe_file_cloud(tmp.name, fname, key, language, prompt)
-            _append_line(f"[{ts}] [{fname}]\n{(text or '').strip()}")
+            # Same post-processing as the live path: strip non-speech markers /
+            # stock fillers, then trim Whisper repetition loops (a long file can
+            # loop just like a live chunk).
+            text = _drop_hallucinations((text or "").strip(), language)
+            if text:
+                text = _trim_repetition(text)
+            tr = _maybe_translate(text, key) if text else ""
+            _append_line(text, tr=tr, tag=fname, ts=ts)
             _set_status("Upload transcribed.")
         except Exception as e:
-            _append_line(f"[{ts}] Upload error: {e}")
+            _append_line(f"Upload error: {e}", tag=fname, ts=ts)
             _set_status("Upload failed.")
         finally:
             os.unlink(tmp.name)
@@ -960,7 +1012,7 @@ def route_vocab_post():
 
 
 def _model_status_payload() -> dict:
-    """Return per-model {alias: {downloaded: bool, size_mb: int|None, path: str|None}}."""
+    """Return per-model {alias: {downloaded: bool, path: str|None}}."""
     out = {}
     for alias in MODEL_REGISTRY:
         path = model_local_path(alias)
@@ -988,6 +1040,18 @@ def route_backend_post():
         return jsonify({"ok": False, "error": "Invalid backend"})
     save_backend(backend)
     return jsonify({"ok": True, "backend": backend})
+
+
+@app.route("/translate", methods=["POST"])
+def route_translate():
+    """Toggle EN→ZH live translation. Takes effect from the next transcribed
+    segment — safe to flip mid-session (it's post-transcription, doesn't touch
+    the ASR pipeline)."""
+    global _translate_enabled
+    enabled = bool((request.json or {}).get("enabled", False))
+    _translate_enabled = enabled
+    save_translate(enabled)
+    return jsonify({"ok": True, "enabled": enabled})
 
 
 @app.route("/onboarding/complete", methods=["POST"])
@@ -1056,7 +1120,7 @@ def route_debug():
 
 @app.route("/transcript")
 def route_transcript():
-    content = "\n".join(_lines)
+    content = "\n".join(_format_line(l) for l in _lines)
     fname = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     buf = io.BytesIO(content.encode("utf-8"))
     return send_file(buf, as_attachment=True, download_name=fname, mimetype="text/plain")
@@ -1066,25 +1130,38 @@ def route_transcript():
 
 def _read_sys_stdout(proc):
     """Pump *proc*'s stdout (float32 PCM from the Swift capture) into _sys_buf
-    until EOF (proc died / was killed) or we stop recording. Returns either
-    way — the supervisor decides whether that was a stop or a drop to reconnect."""
+    until EOF (proc died / was killed), we stop recording, OR we enter pause.
+    Returns either way — the supervisor decides whether that was a stop, a
+    pause (release the tap), or a drop to reconnect.
+
+    The pipe is opened unbuffered (bufsize=0), so a single read can return a
+    byte count that isn't a multiple of 4 — splitting a float32 sample across
+    two reads. We carry the trailing odd bytes into the next read so
+    np.frombuffer always gets a 4-byte-aligned buffer (an unaligned buffer
+    raises ValueError, which previously killed this thread silently and
+    stranded the Swift process holding the audio tap)."""
     global _sys_level
     chunk = int(SAMPLE_RATE * 0.1) * 4  # 100ms of float32
+    carry = b""
     tick = 0
-    while _recording and proc.poll() is None:
+    while _recording and not _paused and proc.poll() is None:
         try:
             data = proc.stdout.read(chunk)
         except Exception:
             return
         if not data:
             return
-        if not _paused:
-            samples = np.frombuffer(data, dtype=np.float32).copy()
-            with _buf_lock:
-                _sys_buf.append(samples)
-            tick += 1
-            if tick % 2 == 0:
-                _sys_level = float(min(1.0, np.sqrt(np.mean(samples ** 2)) * 12))
+        buf = carry + data
+        usable = len(buf) - (len(buf) % 4)
+        carry = buf[usable:]
+        if usable <= 0:
+            continue
+        samples = np.frombuffer(buf[:usable], dtype=np.float32).copy()
+        with _buf_lock:
+            _sys_buf.append(samples)
+        tick += 1
+        if tick % 2 == 0:
+            _sys_level = float(min(1.0, np.sqrt(np.mean(samples ** 2)) * 12))
 
 
 def _watch_sys_stderr(proc, ready: threading.Event):
@@ -1125,6 +1202,12 @@ def _sys_capture_supervisor():
     global _swift_proc
     fails = 0  # consecutive (re)connects that never started capturing
     while _recording:
+        # Paused: don't hold a capture process. ScreenCaptureKit + replayd
+        # burn CPU for as long as the tap is open, so a "pause and walk away"
+        # shouldn't keep them spinning. We re-spawn on resume.
+        if _paused:
+            time.sleep(0.2)
+            continue
         try:
             proc = subprocess.Popen(
                 [BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
@@ -1137,19 +1220,28 @@ def _sys_capture_supervisor():
         ready = threading.Event()
         threading.Thread(target=_watch_sys_stderr, args=(proc, ready), daemon=True).start()
 
-        _read_sys_stdout(proc)  # blocks until the stream ends or we stop
+        _read_sys_stdout(proc)  # blocks until the stream ends, we stop, or we pause
 
         if not _recording:
             return  # normal /stop teardown — /stop already terminated the proc
         _terminate_process(proc, "coreaudio_tap")
+        _swift_proc = None
+
+        if _paused:
+            # Released for a pause, not a failure. Loop back; the pause branch
+            # above idles until resume, then re-spawns. Don't touch `fails`.
+            continue
 
         fails = 0 if ready.is_set() else fails + 1
         if fails > MAX_SYS_RECONNECT:
             _broadcast("sys_audio", {"ok": False, "msg": "system audio stopped"})
             _set_status("⚠ 系統音抓不到 — 系統設定 → 隱私權 → 螢幕錄製 找到 Meeting Transcriber 並開啟")
             return
-        _broadcast("sys_audio", {"ok": False, "msg": "reconnecting"})
-        _set_status("⚠ 系統音中斷,重新連線中…")
+        # A transient stream stop self-heals on the next spawn (usually < 1s).
+        # Don't raise the red "擷取失敗" banner for that — it flashes and
+        # vanishes, which only alarms the user. Use the low-key status line;
+        # the banner is reserved for the genuine give-up case (fails > MAX).
+        _set_status("系統音短暫中斷,重新連線中…")
         time.sleep(min(2 ** fails, 8) if fails else 1)
 
 
@@ -1258,6 +1350,24 @@ _SPEAKER_LABEL_RE = re.compile(
 _NONSPEECH_MARK_RE = re.compile(r'\*[A-Za-z][A-Za-z\s]*\*|\[[A-Za-z][A-Za-z\s]*\]')
 _CJK_RE = re.compile(r'[一-鿿]')
 
+# Stock Whisper "silence filler" phrases — what it emits on quiet/ambiguous
+# audio under a zh lock instead of nothing. Normalised (lowercase, letters +
+# spaces only). Used to drop ONLY these, so a real English sentence in a
+# code-switching meeting ("let me share my screen") survives the zh lock.
+_EN_HALLUCINATION = frozenset({
+    "thank you", "thank you very much", "thank you so much", "thanks",
+    "thanks for watching", "thank you for watching", "thanks for watching everyone",
+    "please subscribe", "subscribe to my channel", "see you next time",
+    "see you in the next video", "bye", "bye bye", "you", "the end",
+    "im not sure", "i dont know", "okay", "ok", "mm", "mmm", "hmm", "yeah",
+})
+
+
+def _normalize_en(text: str) -> str:
+    """Lowercase, strip to letters + single spaces — for matching against the
+    boilerplate set regardless of punctuation/casing."""
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-z\s]', ' ', text.lower())).strip()
+
 
 def _strip_speaker_labels(text: str) -> str:
     """Strip hallucinated speaker labels before feeding to prompt chain.
@@ -1275,16 +1385,18 @@ def _drop_hallucinations(text: str, language: str) -> str:
 
     Two patterns covered:
       1. Non-speech markers (``*Piano*``, ``[Music]``) — always dropped.
-      2. All-English chunks under ``language="zh"`` lock — almost always
-         the decoder filling silence with boilerplate ("I'm not sure.",
-         "Thank you.", "I hope you all do it.") rather than a real
-         language switch. Auto / en modes are left alone (the user
-         signalled they might speak English)."""
+      2. Under ``language="zh"`` lock, a chunk with NO Chinese characters is
+         suspicious — but only dropped when every sentence is a known stock
+         filler phrase ("thank you", "thanks for watching", …). A genuine
+         English sentence in a code-switching meeting is kept. Auto / en
+         modes are left alone entirely."""
     text = _NONSPEECH_MARK_RE.sub('', text).strip()
     if not text:
         return ""
     if language == "zh" and not _CJK_RE.search(text):
-        return ""
+        sents = [s for s in _SENT_SPLIT_RE.split(text) if s.strip()] or [text]
+        if all(_normalize_en(s) in _EN_HALLUCINATION for s in sents):
+            return ""
     return text
 
 
@@ -1330,6 +1442,29 @@ def _is_repetition_loop(text: str) -> bool:
         else:
             prev, count = p, 1
     return False
+
+
+def _dedup_boundary(text: str) -> str:
+    """Drop the leading slice of *text* that repeats the tail of the previous
+    transcript line.
+
+    A hard-cap ('cap') cut keeps a 1s audio OVERLAP for context, so that
+    second of speech is transcribed twice and the seam echoes a phrase. We
+    find the longest suffix of the previous line that is a prefix of this one
+    (char-level, so it works for spaceless Chinese too) and strip it. Requires
+    a 5-char match so we don't clip incidental shared openers like "我覺得"."""
+    if not _lines or not text.strip():
+        return text
+    prev_body = (_lines[-1].get("text") or "").strip()
+    if not prev_body:
+        return text
+    cur = text.lstrip()
+    tail = prev_body[-60:]                 # bounded search window
+    maxk = min(len(tail), len(cur))
+    for k in range(maxk, 4, -1):           # require >= 5 overlapping chars
+        if tail[-k:].lower() == cur[:k].lower():
+            return cur[k:].lstrip()
+    return text
 
 
 def _chunk_worker(api_key: str):
@@ -1418,6 +1553,49 @@ def _transcribe_consumer(api_key: str):
             _transcribe_queue.task_done()
 
 
+def _translate_text(text: str, api_key: str) -> str:
+    """Translate *text* (English) to Traditional Chinese via a Groq chat model.
+
+    Conditioned with the user's vocab so proper nouns survive. Kept to a single
+    sentence/segment per call — no chat history — to stay fast and stateless."""
+    sys_prompt = (
+        "你是專業的會議口譯。把使用者輸入的英文逐字稿翻成自然、口語的台灣繁體中文。"
+        "規則:只輸出譯文本身,不要任何解釋、引號或前綴;"
+        "保留專有名詞、產品名、人名、英文縮寫(如 ETA、HBL、AMS)原樣不譯;"
+        "若輸入本來就是中文,原樣輸出。"
+    )
+    vocab = load_vocab()
+    if vocab:
+        sys_prompt += f" 參考{vocab}"
+    chat = Groq(api_key=api_key).chat.completions.create(
+        model=TRANSLATE_MODEL,
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.2,
+        max_tokens=512,
+    )
+    return (chat.choices[0].message.content or "").strip()
+
+
+def _maybe_translate(text: str, api_key: str) -> str:
+    """Return the EN→ZH translation of *text* when the toggle is on, else "".
+
+    Translation always uses Groq (needs the API key) regardless of the ASR
+    backend. Skips text that is already Chinese with no Latin letters. On
+    failure returns a visible marker rather than dropping the line."""
+    if not _translate_enabled or not api_key:
+        return ""
+    if _CJK_RE.search(text) and not re.search(r'[A-Za-z]', text):
+        return ""
+    try:
+        return _translate_text(text, api_key)
+    except Exception as e:
+        print(f"translate failed: {e}", file=sys.stderr)
+        return "⚠ 翻譯失敗"
+
+
 def _transcribe(audio: np.ndarray, api_key: str):
     """Transcribe *audio*, dispatching to cloud (Groq) or local (whisper.cpp)
     based on `_backend`."""
@@ -1439,8 +1617,13 @@ def _transcribe(audio: np.ndarray, api_key: str):
         frame_count = len(audio) // frame
         frames = audio[: frame_count * frame].reshape(frame_count, frame)
         frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
-        active_ratio = float(np.mean(frame_rms > SILENCE_THRESHOLD))
-        if active_ratio < VOICE_ACTIVITY_RATIO:
+        active_frames = int(np.count_nonzero(frame_rms > SILENCE_THRESHOLD))
+        active_ratio = active_frames / frame_count
+        active_seconds = active_frames * 0.1
+        # Drop only when the ratio is low AND there's little absolute speech.
+        # A short interjection in a long quiet cap chunk has a low ratio but
+        # enough real speech (>= MIN_ACTIVE_SPEECH) to keep.
+        if active_ratio < VOICE_ACTIVITY_RATIO and active_seconds < MIN_ACTIVE_SPEECH:
             _restore_idle_status()
             return
 
@@ -1460,16 +1643,18 @@ def _transcribe(audio: np.ndarray, api_key: str):
 
         text = _drop_hallucinations((text or "").strip(), _language)
         if text:
-            cleaned = _trim_repetition(text)
-            _append_line(f"[{ts}] {cleaned}")
-            # If the result still shows a repetition loop after trimming, the
-            # chunk was unreliable — don't poison the next chunk's prompt chain.
-            # Also strip speaker labels before chaining so a hallucinated
-            # "余婷:" prefix doesn't prime the next chunk to copy the format.
-            if not _is_repetition_loop(text):
-                _update_prompt_chain(_strip_speaker_labels(cleaned))
+            cleaned = _dedup_boundary(_trim_repetition(text))
+            if cleaned.strip():
+                tr = _maybe_translate(cleaned, api_key)
+                _append_line(cleaned, tr=tr, ts=ts)
+                # If the result still shows a repetition loop after trimming,
+                # the chunk was unreliable — don't poison the next chunk's
+                # prompt chain. Also strip speaker labels before chaining so a
+                # hallucinated "余婷:" prefix doesn't prime the next chunk.
+                if not _is_repetition_loop(text):
+                    _update_prompt_chain(_strip_speaker_labels(cleaned))
     except Exception as e:
-        _append_line(f"[{ts}] Error: {e}")
+        _append_line(f"Error: {e}", ts=ts)
     finally:
         _transcribing = False
         _broadcast("transcribing", False)
@@ -1569,6 +1754,7 @@ if __name__ == "__main__":
     cleanup_orphan_tempfiles()
     reap_orphan_audio_taps()
     handle_version_change()
+    _translate_enabled = load_translate()  # restore the toggle from config
 
     # Belt-and-braces shutdown hook: if the user force-quits, closes the
     # webview window, or we hit an unhandled exception, atexit runs and
@@ -1677,10 +1863,10 @@ if __name__ == "__main__":
             return screen_result
 
         def dismiss_revalidation(self):
-            """Persistent escape hatch — user knows they have permissions
-            even if our detection is reporting false-negative. Writes a
-            flag to config; needs_revalidation() reads it and returns
-            False forever after."""
+            """Persistent escape hatch — user knows they have permissions even
+            if our detection is reporting a false-negative. Persists a config
+            flag (kept for forward-compat; the frontend also stops surfacing
+            the sys-audio warning for the rest of the session)."""
             cfg = _read_config()
             cfg["revalidation_dismissed"] = True
             _write_config(cfg)
@@ -1772,7 +1958,7 @@ if __name__ == "__main__":
             path = result if isinstance(result, str) else result[0]
             try:
                 with open(path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(_lines))
+                    f.write("\n".join(_format_line(l) for l in _lines))
                 return {"ok": True, "path": path}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
