@@ -41,8 +41,11 @@ echo
 echo "→ Creating GitHub release ${TAG}…"
 # --generate-notes auto-fills the body with the commit list since the
 # previous tag, so users see what changed without us writing it by hand.
+# --target pins the tag to the exact commit we built + pushed, not the repo
+# default branch (releases are cut from the working branch, e.g. wip-machine-b).
 gh release create "${TAG}" "$ZIP" \
   --title "${TAG}" \
+  --target "$(git rev-parse HEAD)" \
   --generate-notes
 
 echo
