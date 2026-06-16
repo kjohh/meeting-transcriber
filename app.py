@@ -313,7 +313,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.6"  # Bumped on each release. Used to gate one-time
+APP_VERSION = "0.1.7"  # Bumped on each release. Used to gate one-time
                        # `tccutil reset` of stale entries across upgrades.
 
 
