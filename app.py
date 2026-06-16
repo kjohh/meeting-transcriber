@@ -1350,6 +1350,17 @@ _SPEAKER_LABEL_RE = re.compile(
 _NONSPEECH_MARK_RE = re.compile(r'\*[A-Za-z][A-Za-z\s]*\*|\[[A-Za-z][A-Za-z\s]*\]')
 _CJK_RE = re.compile(r'[一-鿿]')
 
+# CJK ideographs + kana + CJK/full-width punctuation. A forced-English session
+# should never contain these — Whisper drifts into them on low-confidence audio
+# (silence → 字幕/subtitle boilerplate), and once such a chunk leaks into the
+# prompt chain it snowballs the rest of the meeting into Chinese gibberish.
+_CJK_KANA_PUNCT_RE = re.compile(
+    "[　-〿"   # CJK symbols & punctuation（、。「」etc.）
+    "぀-ヿ"    # hiragana + katakana
+    "一-鿿"    # CJK ideographs
+    "＀-￯]+"  # full-width forms
+)
+
 # Stock Whisper "silence filler" phrases — what it emits on quiet/ambiguous
 # audio under a zh lock instead of nothing. Normalised (lowercase, letters +
 # spaces only). Used to drop ONLY these, so a real English sentence in a
@@ -1397,6 +1408,13 @@ def _drop_hallucinations(text: str, language: str) -> str:
         sents = [s for s in _SENT_SPLIT_RE.split(text) if s.strip()] or [text]
         if all(_normalize_en(s) in _EN_HALLUCINATION for s in sents):
             return ""
+    if language == "en" and _CJK_KANA_PUNCT_RE.search(text):
+        # Forced-English but CJK/kana appeared → Whisper drift / hallucination.
+        # Strip those runs; keep any real English, drop an all-CJK segment.
+        # This also keeps the prompt chain clean, which is what stops a single
+        # hallucinated chunk from snowballing the rest of the session.
+        stripped = re.sub(r'\s+', ' ', _CJK_KANA_PUNCT_RE.sub(' ', text)).strip()
+        return stripped if re.search(r'[A-Za-z]', stripped) else ""
     return text
 
 

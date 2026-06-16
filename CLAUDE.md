@@ -82,9 +82,11 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 
 `_dedup_boundary` 是 **cross-chunk** 去重（與 `_trim_repetition` 的 chunk 內去重不同）：找「上一行結尾」與「這段開頭」的最長字級重疊（≥5 字、限 60 字窗），砍掉重複前綴。專治 hard-cap 保留的 1s overlap 被轉兩次的接縫重複。同樣套用在 `/upload` 的整檔結果上。
 
-### `_drop_hallucinations` 的 zh-lock 英文判斷
+### `_drop_hallucinations` 的語言鎖判斷（雙向對稱）
 
-`language="zh"` 鎖定下、整段無中文字時，**只丟**落在 `_EN_HALLUCINATION` 清單的 stock filler（"thank you"、"thanks for watching"…），不再無條件丟掉所有英文 —— 中英夾雜會議裡真正的英文句子（"let me share my screen"）必須保留。
+- **`language="zh"`**：整段無中文字時，**只丟**落在 `_EN_HALLUCINATION` 清單的 stock filler（"thank you"、"thanks for watching"…），不無條件丟英文 —— 真正的英文句子（"let me share my screen"）保留。
+- **`language="en"`**：出現 CJK / 假名（`_CJK_KANA_PUNCT_RE`）= Whisper drift / 幻覺（強制英文不該有中文）。strip 掉那些字,留下真英文,整段都是 CJK 就丟。**這同時讓 prompt chain 保持乾淨,是斷「一個靜音幻覺 chunk 把整場後半雪球成中文亂碼」的關鍵**（長 session 經典失敗模式）。
+- **`auto`**：兩邊都不動（使用者沒宣告語言,中英夾雜可能是真的）。
 
 ### Voice activity ratio gate
 
