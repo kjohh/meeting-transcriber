@@ -319,7 +319,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.8"  # Bumped on each release. Used to gate one-time
+APP_VERSION = "0.1.9"  # Bumped on each release. Used to gate one-time
                        # `tccutil reset` of stale entries across upgrades.
 
 
@@ -2034,23 +2034,13 @@ if __name__ == "__main__":
         min_size=(720, 440),
         js_api=JSAPI(),
     )
-
-    # Warn before closing mid-recording so an accidental ⌘W doesn't silently
-    # drop an in-progress meeting. closing handler returns False to cancel.
-    def _on_closing():
-        if _recording:
-            try:
-                return window.create_confirmation_dialog(
-                    "錄音中",
-                    "正在錄音 — 確定要關閉嗎?尚未儲存的逐字稿會遺失。",
-                )
-            except Exception:
-                return True  # if the dialog API is unavailable, don't block close
-        return True
-    try:
-        window.events.closing += _on_closing
-    except Exception as e:
-        print(f"NOTE: could not attach closing handler: {e}", file=sys.stderr)
+    # NOTE: no `events.closing` handler. Opening a native confirmation dialog
+    # from inside pywebview's closing callback re-enters the GUI event loop and
+    # deadlocks the app on ⌘Q ("not responding"). atexit (_shutdown_cleanup)
+    # still reaps the Swift binary + whisper subprocess on quit. If a
+    # close-confirmation is wanted later, use create_window(confirm_close=True)
+    # (pywebview's built-in, which handles this safely) rather than a custom
+    # closing handler that opens a dialog.
 
     webview.start()
     # webview.start() blocks until window is closed — process exits cleanly
