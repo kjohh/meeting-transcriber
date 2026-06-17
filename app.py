@@ -193,6 +193,12 @@ _lines: list[dict] = []
 # EN→ZH live translation toggle. Off by default — the user opts in per session.
 # Mirrors the config "translate" flag; set on launch and via /translate.
 _translate_enabled = False
+
+# Live Groq rate-limit snapshot for translation, read from response headers.
+# x-ratelimit-remaining-requests is the per-DAY window, so this is the
+# authoritative "how many translations left today" — accurate across app
+# restarts and other clients on the same key (it's the server's own count).
+_translate_usage: dict = {"limit": 0, "used": 0, "remaining": 0, "reset": "", "exhausted": False}
 _swift_proc: Optional[subprocess.Popen] = None
 _sys_capture_thread: Optional[threading.Thread] = None
 _mic_stream = None
@@ -313,7 +319,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.7"  # Bumped on each release. Used to gate one-time
+APP_VERSION = "0.1.8"  # Bumped on each release. Used to gate one-time
                        # `tccutil reset` of stale entries across upgrades.
 
 
@@ -703,7 +709,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'translate':load_translate(),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -1585,7 +1591,9 @@ def _translate_text(text: str, api_key: str) -> str:
     vocab = load_vocab()
     if vocab:
         sys_prompt += f" 參考{vocab}"
-    chat = Groq(api_key=api_key).chat.completions.create(
+    # with_raw_response so we can read the rate-limit headers (remaining quota)
+    # alongside the parsed body.
+    raw = Groq(api_key=api_key).chat.completions.with_raw_response.create(
         model=TRANSLATE_MODEL,
         messages=[
             {"role": "system", "content": sys_prompt},
@@ -1594,7 +1602,30 @@ def _translate_text(text: str, api_key: str) -> str:
         temperature=0.2,
         max_tokens=512,
     )
+    _update_translate_usage(raw.headers)
+    chat = raw.parse()
     return (chat.choices[0].message.content or "").strip()
+
+
+def _update_translate_usage(headers, exhausted: bool = False):
+    """Snapshot Groq's per-day request quota from response headers and push it
+    to the UI. x-ratelimit-remaining-requests is the per-day window."""
+    try:
+        limit = int(headers.get("x-ratelimit-limit-requests") or 0)
+        remaining = int(headers.get("x-ratelimit-remaining-requests") or 0)
+    except (TypeError, ValueError):
+        limit = remaining = 0
+    if limit:
+        _translate_usage.update({
+            "limit": limit,
+            "remaining": remaining,
+            "used": max(0, limit - remaining),
+            "reset": headers.get("x-ratelimit-reset-requests") or "",
+        })
+    _translate_usage["exhausted"] = exhausted
+    if exhausted:
+        _translate_usage["remaining"] = 0
+    _broadcast("translate_usage", dict(_translate_usage))
 
 
 def _maybe_translate(text: str, api_key: str) -> str:
@@ -1610,6 +1641,13 @@ def _maybe_translate(text: str, api_key: str) -> str:
     try:
         return _translate_text(text, api_key)
     except Exception as e:
+        # 429 = quota hit. Flag it so the UI shows "額度用盡 · reset in …".
+        if getattr(e, "status_code", None) == 429:
+            try:
+                _update_translate_usage(e.response.headers, exhausted=True)
+            except Exception:
+                _translate_usage["exhausted"] = True
+                _broadcast("translate_usage", dict(_translate_usage))
         print(f"translate failed: {e}", file=sys.stderr)
         return "⚠ 翻譯失敗"
 
@@ -1996,5 +2034,23 @@ if __name__ == "__main__":
         min_size=(720, 440),
         js_api=JSAPI(),
     )
+
+    # Warn before closing mid-recording so an accidental ⌘W doesn't silently
+    # drop an in-progress meeting. closing handler returns False to cancel.
+    def _on_closing():
+        if _recording:
+            try:
+                return window.create_confirmation_dialog(
+                    "錄音中",
+                    "正在錄音 — 確定要關閉嗎?尚未儲存的逐字稿會遺失。",
+                )
+            except Exception:
+                return True  # if the dialog API is unavailable, don't block close
+        return True
+    try:
+        window.events.closing += _on_closing
+    except Exception as e:
+        print(f"NOTE: could not attach closing handler: {e}", file=sys.stderr)
+
     webview.start()
     # webview.start() blocks until window is closed — process exits cleanly

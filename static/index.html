@@ -91,10 +91,6 @@ button:hover:not(:disabled) { filter: brightness(0.88); }
 button:disabled,
 select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
-.btn-start  { background: var(--green);  color: #fff; }
-.btn-stop   { background: var(--red);    color: #fff; }
-.btn-save   { background: var(--accent); color: #fff; margin-left: auto; }
-
 .divider { width: 1px; height: 20px; background: var(--border); }
 
 /* ── audio waveform — small, centered, CSS-transitioned for smoothness ── */
@@ -107,7 +103,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 }
 .audio-wave.visible { display: flex; }
 .audio-wave .wave-bar {
-  width: 2px;
+  width: 3px;
   height: 2px;
   background: #34c759;
   border-radius: 1px;
@@ -207,27 +203,27 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   flex-shrink: 0;
 }
 #transcript {
-  flex: 1; padding: 12px 14px; overflow-y: auto;
-  font-size: 14px; line-height: 1.65;
+  flex: 1; padding: 14px 16px; overflow-y: auto;
+  font-size: 16px; line-height: 1.75;
   white-space: pre-wrap; word-break: break-word;
   color: var(--text);
   user-select: text; -webkit-user-select: text; cursor: text;
 }
-#transcript .ts { color: var(--text2); font-size: 12px; user-select: none; }
+#transcript .ts { color: var(--text2); font-size: 11px; opacity: 0.7; user-select: none; margin-right: 2px; }
 #transcript .line { margin-bottom: 6px; }
 
 /* Translation mode: split each line into original (left) + 中文 (right). */
 #cols-head { display: none; }
 .transcript-card.translating #cols-head {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 28px;
   padding: 6px 14px; font-size: 11px; font-weight: 600;
   color: var(--text2); text-transform: uppercase; letter-spacing: .04em;
   border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
 .col-zh { display: none; }
 .transcript-card.translating #transcript .line {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
-  padding-bottom: 6px; border-bottom: 1px solid var(--border);
+  display: grid; grid-template-columns: 1fr 1fr; gap: 28px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
 }
 .transcript-card.translating .col-en { color: var(--text2); }  /* original = reference */
 .transcript-card.translating .col-zh { display: block; color: var(--text); }
@@ -371,6 +367,68 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 .ob-backend-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; }
 .ob-backend-option:has(input:checked) { border-color: var(--accent); background: var(--surface2); }
 
+/* ── control area (primary action vs. settings/tools) ── */
+.controls { display: flex; flex-direction: column; gap: 10px; flex-shrink: 0; }
+.controls-main { display: flex; align-items: center; gap: 8px; }
+.controls-sub  { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+
+/* primary action — the biggest, heaviest control */
+.btn-record {
+  height: 44px; padding: 0 22px; border: none; border-radius: var(--r);
+  background: var(--green); color: #fff; font-size: 15px; font-weight: 600;
+  cursor: pointer; transition: filter .12s;
+}
+.btn-record:hover:not(:disabled) { filter: brightness(0.92); }
+.btn-record.is-pause { background: var(--surface2); color: var(--text); }  /* "⏸ 暫停" — neutral; the red dot carries the recording signal */
+
+/* secondary actions (新會議 / 儲存) — outline weight */
+.btn-action {
+  height: 36px; padding: 0 14px; border: 1px solid var(--border); border-radius: var(--r);
+  background: transparent; color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer;
+}
+.btn-action:hover:not(:disabled) { background: var(--surface2); }
+.btn-save { border-color: var(--accent); color: var(--accent); }
+
+/* tier-2: settings + tools, lighter (still labelled — no bare icons) */
+.controls-sub > button,
+.controls-sub > select { height: 32px; font-size: 13px; }
+
+/* integrated live status: state dot + label + timer + waveform, in one place */
+.live-status {
+  display: flex; align-items: center; gap: 9px; margin-left: auto;
+  min-height: 44px; color: var(--text2); font-size: 13px;
+}
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+.live-status.active .live-dot { background: var(--red); animation: blink 1.2s ease-in-out infinite; }
+.live-status.paused .live-dot { background: var(--orange); }
+.live-timer { font-variant-numeric: tabular-nums; font-size: 15px; font-weight: 600; color: var(--text); letter-spacing: .02em; }
+
+/* toggle switch — for translation (clear on/off, distinct from buttons) */
+.switch-ctl { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 4px; font-size: 13px; color: var(--text); cursor: pointer; user-select: none; }
+.switch-ctl input { position: absolute; opacity: 0; pointer-events: none; }
+.switch-track { width: 34px; height: 20px; border-radius: 10px; background: var(--surface2); position: relative; transition: background .15s; flex-shrink: 0; }
+.switch-track::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+.switch-ctl input:checked + .switch-track { background: var(--accent); }
+.switch-ctl input:checked + .switch-track::after { transform: translateX(14px); }
+.switch-ctl:has(input:disabled) { opacity: .5; cursor: not-allowed; }
+
+/* translation quota readout (lives next to the toggle, shown whenever ON) */
+#translate-usage { display: none; align-items: center; gap: 6px; font-size: 11px; color: var(--text2); }
+#translate-usage.tu-warn { color: var(--orange); font-weight: 600; }
+
+/* ── two independent boards: transcript | translation ── */
+.boards { flex: 1; display: flex; gap: 12px; min-height: 0; }
+.board { flex: 1; min-width: 0; display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; min-height: 0; }
+.board-header { padding: 8px 14px 7px; font-size: 11px; font-weight: 600; color: var(--text2);
+  text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--border);
+  flex-shrink: 0; display: flex; align-items: center; }
+.board-body { flex: 1; padding: 14px 16px; overflow-y: auto; font-size: 16px; line-height: 1.75;
+  white-space: pre-wrap; word-break: break-word; color: var(--text);
+  user-select: text; -webkit-user-select: text; cursor: text; }
+.board-body .line { margin-bottom: 6px; }
+.board-body .ts { color: var(--text2); font-size: 11px; opacity: 0.7; user-select: none; margin-right: 2px; }
+
 /* ── status ── */
 .status-bar {
   font-size: 12px; color: var(--text2);
@@ -388,29 +446,53 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
 <div class="header">
   <h1>Meeting Transcriber</h1>
-  <span class="badge" id="badge">待機</span>
 </div>
 
-<div class="btn-row">
-  <button id="btn-record" class="btn-start" onclick="onRecordClick()">● 開始</button>
-  <button id="btn-new" onclick="newSession()" title="結束目前的會議,清空逐字稿開新場">↻ 新會議</button>
-  <div class="divider"></div>
-  <select id="lang-select" onchange="onLangChange()" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
-    <option value="auto">自動</option>
-    <option value="zh">強制中文</option>
-    <option value="en">強制英文</option>
-  </select>
-  <select id="backend-select" onchange="onBackendChange()" style="height:32px;padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;cursor:pointer">
-    <option value="local">🔒 本機</option>
-    <option value="cloud">🌐 雲端</option>
-  </select>
-  <button id="btn-translate" onclick="toggleTranslate()" title="開啟後逐字稿多一欄即時中文翻譯(英文→中文,走 Groq 雲端,需金鑰)">🌐 翻譯</button>
-  <div class="divider"></div>
-  <button id="btn-upload" onclick="document.getElementById('upload-input').click()">↑ 上傳檔案</button>
-  <input type="file" id="upload-input" accept="audio/*,video/*" onchange="uploadFile(this)">
-  <button id="btn-vocab" onclick="openVocab()">詞彙</button>
-  <button id="btn-save" class="btn-save" onclick="saveTranscript()">儲存 .txt</button>
-  <button id="btn-settings" onclick="openSettings()" title="設定" aria-label="設定" style="margin-left:6px;width:32px;padding:0;font-size:16px">⚙</button>
+<div class="controls">
+  <!-- Tier 1 — primary action + integrated live status (state · timer · wave) -->
+  <div class="controls-main">
+    <button id="btn-record" class="btn-record" onclick="onRecordClick()">● 開始錄音</button>
+    <button id="btn-new" class="btn-action" onclick="newSession()" title="結束目前的會議,清空逐字稿開新場">↻ 新會議</button>
+    <button id="btn-save" class="btn-action btn-save" onclick="saveTranscript()">儲存 .txt</button>
+    <div class="live-status" id="live-status">
+      <span class="live-dot" id="live-dot"></span>
+      <span id="live-text">待機中</span>
+      <span class="live-timer" id="rec-timer"></span>
+      <div class="audio-wave" id="audio-wave">
+        <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+        <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+        <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+        <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+        <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
+        <span class="wave-bar"></span>
+      </div>
+    </div>
+  </div>
+  <!-- Tier 2 — session settings + tools, lighter weight (labelled, no bare icons) -->
+  <div class="controls-sub">
+    <select id="lang-select" onchange="onLangChange()" style="padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);cursor:pointer">
+      <option value="auto">自動</option>
+      <option value="zh">強制中文</option>
+      <option value="en">強制英文</option>
+    </select>
+    <select id="backend-select" onchange="onBackendChange()" style="padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);cursor:pointer">
+      <option value="local">🔒 本機轉錄</option>
+      <option value="cloud">🌐 雲端轉錄</option>
+    </select>
+    <label class="switch-ctl" title="開啟後即時把英文翻成中文,顯示在右側翻譯欄。會議開始前設定,中途不能改。需 Groq 金鑰(走雲端)。">
+      <input type="checkbox" id="translate-toggle" onchange="onTranslateToggle()">
+      <span class="switch-track"></span>
+      <span>🌐 翻譯成中文</span>
+    </label>
+    <span id="translate-usage" title="免費額度:翻譯密集使用時可能會短暫受限,稍後會自動恢復。實際上限由每日請求數與 token 用量共同決定(不是固定整點重置),所以這裡只顯示已用量,接近上限時才提醒。">
+      <span id="tu-text"></span>
+    </span>
+    <div class="divider"></div>
+    <button id="btn-upload" onclick="document.getElementById('upload-input').click()">↑ 上傳檔案</button>
+    <input type="file" id="upload-input" accept="audio/*,video/*" onchange="uploadFile(this)">
+    <button id="btn-vocab" onclick="openVocab()">詞彙</button>
+    <button id="btn-settings" onclick="openSettings()" title="設定" style="margin-left:auto">⚙ 設定</button>
+  </div>
 </div>
 
 <div class="modal-backdrop" id="onboarding-modal">
@@ -648,13 +730,17 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   </div>
 </div>
 
-<div class="audio-wave" id="audio-wave">
-  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
-  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
-  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
-  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
-  <span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span>
-  <span class="wave-bar"></span>
+<div class="modal-backdrop" id="confirm-modal">
+  <div class="modal" style="width:420px">
+    <div class="modal-header" id="confirm-title">確認</div>
+    <div class="modal-body">
+      <div style="font-size:14px;line-height:1.6" id="confirm-msg"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="confirm-cancel">取消</button>
+      <button class="btn-primary" id="confirm-ok">確定</button>
+    </div>
+  </div>
 </div>
 
 <div class="loading-bar" id="loading-bar"></div>
@@ -667,13 +753,15 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   </div>
 </div>
 
-<div class="transcript-card" id="transcript-card" style="display:none">
-  <div class="transcript-header">
-    逐字稿
-    <button class="btn-copy" onclick="copyTranscript()">複製全部</button>
+<div class="boards" id="boards" style="display:none">
+  <div class="board">
+    <div class="board-header">逐字稿<button class="btn-copy" onclick="copyTranscript()" style="margin-left:auto">複製全部</button></div>
+    <div class="board-body" id="transcript"></div>
   </div>
-  <div id="cols-head"><div>英文原文</div><div>中文翻譯</div></div>
-  <div id="transcript"></div>
+  <div class="board" id="board-zh" style="display:none">
+    <div class="board-header">中文翻譯</div>
+    <div class="board-body" id="transcript-zh"></div>
+  </div>
 </div>
 
 <div id="transcript-empty" style="flex:1;display:flex;align-items:center;justify-content:center">
@@ -749,13 +837,15 @@ es.onmessage = ({data}) => {
       document.getElementById('lang-select').value = lang;
     }
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
+    if (msg.translate_usage) _lastUsage = msg.translate_usage;
     if (typeof msg.translate === 'boolean') setTranslateUI(msg.translate);
     if (msg.models) modelStatus = msg.models;
     updateKeyBanner();
     document.getElementById('transcript').innerHTML = '';
+    document.getElementById('transcript-zh').innerHTML = '';
     msg.lines.forEach(l => appendLine(l));
     if (!msg.lines.length) {
-      document.getElementById('transcript-card').style.display = 'none';
+      document.getElementById('boards').style.display = 'none';
       document.getElementById('transcript-empty').style.display = 'flex';
     }
     recording = msg.recording; paused = msg.paused; sync();
@@ -778,99 +868,126 @@ es.onmessage = ({data}) => {
     const warn = document.getElementById('sys-audio-warning');
     const shouldHide = msg.data.ok || _anyBlockingModalOpen() || _sysAudioWarningDismissed;
     warn.style.display = shouldHide ? 'none' : 'block';
+  } else if (msg.type === 'translate_usage') {
+    _lastUsage = msg.data;
+    renderTranslateUsage(_lastUsage);
   } else if (msg.type === 'mic_test_level') {
     _micTestLatest = msg.data;
   }
 };
 
+// Build one transcript row. Via DOM nodes, never innerHTML — transcript text is
+// raw model output and may contain "<", ">" etc.; only the timestamp is styled.
+function _buildRow(ts, tag, body) {
+  const row = document.createElement('div');
+  row.className = 'line';
+  if (ts) {
+    const tsSpan = document.createElement('span');
+    tsSpan.className = 'ts';
+    tsSpan.textContent = `[${ts}]` + (tag ? ` [${tag}]` : '');
+    row.appendChild(tsSpan);
+    row.appendChild(document.createTextNode(' ' + (body || '')));
+  } else {
+    row.textContent = body || '';
+  }
+  return row;
+}
+
 function appendLine(line) {
   // line: {ts, text, tr, tag}. (Defensive: wrap a bare string.)
   if (typeof line === 'string') line = {ts: '', text: line, tr: '', tag: ''};
 
-  // Show transcript card on first line
-  const card = document.getElementById('transcript-card');
-  const empty = document.getElementById('transcript-empty');
-  if (card.style.display === 'none') {
-    card.style.display = 'flex';
-    empty.style.display = 'none';
+  // Reveal the boards on first line
+  const boards = document.getElementById('boards');
+  if (boards.style.display === 'none') {
+    boards.style.display = 'flex';
+    document.getElementById('transcript-empty').style.display = 'none';
   }
 
-  const box = document.getElementById('transcript');
-  const row = document.createElement('div');
-  row.className = 'line';
+  // Original → 逐字稿 board
+  const orig = document.getElementById('transcript');
+  orig.appendChild(_buildRow(line.ts, line.tag, line.text));
+  orig.scrollTop = orig.scrollHeight;
 
-  // Build via DOM nodes, never innerHTML — transcript text is raw model output
-  // and may contain "<", ">" etc. Only the leading timestamp is styled; bodies
-  // go in as text nodes so they can't be parsed as markup.
-  const en = document.createElement('div');
-  en.className = 'col-en';
-  if (line.ts) {
-    const tsSpan = document.createElement('span');
-    tsSpan.className = 'ts';
-    tsSpan.textContent = `[${line.ts}]` + (line.tag ? ` [${line.tag}]` : '');
-    en.appendChild(tsSpan);
-    en.appendChild(document.createTextNode(' ' + (line.text || '')));
-  } else {
-    en.textContent = line.text || '';
+  // Translation → its own board (only while translation is on). Always append a
+  // row — even the failure marker — so the two boards stay row-aligned.
+  if (translateOn) {
+    const zh = document.getElementById('transcript-zh');
+    zh.appendChild(_buildRow(line.ts, line.tag, line.tr || ''));
+    zh.scrollTop = zh.scrollHeight;
   }
-  row.appendChild(en);
 
-  const zh = document.createElement('div');
-  zh.className = 'col-zh';
-  zh.textContent = line.tr || '';
-  row.appendChild(zh);
-
-  box.appendChild(row);
-  box.scrollTop = box.scrollHeight;
   // Re-evaluate Save/New button state — they're gated on transcript being
   // non-empty, and arriving content needs to flip them from disabled.
   sync();
 }
 
+/* ── recording timer (excludes paused spans) ── */
+let _recElapsedMs = 0, _recSegStart = 0, _timerInterval = null, _wasActive = false;
+
+function fmtDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  const p = n => String(n).padStart(2, '0');
+  const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = s % 60;
+  return (hh > 0 ? p(hh) + ':' : '') + p(mm) + ':' + p(ss);
+}
+function renderTimer() {
+  const el = document.getElementById('rec-timer');
+  if (!el) return;
+  if (!recording) { el.textContent = ''; return; }
+  const active = recording && !paused;
+  el.textContent = fmtDuration(_recElapsedMs + (active ? (Date.now() - _recSegStart) : 0));
+}
+function updateTimerForState() {
+  const active = recording && !paused;
+  if (active && !_wasActive) {                 // started or resumed
+    _recSegStart = Date.now();
+    if (!_timerInterval) _timerInterval = setInterval(renderTimer, 500);
+  } else if (!active && _wasActive) {          // paused or stopped → bank the segment
+    _recElapsedMs += Date.now() - _recSegStart;
+  }
+  if (!recording) {                            // session ended / reset
+    if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
+    _recElapsedMs = 0;
+  }
+  _wasActive = active;
+  renderTimer();
+}
+
 function sync() {
-  // ── Record toggle (開始 → 暫停 → 繼續) ──
+  // ── Primary action toggle (開始錄音 → 暫停 → 繼續) ──
   const btn = document.getElementById('btn-record');
   if (!recording) {
-    btn.textContent = '● 開始';
-    btn.className = 'btn-start';
+    btn.textContent = '● 開始錄音'; btn.className = 'btn-record';
   } else if (paused) {
-    btn.textContent = '▶ 繼續';
-    btn.className = 'btn-start';
+    btn.textContent = '▶ 繼續';      btn.className = 'btn-record';
   } else {
-    btn.textContent = '⏸ 暫停';
-    btn.className = '';
+    btn.textContent = '⏸ 暫停';      btn.className = 'btn-record is-pause';
   }
 
-  // ── State machine for everything else ──
-  //   Idle     : nothing recorded, full freedom to configure + start
-  //   Active   : recording in progress — lock everything except the record toggle
-  //   Paused   : session ongoing but recording halted — selectors stay locked
-  //              (changes wouldn't apply mid-session anyway), but Save / New
-  //              re-enable so the user can checkpoint or end the session.
-  const sessionInProgress = recording;          // true in Active OR Paused
+  // ── State machine ──
+  //   Idle: configure + start freely. Active: lock settings, only the toggle.
+  //   Paused: settings stay locked, but Save / New re-enable to checkpoint/end.
+  const sessionInProgress = recording;
   const activeRecording   = recording && !paused;
-  const transcriptEmpty   = document.querySelectorAll('#transcript > div').length === 0;
+  const transcriptEmpty   = document.querySelectorAll('#transcript .line').length === 0;
 
-  // Selectors: locked for the entire session — only Idle or after New unlocks.
   document.getElementById('lang-select').disabled    = sessionInProgress;
   document.getElementById('backend-select').disabled = sessionInProgress;
-
-  // Buttons that have no meaningful behavior mid-session.
+  document.getElementById('translate-toggle').disabled = sessionInProgress;  // set before recording, locked mid-session
   document.getElementById('btn-upload').disabled = sessionInProgress;
   document.getElementById('btn-vocab').disabled  = sessionInProgress;
-
-  // Save + New: usable in Paused (checkpoint / end), off during Active recording
-  // and Idle-empty (nothing to save / end).
   document.getElementById('btn-save').disabled = activeRecording || transcriptEmpty;
-  // New-session button: always available when paused (user may want to
-  // abort and restart, even before anything has been transcribed). Only
-  // disabled while actively recording or in pure Idle with no transcript.
   document.getElementById('btn-new').disabled  = activeRecording || (!sessionInProgress && transcriptEmpty);
 
-  const badge = document.getElementById('badge');
-  badge.textContent = recording ? (paused ? '暫停' : '錄音中') : '待機';
-  badge.className = 'badge' + (recording && !paused ? ' recording' : paused ? ' paused' : '');
-  document.getElementById('audio-wave').className = 'audio-wave' + (recording && !paused ? ' visible' : '');
+  // ── Integrated live status: dot + label + timer + waveform ──
+  const live = document.getElementById('live-status');
+  live.className = 'live-status' + (activeRecording ? ' active' : paused ? ' paused' : '');
+  document.getElementById('live-text').textContent = recording ? (paused ? '已暫停' : '錄音中') : '待機中';
+  document.getElementById('audio-wave').className = 'audio-wave' + (activeRecording ? ' visible' : '');
+
+  updateTimerForState();
+
   if (!recording) {
     waveHistory.fill(0);
     document.querySelectorAll('#audio-wave .wave-bar').forEach(b => b.style.height = '2px');
@@ -951,6 +1068,17 @@ function startRecording() {
 }
 
 function newSession() {
+  // Confirm before discarding a non-empty transcript — New ends the session
+  // and clears everything.
+  const hasContent = document.querySelectorAll('#transcript .line').length > 0;
+  if (hasContent) {
+    showConfirm('開始新會議?', '目前的逐字稿會被清空。如果還沒存,先「儲存 .txt」再開新場。', _doNewSession);
+  } else {
+    _doNewSession();
+  }
+}
+
+function _doNewSession() {
   // End current recording (if any) and clear the transcript.
   // /stop joins worker threads and reaps the whisper subprocess — can
   // take a couple of seconds. Block the UI with a clear overlay so the
@@ -962,7 +1090,8 @@ function newSession() {
     .then(() => fetch('/clear', {method:'POST'}))
     .then(() => {
       document.getElementById('transcript').innerHTML = '';
-      document.getElementById('transcript-card').style.display = 'none';
+      document.getElementById('transcript-zh').innerHTML = '';
+      document.getElementById('boards').style.display = 'none';
       document.getElementById('transcript-empty').style.display = 'flex';
       setStatus('準備就緒,可以開始新會議了。');
       sync();
@@ -1015,26 +1144,55 @@ function maybeWarnCloudZh() {
 
 /* ── Live EN→ZH translation toggle ── */
 let translateOn = false;
+let _lastUsage = null;   // latest Groq translation quota snapshot
 
 function setTranslateUI(on) {
-  // Reflect state in the button + transcript layout. Does NOT hit the server —
-  // used both by the user toggle and the SSE init sync.
+  // Reflect state in the toggle + the separate translation board + the usage
+  // readout. Does NOT hit the server — used by both the user toggle and SSE init.
   translateOn = on;
-  const btn = document.getElementById('btn-translate');
-  if (btn) btn.className = on ? 'btn-toggle-on' : '';
-  document.getElementById('transcript-card').classList.toggle('translating', on);
+  const tg = document.getElementById('translate-toggle');
+  if (tg) tg.checked = on;
+  document.getElementById('board-zh').style.display = on ? 'flex' : 'none';
+  renderTranslateUsage(_lastUsage);
 }
 
-function toggleTranslate() {
-  const on = !translateOn;
+function renderTranslateUsage(u) {
+  // Progressive disclosure. The real ceiling is unknowable (per-day requests +
+  // per-minute/day token limits, and Groq gives no per-day token number), so we
+  // DON'T show a fake "/1000" denominator. Plain usage count by default; only
+  // escalate to an orange warning when Groq actually reports the quota tight or
+  // exhausted.
+  const el = document.getElementById('translate-usage');
+  if (!el) return;
+  if (!translateOn) { el.style.display = 'none'; return; }
+  el.style.display = 'inline-flex';
+  const txt = document.getElementById('tu-text');
+  const used = (u && u.limit) ? u.used : 0;
+  const tight = u && u.limit && (u.remaining / u.limit) < 0.15;  // request window running low
+  if (u && u.exhausted) {
+    txt.textContent = '翻譯額度暫時用盡' + (u.reset ? ' · 約 ' + u.reset + ' 後自動恢復' : ' · 稍後自動恢復');
+    el.classList.add('tu-warn');
+  } else if (tight) {
+    txt.textContent = '翻譯額度快用完了 (已翻 ' + used + ' 段)';
+    el.classList.add('tu-warn');
+  } else {
+    txt.textContent = '今日已翻譯 ' + used + ' 段';
+    el.classList.remove('tu-warn');
+  }
+}
+
+function onTranslateToggle() {
+  const tg = document.getElementById('translate-toggle');
+  const on = tg.checked;
   // Translation always runs on Groq (needs the key) regardless of ASR backend.
   if (on && !cachedKey) {
-    setStatus('翻譯需要 Groq 金鑰(即時翻譯走 Groq 雲端)— 點右上角 ⚙ 填寫。');
+    setStatus('翻譯需要 Groq 金鑰(走雲端)— 點右上角「⚙ 設定」填寫。');
+    tg.checked = false;
     return;
   }
   setTranslateUI(on);
   fetch('/translate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: on})});
-  setStatus(on ? '已開啟即時翻譯(英文 → 中文,逐句出現)。' : '已關閉翻譯。');
+  setStatus(on ? '已開啟即時翻譯(英文 → 中文)。會議中途無法變更。' : '已關閉翻譯。');
 }
 
 function _isOnboardingOpen() {
@@ -1532,16 +1690,14 @@ function saveVocab() {
 }
 
 function copyTranscript() {
-  // Walk the rows so the translation column is included (original ↳ 譯文)
-  // rather than relying on innerText, which would jam the two columns together.
-  const rows = [...document.querySelectorAll('#transcript .line')];
-  const text = rows.length
-    ? rows.map(r => {
-        const en = (r.querySelector('.col-en')?.innerText || '').trim();
-        const zh = (r.querySelector('.col-zh')?.innerText || '').trim();
-        return zh ? en + '\n  ↳ ' + zh : en;
-      }).join('\n')
-    : document.getElementById('transcript').innerText;
+  // Pair the two boards by row index so the copy keeps original ↳ 譯文 together.
+  const orig = [...document.querySelectorAll('#transcript .line')];
+  const zh   = [...document.querySelectorAll('#transcript-zh .line')];
+  const text = orig.map((r, i) => {
+    const en = (r.innerText || '').trim();
+    const tr = translateOn ? ((zh[i]?.innerText || '').trim()) : '';
+    return tr ? en + '\n  ↳ ' + tr : en;
+  }).join('\n');
   if (!text.trim()) { setStatus('沒有內容可以複製。'); return; }
   navigator.clipboard.writeText(text).then(
     () => setStatus('逐字稿已複製到剪貼簿。'),
@@ -1562,6 +1718,18 @@ function saveTranscript() {
     window.location.href = '/transcript';
   }
 }
+function showConfirm(title, msg, onYes) {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-msg').textContent = msg;
+  const m = document.getElementById('confirm-modal');
+  const ok = document.getElementById('confirm-ok');
+  const cancel = document.getElementById('confirm-cancel');
+  const close = () => { m.classList.remove('open'); ok.onclick = null; cancel.onclick = null; };
+  ok.onclick = () => { close(); onYes(); };
+  cancel.onclick = close;
+  m.classList.add('open');
+}
+
 function setStatus(msg)    { document.getElementById('status').textContent = msg; }
 </script>
 </body>
