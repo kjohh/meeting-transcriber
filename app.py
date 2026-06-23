@@ -319,7 +319,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.9"  # Bumped on each release. Used to gate one-time
+APP_VERSION = "0.1.10"  # Bumped on each release. Used to gate one-time
                        # `tccutil reset` of stale entries across upgrades.
 
 
@@ -632,6 +632,38 @@ def _terminate_process(proc: subprocess.Popen, name: str, soft_timeout: float = 
         pass
 
 
+# Keeps the Mac awake while recording. macOS idle display-sleep stops the
+# ScreenCaptureKit stream and throttles the app, so a meeting left unattended
+# stalls (UI still says recording, but capture/transcription has died). We hold
+# a `caffeinate` assertion for the duration of a recording session instead.
+_caffeinate_proc: Optional[subprocess.Popen] = None
+
+
+def _start_caffeinate():
+    """Prevent display + system idle sleep while recording."""
+    global _caffeinate_proc
+    if _caffeinate_proc is not None and _caffeinate_proc.poll() is None:
+        return
+    try:
+        # -d: no display sleep, -i: no system idle sleep, -s: no system sleep
+        # (AC only), -w <pid>: auto-exit if we crash without cleaning up.
+        _caffeinate_proc = subprocess.Popen(
+            ["caffeinate", "-d", "-i", "-s", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"NOTE: caffeinate failed to start: {e}", file=sys.stderr)
+        _caffeinate_proc = None
+
+
+def _stop_caffeinate():
+    """Release the keep-awake assertion."""
+    global _caffeinate_proc
+    if _caffeinate_proc is not None:
+        _terminate_process(_caffeinate_proc, "caffeinate", soft_timeout=1.0)
+        _caffeinate_proc = None
+
+
 def reap_orphan_audio_taps():
     """Kill any leftover coreaudio_tap processes from prior crashed runs.
 
@@ -858,6 +890,10 @@ def route_start():
         _chunk_worker_thread = threading.Thread(target=_chunk_worker, args=(key,), daemon=True)
         _chunk_worker_thread.start()
 
+        # Keep the Mac awake for the whole session so an unattended meeting
+        # doesn't stall when the screen sleeps.
+        _start_caffeinate()
+
     return jsonify({"ok": True})
 
 
@@ -905,6 +941,8 @@ def route_stop():
             return jsonify({"ok": True})  # idempotent
         _recording = False
         _paused = False
+
+        _stop_caffeinate()  # let the Mac sleep again once recording ends
 
         if _mic_stream:
             _mic_stream.stop()
@@ -1818,6 +1856,7 @@ if __name__ == "__main__":
     # /stop already cleans these up on the happy path — this catches the
     # paths where /stop never fires.
     def _shutdown_cleanup():
+        _stop_caffeinate()
         if _swift_proc is not None:
             _terminate_process(_swift_proc, "coreaudio_tap", soft_timeout=1.0)
         if _local_worker is not None:
