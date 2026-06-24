@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from datetime import datetime
 from multiprocessing.connection import Connection
 from typing import Any, Optional
@@ -64,6 +65,51 @@ MAX_SYS_RECONNECT = 5
 
 # Groq chat model used for EN→ZH live translation. Swap if Groq retires it.
 TRANSLATE_MODEL = "llama-3.3-70b-versatile"
+
+# ── Mixing / signal conditioning ──
+MIX_TARGET_RMS = 0.09     # per-stream loudness target before summing mic+sys
+MIX_GAIN_MAX = 4.0        # cap on per-stream boost (don't over-amplify a stream)
+MIX_GAIN_EMA = 0.3        # smoothing on the per-stream gain across chunks (0..1,
+                          # lower = smoother) so levels don't pump between chunks
+MIC_GATE_GRACE = 3.0      # seconds. Mic samples are withheld until system audio
+                          # is READY (so mic[0] and sys[0] share a wall-clock
+                          # start and aren't summed with a ~1s skew); after this
+                          # grace we record mic anyway (mic-only fallback / slow
+                          # ScreenCaptureKit warmup).
+
+# ── Chunk worker ──
+CHUNK_POLL = 0.1          # chunk-loop poll interval (matches the 100ms block
+                          # cadence; tighter pause-boundary detection than 0.3s)
+PAUSE_REL_DROP = 0.45     # tail counts as a pause when its RMS drops below this
+                          # fraction of the body RMS — relative test so a raised
+                          # noise floor (typing/fan) doesn't defeat boundary cuts
+
+# ── Prompt conditioning ──
+PROMPT_CHAIN_CHARS = 160  # chars of prior transcript carried as cross-chunk
+                          # context (was 80 — too short to keep continuity)
+PROMPT_CHAIN_KEEP = 2     # number of recent segments kept in the chain
+PROMPT_MAX_CHARS = 330    # hard cap on the assembled prompt (~224 Whisper tokens
+                          # for CJK-heavy text); the style prime is placed LAST so
+                          # Whisper's tail-keep truncation never drops it
+
+# ── Local whisper.cpp decoding ──
+LOCAL_BEAM_SIZE = 5       # beam search (default greedy beam=-1 is lower accuracy);
+                          # needs params_sampling_strategy=1 on the Model to engage
+
+# ── Model-confidence post-filter (layered AFTER the energy gate) ──
+# Conservative: drop a segment only on a STRONG combined low-confidence signal;
+# flag (amber, non-destructive) on a softer signal. No eval harness yet, so these
+# err toward keeping real speech — tune against real meeting clips before raising.
+LOCAL_PROB_DROP = 0.25       # local: drop a segment whose geo-mean prob is below this
+LOCAL_PROB_LOWCONF = 0.55    # local: flag the line when min kept prob is below this
+CLOUD_NSP_DROP = 0.85        # cloud: drop a segment when no_speech_prob > this AND…
+CLOUD_LOGPROB_DROP = -1.0    # …avg_logprob < this (both must hold)
+CLOUD_NSP_LOWCONF = 0.6      # cloud: flag the line when max kept no_speech_prob > this…
+CLOUD_LOGPROB_LOWCONF = -0.9 # …or min kept avg_logprob < this
+
+# ── Cloud (Groq) model selection ──
+CLOUD_MODEL_LIVE = "whisper-large-v3-turbo"  # live default: speed helps serial display
+CLOUD_MODEL_BATCH = "whisper-large-v3"       # upload/batch: no latency cost → use accuracy
 
 
 def _is_frozen_bundle() -> bool:
@@ -133,9 +179,23 @@ def _enforce_origin():
 
 _recording = False
 _paused = False
-_language = "auto"   # default: let Whisper detect per chunk
+_language = "zh"     # default: force Chinese. This user's meetings are zh/en
+                     # code-switched; the Chinese decoder natively interleaves
+                     # Latin tokens, and forcing zh turns on the bilingual style
+                     # prime + the zh hallucination/script-lock cleanup. "auto"
+                     # gave no prime and flip-flopped language per chunk.
 _backend = "local"   # "cloud" (Groq) or "local" (whisper.cpp). Default local
                      # to match onboarding's privacy-first preselection.
+
+# Set when system audio reaches READY; gates mic-buffer appends so the two
+# streams start at the same wall-clock instant (see _mic_cb / MIC_GATE_GRACE).
+_sys_ready = threading.Event()
+_mic_gate_deadline = 0.0  # monotonic time after which mic records even if sys isn't ready
+
+# Per-stream mix gains, EMA-smoothed across chunks so loudness matching doesn't
+# pump between chunks. Reset at session start.
+_mix_gain_sys = 1.0
+_mix_gain_mic = 1.0
 _chunk_worker_thread: Optional[threading.Thread] = None
 _transcribe_consumer_thread: Optional[threading.Thread] = None
 _mic_test_stream = None  # separate stream used by onboarding mic preview
@@ -175,13 +235,18 @@ _prompt_chain: list[str] = []
 # decoder stays in Chinese mode (which natively interleaves Latin tokens),
 # and provide example sentences that demonstrate the expected style. The
 # decoder mimics the style of the prompt, not its semantic content.
+# Kept deliberately short: it competes with vocab + the prompt chain for
+# Whisper's ~224-token prompt window, and a bloated prime crowds the chain out
+# (or gets truncated itself). Two representative code-switched sentences are
+# enough to set the style.
 _BILINGUAL_PROMPT = (
-    "以下是一段繁體中文與英文混合的工作會議逐字稿。"
-    "我覺得這個方案的 timeline 有點趕,我們先 sync 一下。"
-    "這個 feature 的 spec 還沒 finalize,等等 review 完再 follow up。"
-    "OK,那我們 align 一下 priority,下週 update 進度。"
-    "麻煩照之前的 format 處理,有問題隨時 ping 我。"
+    "以下是繁體中文與英文混合的工作會議逐字稿。"
+    "這個 feature 的 spec 還沒 finalize,等 review 完再 follow up,我們先 sync 一下 priority。"
 )
+# Rolling source-line context for translation (separate from the ASR prompt
+# chain). Gives the translator cross-sentence context so pronouns / continuations
+# resolve across chunk boundaries.
+_translate_ctx: "deque[str]" = deque(maxlen=2)
 _sys_buf: list[np.ndarray] = []
 _mic_buf: list[np.ndarray] = []
 _buf_lock = threading.Lock()
@@ -221,12 +286,14 @@ def _set_status(msg: str):
     _broadcast("status", msg)
 
 
-def _append_line(text: str, tr: str = "", tag: str = "", ts: Optional[str] = None):
+def _append_line(text: str, tr: str = "", tag: str = "", ts: Optional[str] = None,
+                 conf: str = ""):
     line = {
         "ts": ts or datetime.now().strftime("%H:%M:%S"),
         "text": text,
         "tr": tr,
         "tag": tag,
+        "conf": conf,  # "" normal, "low" = model was unsure (rendered de-emphasized)
     }
     _lines.append(line)
     _broadcast("transcript", line)
@@ -294,6 +361,21 @@ def load_translate() -> bool:
 def save_translate(value: bool):
     cfg = _read_config()
     cfg["translate"] = bool(value)
+    _write_config(cfg)
+
+
+def load_cloud_model() -> str:
+    """Groq model for the LIVE cloud path. Default = turbo (its speed helps the
+    serial chunk display); a user on hard bilingual meetings can opt into the
+    higher-accuracy non-turbo large-v3 in Settings. Upload/batch always uses
+    large-v3 (no latency cost) regardless of this setting."""
+    m = _read_config().get("cloud_model", CLOUD_MODEL_LIVE)
+    return m if m in (CLOUD_MODEL_LIVE, CLOUD_MODEL_BATCH) else CLOUD_MODEL_LIVE
+
+
+def save_cloud_model(model: str):
+    cfg = _read_config()
+    cfg["cloud_model"] = model if model in (CLOUD_MODEL_LIVE, CLOUD_MODEL_BATCH) else CLOUD_MODEL_LIVE
     _write_config(cfg)
 
 
@@ -452,7 +534,10 @@ def _whisper_subprocess_main(model_path: str, conn: Any) -> None:
 
     try:
         from pywhispercpp.model import Model
-        model = Model(model_path, print_progress=False, print_realtime=False)
+        # params_sampling_strategy=1 = beam search (greedy=0 is the default and
+        # lower-accuracy); the beam_search dict per-call tunes beam_size.
+        model = Model(model_path, params_sampling_strategy=1,
+                      print_progress=False, print_realtime=False)
     except Exception as e:
         try:
             conn.send({"status": "error", "error": f"model load failed: {e}"})
@@ -461,6 +546,20 @@ def _whisper_subprocess_main(model_path: str, conn: Any) -> None:
         return
 
     conn.send({"status": "ready"})
+
+    def _run(audio, kw, with_extras):
+        """Transcribe; with_extras adds beam/prob/NST params that some builds may
+        reject — caller retries without them on failure."""
+        k = dict(kw)
+        if with_extras:
+            # NOTE: the whisper.cpp beam_search param REQUIRES both keys —
+            # {"beam_size": N} alone raises KeyError 'patience' on every call,
+            # which would make this whole branch fall back to greedy and also
+            # silently disable suppress_nst + extract_probability.
+            k["beam_search"] = {"beam_size": LOCAL_BEAM_SIZE, "patience": -1.0}
+            k["suppress_nst"] = True   # suppress non-speech tokens ([Music], 字幕…) at decode
+            k["extract_probability"] = True
+        return model.transcribe(audio, **k)
 
     while True:
         try:
@@ -476,9 +575,29 @@ def _whisper_subprocess_main(model_path: str, conn: Any) -> None:
             if req.get("prompt"):
                 kw["initial_prompt"] = req["prompt"]
             audio = req["audio"].astype(np.float32)
-            segments = model.transcribe(audio, **kw)
-            text = " ".join(s.text.strip() for s in segments if s.text.strip())
-            conn.send({"status": "ok", "text": text})
+            try:
+                segments = _run(audio, kw, with_extras=True)
+            except Exception:
+                # A whisper.cpp build that rejects the extra kwargs — degrade
+                # gracefully to a plain decode rather than failing the chunk.
+                segments = _run(audio, kw, with_extras=False)
+
+            kept, probs = [], []
+            for s in segments:
+                t = s.text.strip()
+                if not t:
+                    continue
+                p = getattr(s, "probability", float("nan"))
+                # Drop only a segment with a VALID, strongly-low probability —
+                # NaN (prob not computed) is always kept.
+                if isinstance(p, float) and not np.isnan(p) and p < LOCAL_PROB_DROP:
+                    continue
+                kept.append(t)
+                if isinstance(p, float) and not np.isnan(p):
+                    probs.append(p)
+            text = " ".join(kept)
+            conf = "low" if probs and min(probs) < LOCAL_PROB_LOWCONF else ""
+            conn.send({"status": "ok", "text": text, "conf": conf})
         except Exception as e:
             conn.send({"status": "error", "error": str(e)})
 
@@ -542,7 +661,8 @@ class LocalWhisperWorker:
             self.close()
             raise RuntimeError(f"whisper subprocess: {err}")
 
-    def transcribe(self, audio: np.ndarray, language: str, prompt: str) -> str:
+    def transcribe(self, audio: np.ndarray, language: str, prompt: str) -> tuple[str, str]:
+        """Returns (text, conf) where conf is "low" when the model was unsure."""
         if self._conn is None:
             raise RuntimeError("Worker not started")
         # Pipe is duplex but single send/recv pair — serialise so two
@@ -555,7 +675,7 @@ class LocalWhisperWorker:
             result = self._conn.recv()
         if result.get("status") == "error":
             raise RuntimeError(result["error"])
-        return result.get("text", "")
+        return result.get("text", ""), result.get("conf", "")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -707,23 +827,58 @@ def reap_orphan_audio_taps():
         print(f"INFO: reaped {killed} orphan coreaudio_tap process(es)", file=sys.stderr)
 
 
-def load_vocab() -> str:
-    """Read user vocabulary from .vocab.local. Returns a comma-joined hint string
-    to be appended to Whisper's prompt, improving recognition of proper nouns
-    that aren't in the model's training distribution (brand names, internal
-    jargon, people)."""
+def _vocab_lines() -> list[str]:
     try:
         with open(VOCAB_FILE, encoding="utf-8") as f:
-            words = [
-                line.strip()
-                for line in f
-                if line.strip() and not line.strip().startswith("#")
-            ]
+            return [ln.strip() for ln in f
+                    if ln.strip() and not ln.strip().startswith("#")]
     except FileNotFoundError:
-        return ""
+        return []
+
+
+def load_vocab() -> str:
+    """Read user vocabulary from .vocab.local. Returns a comma-joined hint string
+    appended to Whisper's prompt, improving recognition of proper nouns that
+    aren't in the model's training distribution (brand names, internal jargon,
+    people).
+
+    Lines of the form ``wrong=>right`` are correction pairs, NOT prompt hints —
+    they're applied as a post-hoc find/replace on transcript output instead of
+    eating the limited prompt window (see apply_vocab_corrections). Only the
+    plain terms go into the prompt."""
+    words = [ln for ln in _vocab_lines() if "=>" not in ln]
     if not words:
         return ""
     return "專有名詞:" + "、".join(words) + "。"
+
+
+def load_vocab_corrections() -> list[tuple[str, str]]:
+    """Parse ``wrong=>right`` lines from .vocab.local into (wrong, right) pairs.
+    Deterministic post-transcription correction — fixes a recurring mishear for
+    BOTH backends without priming Whisper into a repetition loop."""
+    pairs = []
+    for ln in _vocab_lines():
+        if "=>" in ln:
+            wrong, _, right = ln.partition("=>")
+            wrong, right = wrong.strip(), right.strip()
+            if wrong:
+                pairs.append((wrong, right))
+    return pairs
+
+
+def apply_vocab_corrections(text: str) -> str:
+    """Apply user-defined wrong=>right replacements to *text* (case-insensitive
+    for Latin runs; exact for CJK). Intentionally simple literal replace — no
+    fuzzy auto-matching, which would risk silently over-correcting real speech
+    when there's no eval harness to catch regressions."""
+    if not text:
+        return text
+    for wrong, right in load_vocab_corrections():
+        if re.search(r'[A-Za-z]', wrong):
+            text = re.sub(re.escape(wrong), right, text, flags=re.IGNORECASE)
+        else:
+            text = text.replace(wrong, right)
+    return text
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -741,7 +896,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'cloud_model':load_cloud_model(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -803,7 +958,7 @@ def _ensure_local_worker(model_path: str) -> "LocalWhisperWorker":
 def route_start():
     global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
     global _chunk_worker_thread, _transcribe_consumer_thread, _local_worker
-    global _sys_capture_thread
+    global _sys_capture_thread, _mic_gate_deadline, _mix_gain_sys, _mix_gain_mic
 
     data = request.json or {}
     key = data.get("key", "").strip()
@@ -828,6 +983,17 @@ def route_start():
         _backend = backend
         _recording = True
         _paused = False
+        # Arm the mic-buffer gate: withhold mic until system audio is READY (so
+        # the two streams start aligned), with a grace fallback. If screen
+        # recording isn't granted, system audio will never arrive — open the
+        # gate now so a mic-only session records from t=0 (no 3s dead start).
+        _sys_ready.clear()
+        _mic_gate_deadline = time.monotonic() + MIC_GATE_GRACE
+        if not _screen_capture_granted():
+            _sys_ready.set()
+        _mix_gain_sys = 1.0
+        _mix_gain_mic = 1.0
+        _translate_ctx.clear()
         with _buf_lock:
             _sys_buf.clear()
             _mic_buf.clear()
@@ -907,6 +1073,11 @@ def route_pause():
     with _lifecycle_lock:
         _paused = not _paused
         paused_now = _paused
+        # NOTE: we deliberately do NOT re-arm the mic gate on resume. _sys_ready
+        # stays set from the first READY, so mic records immediately on resume.
+        # Re-arming would discard ~MIC_GATE_GRACE of the user's own speech every
+        # resume just to re-align against the system-audio warmup — not worth it
+        # (the brief re-skew is absorbed by _mix_buffers' zero-pad-to-longest).
     _broadcast("state", {"recording": _recording, "paused": paused_now})
     _set_status("暫停中" if paused_now else "錄音中…")
     return jsonify({"ok": True, "paused": paused_now})
@@ -925,10 +1096,7 @@ def _flush_pending_audio():
         _mic_buf.clear()
     audio = _mix_buffers(sa, ma)
     if len(audio) > SAMPLE_RATE // 2:
-        try:
-            _transcribe_queue.put(audio, timeout=2)
-        except queue.Full:
-            print("WARN: transcribe queue full, dropping flush chunk", file=sys.stderr)
+        _queue_chunk(audio, "flush", "flush chunk")
 
 
 @app.route("/stop", methods=["POST"])
@@ -1005,7 +1173,7 @@ def route_upload():
 
     def _do():
         ts = datetime.now().strftime("%H:%M:%S")
-        _set_status(f"Transcribing {fname}…")
+        _set_status(f"轉錄中:{fname} — 長檔可能需要幾分鐘…")
         try:
             vocab = load_vocab()
             prompt = vocab
@@ -1016,19 +1184,20 @@ def route_upload():
             else:
                 text = _transcribe_file_cloud(tmp.name, fname, key, language, prompt)
             # Same post-processing as the live path: strip non-speech markers /
-            # stock fillers, then trim Whisper repetition loops (a long file can
-            # loop just like a live chunk).
+            # stock fillers, collapse + trim repetition loops (a long file can
+            # loop just like a live chunk), then apply vocab corrections.
             text = _drop_hallucinations((text or "").strip(), language)
             if text:
-                text = _trim_repetition(text)
+                text = apply_vocab_corrections(_trim_repetition(_collapse_runs(text)))
             tr = _maybe_translate(text, key) if text else ""
             _append_line(text, tr=tr, tag=fname, ts=ts)
-            _set_status("Upload transcribed.")
+            _set_status("檔案轉錄完成。")
         except Exception as e:
             _append_line(f"Upload error: {e}", tag=fname, ts=ts)
-            _set_status("Upload failed.")
+            _set_status("檔案轉錄失敗。")
         finally:
             os.unlink(tmp.name)
+            _broadcast("upload_done", True)
 
     threading.Thread(target=_do, daemon=True).start()
     return jsonify({"ok": True})
@@ -1037,10 +1206,60 @@ def route_upload():
 @app.route("/clear", methods=["POST"])
 def route_clear():
     # Serialise with /stop so a late _append_line from a still-draining
-    # transcribe doesn't land into the cleared list.
+    # transcribe doesn't land into the cleared list. Also hold _buf_lock so the
+    # clear can't interleave between /line's bounds-check and its indexed write.
     with _lifecycle_lock:
-        _lines.clear()
+        with _buf_lock:
+            _lines.clear()
+    _translate_ctx.clear()
     return jsonify({"ok": True})
+
+
+@app.route("/line", methods=["POST"])
+def route_line():
+    """Edit a transcript line in place. The DOM edit alone wouldn't survive into
+    the saved file (save serializes from _lines), so we write the correction
+    back into _lines under the buffer lock."""
+    data = request.json or {}
+    try:
+        idx = int(data.get("index", -1))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "bad index"})
+    with _buf_lock:
+        if not (0 <= idx < len(_lines)):
+            return jsonify({"ok": False, "error": "index out of range"})
+        if "text" in data:
+            _lines[idx]["text"] = str(data["text"])
+        if "tr" in data:
+            _lines[idx]["tr"] = str(data["tr"])
+    return jsonify({"ok": True})
+
+
+@app.route("/cloud_model", methods=["GET", "POST"])
+def route_cloud_model():
+    """Get/set the LIVE cloud model (turbo vs the higher-accuracy large-v3)."""
+    if request.method == "POST":
+        model = (request.json or {}).get("model", CLOUD_MODEL_LIVE)
+        save_cloud_model(model)
+        return jsonify({"ok": True, "cloud_model": load_cloud_model()})
+    return jsonify({"ok": True, "cloud_model": load_cloud_model()})
+
+
+@app.route("/language", methods=["POST"])
+def route_language():
+    """Set the ASR language live. Cloud reads _language per chunk so a
+    mid-session switch takes effect on the next chunk; local would need a worker
+    respawn across the breeze-q8 ↔ large-v3 boundary, so a mid-session local
+    switch is rejected (the UI keeps the selector locked for local while
+    recording). When idle, this just stages the value for the next /start."""
+    global _language
+    lang = (request.json or {}).get("language", "auto")
+    if lang not in ("auto", "zh", "en"):
+        return jsonify({"ok": False, "error": "bad language"})
+    if _recording and _backend == "local" and lang != _language:
+        return jsonify({"ok": False, "error": "本機模式錄音中無法切換語言(需重新開始)"})
+    _language = lang
+    return jsonify({"ok": True, "language": lang})
 
 
 @app.route("/vocab", methods=["GET"])
@@ -1192,9 +1411,9 @@ def _read_sys_stdout(proc):
         try:
             data = proc.stdout.read(chunk)
         except Exception:
-            return
+            break
         if not data:
-            return
+            break
         buf = carry + data
         usable = len(buf) - (len(buf) % 4)
         carry = buf[usable:]
@@ -1206,6 +1425,20 @@ def _read_sys_stdout(proc):
         tick += 1
         if tick % 2 == 0:
             _sys_level = float(min(1.0, np.sqrt(np.mean(samples ** 2)) * 12))
+
+    # Recover the in-flight pipe tail — the blocking 100ms reads leave up to
+    # ~100ms of remote speech buffered when we exit on /stop. Non-blocking drain.
+    try:
+        os.set_blocking(proc.stdout.fileno(), False)
+        rest = proc.stdout.read() or b""
+        buf = carry + rest
+        usable = len(buf) - (len(buf) % 4)
+        if usable > 0:
+            samples = np.frombuffer(buf[:usable], dtype=np.float32).copy()
+            with _buf_lock:
+                _sys_buf.append(samples)
+    except Exception:
+        pass
 
 
 def _watch_sys_stderr(proc, ready: threading.Event):
@@ -1222,6 +1455,7 @@ def _watch_sys_stderr(proc, ready: threading.Event):
             continue
         if line == "READY":
             ready.set()
+            _sys_ready.set()  # opens the mic-buffer gate (aligned start)
             _set_status("錄音中…")
             _broadcast("sys_audio", {"ok": True})
         elif line.startswith("ERROR"):
@@ -1230,6 +1464,17 @@ def _watch_sys_stderr(proc, ready: threading.Event):
             except Exception:
                 pass
             return
+
+
+def _screen_capture_granted() -> bool:
+    """Preflight the screen-recording grant WITHOUT triggering a prompt. Used to
+    decide whether to even arm the mic-alignment gate — if system audio can't be
+    captured, mic must record from t=0 (mic-only fallback)."""
+    try:
+        from Quartz import CGPreflightScreenCaptureAccess
+        return bool(CGPreflightScreenCaptureAccess())
+    except Exception:
+        return True  # can't tell → assume granted; the grace deadline still backstops
 
 
 def _sys_capture_supervisor():
@@ -1257,6 +1502,7 @@ def _sys_capture_supervisor():
                 [BINARY], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
             )
         except Exception as e:
+            _sys_ready.set()  # mic-only fallback: open the mic gate immediately
             _broadcast("sys_audio", {"ok": False, "msg": f"spawn failed: {e}"})
             _set_status("⚠ 系統音擷取程式啟動失敗,僅麥克風錄音中")
             return
@@ -1278,6 +1524,7 @@ def _sys_capture_supervisor():
 
         fails = 0 if ready.is_set() else fails + 1
         if fails > MAX_SYS_RECONNECT:
+            _sys_ready.set()  # give up on system audio → don't keep withholding mic
             _broadcast("sys_audio", {"ok": False, "msg": "system audio stopped"})
             _set_status("⚠ 系統音抓不到 — 系統設定 → 隱私權 → 螢幕錄製 找到 Meeting Transcriber 並開啟")
             return
@@ -1298,7 +1545,13 @@ def _mic_test_cb(indata, frames, time_info, status):
 
 def _mic_cb(indata, frames, time_info, status):
     global _mic_level, _level_tick
-    if not _paused:
+    # Withhold mic until system audio is READY so mic[0] and sys[0] share a
+    # wall-clock start (the ScreenCaptureKit warmup made the mic lead system by
+    # ~1s, and _mix_buffers overlays by index — a constant skew that smeared
+    # overlapping speech). After MIC_GATE_GRACE we record anyway: mic-only
+    # fallback (sys permission denied) or an unusually slow warmup.
+    gate_open = _sys_ready.is_set() or time.monotonic() >= _mic_gate_deadline
+    if not _paused and gate_open:
         samples = indata[:, 0].copy()
         with _buf_lock:
             _mic_buf.append(samples)
@@ -1309,16 +1562,64 @@ def _mic_cb(indata, frames, time_info, status):
             _broadcast("level", {"mic": _mic_level, "sys": _sys_level})
 
 
-def _mix_buffers(sa: np.ndarray, ma: np.ndarray) -> np.ndarray:
-    """Mix sys + mic, falling back to whichever is non-empty."""
+def _mix_buffers(sa: np.ndarray, ma: np.ndarray, update_gain: bool = True) -> np.ndarray:
+    """Mix sys + mic, falling back to whichever is non-empty.
+
+    update_gain=False computes the loudness-match gains for THIS mix without
+    advancing the EMA state — used by the chunk worker's pause-boundary probe,
+    which runs every poll. Advancing the EMA there (10×/s) would defeat the
+    cross-chunk smoothing; the EMA is updated exactly once per emitted chunk."""
     if len(sa) == 0 and len(ma) == 0:
         return np.array([], np.float32)
     if len(sa) == 0:
         return ma
     if len(ma) == 0:
         return sa
-    n = min(len(sa), len(ma))
-    return np.clip(sa[:n] + ma[:n], -1.0, 1.0)
+    global _mix_gain_sys, _mix_gain_mic
+    # Per-stream, noise-gated loudness match so the quieter party (close-mic user
+    # vs post-gain remote, or vice-versa) isn't summed near the noise floor and
+    # gated out. Gain is EMA-smoothed across emitted chunks so levels don't pump.
+    gs = _stream_gain(sa, _mix_gain_sys)
+    gm = _stream_gain(ma, _mix_gain_mic)
+    if update_gain:
+        _mix_gain_sys, _mix_gain_mic = gs, gm
+    # Zero-pad to the LONGER stream (don't truncate to the shorter — that
+    # silently dropped the tail of whichever stream was ahead).
+    n = max(len(sa), len(ma))
+    out = np.zeros(n, np.float32)
+    if len(sa):
+        out[: len(sa)] += sa * gs
+    if len(ma):
+        out[: len(ma)] += ma * gm
+    # Peak-limit instead of hard clip — removes the dual-talk clipping distortion
+    # np.clip introduced exactly when both parties spoke at once.
+    peak = float(np.max(np.abs(out))) if n else 0.0
+    if peak > 1.0:
+        out /= peak
+    return out
+
+
+def _stream_gain(stream: np.ndarray, prev_gain: float) -> float:
+    """EMA-smoothed gain bringing *stream* toward MIX_TARGET_RMS, but only when
+    the stream actually contains SPEECH. An idle-but-noisy channel (typing/fan
+    above the RMS floor but no voice) is left at unity so its noise isn't boosted
+    up to target and smeared into the active speaker."""
+    if len(stream) == 0:
+        return prev_gain
+    rms = float(np.sqrt(np.mean(stream ** 2)))
+    # Voice-activity check: fraction of 100ms frames above the speech threshold.
+    frame = int(SAMPLE_RATE * 0.1)
+    active_ratio = 0.0
+    if len(stream) >= frame:
+        nf = len(stream) // frame
+        fr = np.sqrt(np.mean(stream[: nf * frame].reshape(nf, frame) ** 2, axis=1))
+        active_ratio = float(np.count_nonzero(fr > SILENCE_THRESHOLD)) / nf
+    if rms > TRANSCRIBE_MIN_RMS and active_ratio >= VOICE_ACTIVITY_RATIO:
+        target = min(MIX_TARGET_RMS / rms, MIX_GAIN_MAX)
+        target = max(target, 0.25)  # don't over-attenuate a loud stream
+    else:
+        target = 1.0
+    return prev_gain * (1 - MIX_GAIN_EMA) + target * MIX_GAIN_EMA
 
 
 def _should_trigger(buf_len: int) -> tuple[bool, str]:
@@ -1347,36 +1648,58 @@ def _is_pause_boundary(audio: np.ndarray) -> bool:
     body = audio[:-pause_samples]
     tail_rms = float(np.sqrt(np.mean(tail ** 2)))
     body_rms = float(np.sqrt(np.mean(body ** 2)))
-    return tail_rms < PAUSE_TAIL_THRESHOLD and body_rms >= PAUSE_BODY_THRESHOLD
+    if body_rms < PAUSE_BODY_THRESHOLD:
+        return False  # no real speech in the body — not a sentence boundary
+    # Boundary = the tail went quiet RELATIVE to the body. A purely absolute
+    # threshold fails under steady background noise (typing/fan) that keeps the
+    # floor elevated, so the speaker's pause never registers and the chunk runs
+    # to the 25s hard cap. The relative drop catches "the speaker stopped" even
+    # when the noise floor is high; the absolute threshold still short-circuits
+    # genuinely quiet tails.
+    return tail_rms < PAUSE_TAIL_THRESHOLD or tail_rms < body_rms * PAUSE_REL_DROP
 
 
 def _build_prompt(vocab: str) -> str:
-    """Compose the Whisper conditioning prompt: vocab + (zh-only) bilingual
-    style demo + last segment from the prompt chain.
+    """Compose the Whisper conditioning prompt from chain + vocab + (zh-only)
+    bilingual style demo.
 
-    The bilingual prime only goes in when language is forced zh — under auto
-    it would bias the decoder toward Chinese tokens and turn pure-English
-    chunks into garbled CJK. Under forced en it's irrelevant."""
+    Whisper keeps the LAST ~224 tokens of the prompt and truncates the front, so
+    parts are ordered lowest-value-first: chain (droppable continuity) → vocab →
+    style prime LAST, so the prime — the thing that makes code-switching work —
+    always survives. The whole prompt is then capped at PROMPT_MAX_CHARS.
+
+    The bilingual prime only goes in when language is forced zh — under auto it
+    would bias the decoder toward Chinese tokens and turn pure-English chunks
+    into garbled CJK. Under forced en it's irrelevant."""
     parts: list[str] = []
+    if _prompt_chain:
+        # Carry recent transcript for cross-chunk continuity (recurring proper
+        # nouns, ongoing topic). _is_repetition_loop / _has_runaway_repeat gate
+        # the chain, so a longer window doesn't reintroduce loops.
+        chain = " ".join(_prompt_chain)[-PROMPT_CHAIN_CHARS:]
+        parts.append(chain)
     if vocab:
         parts.append(vocab)
     if _language == "zh":
         parts.append(_BILINGUAL_PROMPT)
-    if _prompt_chain:
-        # Cap aggressively — long prompts make Whisper much more likely to
-        # enter a repetition loop on tokens that appear in the prompt.
-        parts.append(_prompt_chain[-1][-80:])
-    return " ".join(parts).strip()
+    prompt = " ".join(parts).strip()
+    if len(prompt) > PROMPT_MAX_CHARS:
+        # Keep the TAIL (prime + vocab survive; oldest chain drops first).
+        prompt = prompt[-PROMPT_MAX_CHARS:]
+    if os.environ.get("MT_DEBUG_PROMPT"):
+        print(f"DEBUG prompt len={len(prompt)} chars", file=sys.stderr)
+    return prompt
 
 
 def _update_prompt_chain(text: str):
-    """Append the latest transcript to the prompt chain. Keep just 1 entry —
-    feeding more risks Whisper entering a repetition loop (it treats the prompt
-    as a continuation context and can fixate on tokens it sees there)."""
+    """Append the latest transcript to the prompt chain, keeping the most recent
+    PROMPT_CHAIN_KEEP segments. _build_prompt char-caps the assembled chain, and
+    the repetition-loop guards suppress chaining of looped chunks, so a couple of
+    segments is safe and preserves more cross-chunk continuity than just one."""
     if not text:
         return
-    _prompt_chain.clear()
     _prompt_chain.append(text)
+    del _prompt_chain[:-PROMPT_CHAIN_KEEP]
 
 
 _SENT_SPLIT_RE = re.compile(r'(?<=[。\.!?！？])\s*')
@@ -1416,12 +1739,50 @@ _EN_HALLUCINATION = frozenset({
     "see you in the next video", "bye", "bye bye", "you", "the end",
     "im not sure", "i dont know", "okay", "ok", "mm", "mmm", "hmm", "yeah",
 })
+# Unambiguous YouTube/video boilerplate — never a real meeting utterance, so
+# safe to drop in ANY mode even as a lone chunk. The rest of _EN_HALLUCINATION
+# ("thank you", "ok", "i dont know", "yeah"…) are also REAL meeting utterances,
+# so they're only dropped under the zh lock (bare English is itself suspicious
+# there) or when the whole chunk is multiple filler sentences (a hallucinated
+# run). A deliberate standalone "OK." / "Yeah." in en/auto survives.
+_EN_FILLER_PHRASES = frozenset({
+    "thanks for watching", "thank you for watching", "thanks for watching everyone",
+    "please subscribe", "subscribe to my channel", "see you next time",
+    "see you in the next video", "the end",
+})
 
 
 def _normalize_en(text: str) -> str:
     """Lowercase, strip to letters + single spaces — for matching against the
     boilerplate set regardless of punctuation/casing."""
     return re.sub(r'\s+', ' ', re.sub(r'[^a-z\s]', ' ', text.lower())).strip()
+
+
+# Chinese / Japanese "silence filler" hallucinations Whisper emits on quiet or
+# off-script audio — the zh/jp analogue of _EN_HALLUCINATION. These are almost
+# always run-ons with NO sentence punctuation, so they're matched by normalized
+# substring (not per-sentence). Both Traditional and Simplified variants, since
+# Whisper may emit either. Seeded with near-zero-collision boilerplate.
+_ZH_HALLUCINATION = frozenset({
+    "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目", "请不吝点赞订阅转发打赏支持明镜与点点栏目",
+    "明鏡與點點欄目", "明镜与点点栏目", "明鏡新聞", "明镜新闻",
+    "請訂閱我的頻道", "请订阅我的频道", "記得訂閱", "记得订阅",
+    "請訂閱按贊", "请订阅按赞", "點贊訂閱", "点赞订阅",
+    "謝謝大家收看", "谢谢大家收看", "謝謝觀看", "谢谢观看", "謝謝你的觀看", "谢谢你的观看",
+    "字幕by", "字幕志願者", "字幕志愿者", "由社群提供的字幕", "由社区提供的字幕",
+    "ご視聴ありがとうございました", "本字幕由",
+})
+# Drop a chunk as a zh/jp hallucination only when the boilerplate DOMINATES the
+# normalized text by at least this fraction — a meeting that merely mentions
+# "字幕" or "訂閱" in a longer sentence is kept.
+_ZH_HALLUCINATION_COVERAGE = 0.6
+
+
+def _normalize_zh(text: str) -> str:
+    """Strip to CJK ideographs + kana + latin + digits (drop all whitespace and
+    punctuation) so the run-on boilerplate phrases match regardless of how
+    Whisper punctuated them."""
+    return re.sub(r'[^぀-ヿ一-鿿A-Za-z0-9]', '', text)
 
 
 def _strip_speaker_labels(text: str) -> str:
@@ -1433,6 +1794,34 @@ def _strip_speaker_labels(text: str) -> str:
     chain boundary breaks the propagation without altering what the user
     sees in the transcript."""
     return _SPEAKER_LABEL_RE.sub('', text).strip()
+
+
+# Display-safe speaker-label stripper. The chain stripper above is aggressive
+# (fine — the chain is never shown). For the VISIBLE transcript we must not eat
+# legitimate openers ("ETA:", "結論:", "11:30"), so this is tighter: only a
+# name-like token (single Capitalized Latin word, or 2-4 CJK chars) followed by a
+# colon and real text, and never an allowlisted meeting opener.
+_LABEL_ALLOWLIST = frozenset({
+    "eta", "etd", "ata", "atd", "hbl", "mbl", "ok", "note", "action", "actions",
+    "decision", "todo", "re", "ps", "fyi", "q", "a", "ref", "po", "so", "inv",
+    "結論", "重點", "行動", "決議", "決定", "摘要", "總結", "待辦", "問題",
+    "回覆", "補充", "提醒", "註", "例", "附註", "備註", "結語",
+})
+_DISPLAY_LABEL_RE = re.compile(
+    r'(?:^|(?<=[\s。\.\?\!,，、;；]))'
+    r'(?P<lbl>[A-Z][A-Za-z]{1,11}|[一-鿿]{2,4})[：:](?=\s*\S)'
+)
+
+
+def _strip_display_labels(text: str) -> str:
+    """Strip hallucinated speaker-name prefixes from the VISIBLE transcript,
+    while preserving real openers via _LABEL_ALLOWLIST."""
+    def _repl(m):
+        lbl = m.group("lbl")
+        if lbl.lower() in _LABEL_ALLOWLIST or lbl in _LABEL_ALLOWLIST:
+            return m.group(0)
+        return ""
+    return _DISPLAY_LABEL_RE.sub(_repl, text).strip()
 
 
 def _drop_hallucinations(text: str, language: str) -> str:
@@ -1448,10 +1837,27 @@ def _drop_hallucinations(text: str, language: str) -> str:
     text = _NONSPEECH_MARK_RE.sub('', text).strip()
     if not text:
         return ""
-    if language == "zh" and not _CJK_RE.search(text):
-        sents = [s for s in _SENT_SPLIT_RE.split(text) if s.strip()] or [text]
-        if all(_normalize_en(s) in _EN_HALLUCINATION for s in sents):
-            return ""
+
+    # (A) English stock-filler drop — runs in EVERY mode now (was zh-only, hence
+    # a no-op under the default). Under the zh lock, or when the whole chunk is a
+    # run of filler sentences, the full ambiguous set drops; in en/auto a single
+    # sentence only drops if it's unambiguous video boilerplate — so a real lone
+    # "OK." / "I don't know." survives.
+    sents = [s for s in _SENT_SPLIT_RE.split(text) if s.strip()] or [text]
+    drop_set = _EN_HALLUCINATION if (language == "zh" or len(sents) > 1) else _EN_FILLER_PHRASES
+    if all(_normalize_en(s) in drop_set for s in sents):
+        return ""
+
+    # (B) Chinese/Japanese boilerplate — match the normalized WHOLE text (these
+    # are punctuation-free run-ons). Drop only when the boilerplate dominates the
+    # chunk (>= coverage), so a passing mention of 字幕/訂閱 in a real sentence
+    # is kept. Runs in every mode for the same anti-snowball reason as (C).
+    norm = _normalize_zh(text)
+    if norm:
+        for h in _ZH_HALLUCINATION:
+            if h in norm and len(h) >= _ZH_HALLUCINATION_COVERAGE * len(norm):
+                return ""
+
     if language == "en" and _CJK_KANA_PUNCT_RE.search(text):
         # Forced-English but CJK/kana appeared → Whisper drift / hallucination.
         # Strip those runs; keep any real English, drop an all-CJK segment.
@@ -1506,16 +1912,49 @@ def _is_repetition_loop(text: str) -> bool:
     return False
 
 
-def _dedup_boundary(text: str) -> str:
+# A unit (≤12 chars) repeated 3+ times in a row, tolerating zh/en separators
+# between copies. Catches Whisper loops that _trim_repetition/_is_repetition_loop
+# MISS because they split on sentence punctuation — and zh loops ("好的好的好的…",
+# "對，對，對，對…") usually have none.
+_RUN_REPEAT_RE = re.compile(r'(.{1,12}?)(?:[，、,。.!?！？\s]*\1){2,}')
+
+
+def _collapse_runs(text: str) -> str:
+    """Collapse a consecutively-repeated unit down to 2 copies (matching the
+    sentence-level max_repeat=2 semantics). Latin units are rejoined with a
+    space (so "you know you know you know" → "you know you know", not glued);
+    CJK units join with no separator ("好的好的好的好的" → "好的好的"). A lone
+    repeated single digit/letter ("5 5 5") is left alone — too likely real."""
+    def _repl(m):
+        unit = m.group(1)
+        bare = unit.strip()
+        if len(bare) <= 1 and re.match(r'[A-Za-z0-9]$', bare):
+            return m.group(0)  # don't collapse "5 5 5" / "a a a"
+        sep = ' ' if (re.search(r'[A-Za-z]', unit) and not _CJK_RE.search(unit)) else ''
+        return unit + sep + unit
+    return _RUN_REPEAT_RE.sub(_repl, text)
+
+
+def _has_runaway_repeat(text: str) -> bool:
+    """True if *text* contains a unit repeated 3+ times in a row (the
+    punctuation-independent analogue of _is_repetition_loop). Used to suppress
+    prompt-chain propagation on a looped chunk."""
+    return bool(_RUN_REPEAT_RE.search(text))
+
+
+def _dedup_boundary(text: str, from_cap: bool = True) -> str:
     """Drop the leading slice of *text* that repeats the tail of the previous
     transcript line.
 
-    A hard-cap ('cap') cut keeps a 1s audio OVERLAP for context, so that
-    second of speech is transcribed twice and the seam echoes a phrase. We
-    find the longest suffix of the previous line that is a prefix of this one
-    (char-level, so it works for spaceless Chinese too) and strip it. Requires
-    a 5-char match so we don't clip incidental shared openers like "我覺得"."""
-    if not _lines or not text.strip():
+    Only meaningful after a hard-'cap' cut, which keeps a 1s audio OVERLAP that
+    gets transcribed twice and echoes a phrase at the seam. A silence ('pause')
+    cut keeps no overlap, so any boundary match there is a genuine restatement —
+    skip dedup entirely (from_cap=False) to avoid clipping legitimately repeated
+    phrasing ("好的好的", "對對對"). We find the longest suffix of the previous
+    line that is a prefix of this one (char-level, so it works for spaceless
+    Chinese too) and strip it. Requires a 5-char match (8 for all-CJK runs, which
+    collide more easily) so we don't clip incidental shared openers like "我覺得"."""
+    if not from_cap or not _lines or not text.strip():
         return text
     prev_body = (_lines[-1].get("text") or "").strip()
     if not prev_body:
@@ -1524,9 +1963,48 @@ def _dedup_boundary(text: str) -> str:
     tail = prev_body[-60:]                 # bounded search window
     maxk = min(len(tail), len(cur))
     for k in range(maxk, 4, -1):           # require >= 5 overlapping chars
-        if tail[-k:].lower() == cur[:k].lower():
+        match = tail[-k:]
+        if match.lower() == cur[:k].lower():
+            # A pure-CJK overlap collides more easily (no word boundaries); demand
+            # a longer match before trusting it's a real seam echo.
+            if k < 8 and _CJK_RE.search(match) and not re.search(r'[A-Za-z0-9]', match):
+                continue
             return cur[k:].lstrip()
     return text
+
+
+def _best_cut_index(audio: np.ndarray) -> Optional[int]:
+    """For a hard-cap cut, find a low-energy 100ms frame within the last ~2s to
+    cut at (an inter-word gap) rather than slicing mid-word at the raw 25s mark.
+    Returns a sample index, or None to fall back to the overlap-retain cut."""
+    frame = int(SAMPLE_RATE * 0.1)
+    window = int(SAMPLE_RATE * 2.0)
+    if len(audio) < window + frame:
+        return None
+    region = audio[-window:]
+    nf = len(region) // frame
+    if nf < 2:
+        return None
+    frames = region[: nf * frame].reshape(nf, frame)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    qi = int(np.argmin(rms))
+    cut = (len(audio) - window) + qi * frame
+    if cut <= 0 or cut >= len(audio) - frame:
+        return None
+    return cut
+
+
+def _queue_chunk(mixed: np.ndarray, reason: str, drop_label: str):
+    """Enqueue (audio, reason); on a full queue, drop but leave a PERSISTENT,
+    timestamped gap marker in the transcript (not just a 0.3s status flash) so
+    the lost span is locatable and survives into the saved file."""
+    try:
+        _transcribe_queue.put((mixed, reason), timeout=2)
+    except queue.Full:
+        secs = max(1, round(len(mixed) / SAMPLE_RATE))
+        print(f"WARN: transcribe queue full, dropping {drop_label} (~{secs}s)", file=sys.stderr)
+        _append_line(f"⚠ 略過約 {secs} 秒音訊 — 轉錄跟不上錄音速度", tag="dropped")
+        _set_status("⚠ Transcribe 跟不上速度,跳過一段")
 
 
 def _chunk_worker(api_key: str):
@@ -1542,7 +2020,7 @@ def _chunk_worker(api_key: str):
     last_pause_state = False
 
     while _recording:
-        time.sleep(0.3)
+        time.sleep(CHUNK_POLL)
         if _paused:
             # Edge: just entered pause → flush whatever's in the buffer so
             # audio below the trigger threshold isn't lost. Done by the
@@ -1565,27 +2043,40 @@ def _chunk_worker(api_key: str):
 
             sa = np.concatenate(_sys_buf) if _sys_buf else np.array([], np.float32)
             ma = np.concatenate(_mic_buf) if _mic_buf else np.array([], np.float32)
-            mixed = _mix_buffers(sa, ma)
 
-            if reason == "pause-check" and not _is_pause_boundary(mixed):
-                continue
+            if reason == "pause-check":
+                # Probe WITHOUT advancing the gain EMA (this runs every poll).
+                if not _is_pause_boundary(_mix_buffers(sa, ma, update_gain=False)):
+                    continue
 
-            # 'cap' keeps an overlap tail for context across the cut.
-            # 'pause-check' clears everything — the sentence already ended,
-            # and a stale-speech tail would prime a phantom silent chunk
-            # and Whisper would hallucinate.
-            if reason == "cap":
-                _sys_buf[:] = [sa[-overlap_samples:]] if len(sa) > overlap_samples else []
-                _mic_buf[:] = [ma[-overlap_samples:]] if len(ma) > overlap_samples else []
-            else:
+            # We're emitting a chunk — build the mix once, advancing the EMA gains
+            # exactly once per emitted chunk (not per poll).
+            mixed = _mix_buffers(sa, ma, update_gain=True)
+
+            if reason == "pause-check":
+                # Sentence ended — clear everything. A stale-speech tail would
+                # prime a phantom silent chunk and Whisper would hallucinate.
                 _sys_buf.clear()
                 _mic_buf.clear()
+                reason = "pause"
+            else:  # 'cap' — continuous speech hit the hard cap.
+                cut = _best_cut_index(mixed)
+                if cut is not None:
+                    # Cut at an inter-word gap and carry the remainder forward
+                    # (no overlap → no seam echo → no dedup needed downstream).
+                    mixed = mixed[:cut]
+                    _sys_buf[:] = [sa[cut:]] if len(sa) > cut else []
+                    _mic_buf[:] = [ma[cut:]] if len(ma) > cut else []
+                    reason = "cap-clean"
+                else:
+                    # No good gap — keep a 1s overlap tail for context; the seam
+                    # echo is stripped downstream by _dedup_boundary (from_cap).
+                    _sys_buf[:] = [sa[-overlap_samples:]] if len(sa) > overlap_samples else []
+                    _mic_buf[:] = [ma[-overlap_samples:]] if len(ma) > overlap_samples else []
+                    reason = "cap"
 
-        try:
-            _transcribe_queue.put(mixed, timeout=2)
-        except queue.Full:
-            print("WARN: transcribe queue full, dropping chunk", file=sys.stderr)
-            _set_status("⚠ Transcribe 跟不上速度,跳過一段")
+        _queue_chunk(mixed, reason, "chunk")
+        _broadcast("queue", _transcribe_queue.qsize())
 
     # Final flush after /stop sets _recording=False.
     _flush_pending_audio()
@@ -1602,13 +2093,15 @@ def _transcribe_consumer(api_key: str):
     we quit — the trailing segment of a meeting is never dropped."""
     while True:
         try:
-            audio = _transcribe_queue.get(timeout=0.5)
+            item = _transcribe_queue.get(timeout=0.5)
         except queue.Empty:
             if _consumer_should_exit.is_set():
                 break
             continue
         try:
-            _transcribe(audio, api_key)
+            audio, reason = item if isinstance(item, tuple) else (item, "flush")
+            _transcribe(audio, api_key, reason)
+            _broadcast("queue", _transcribe_queue.qsize())
         except Exception as e:
             print(f"transcribe failed: {e}", file=sys.stderr)
         finally:
@@ -1629,6 +2122,11 @@ def _translate_text(text: str, api_key: str) -> str:
     vocab = load_vocab()
     if vocab:
         sys_prompt += f" 參考{vocab}"
+    # Give the translator the previous 1-2 source lines as context (NOT to be
+    # translated) so pronouns / continuations resolve across chunk boundaries.
+    prev = [c for c in _translate_ctx if c.strip()]
+    if prev:
+        sys_prompt += " 前文(僅供理解上下文,不要翻譯這段):" + " ".join(prev)
     # with_raw_response so we can read the rate-limit headers (remaining quota)
     # alongside the parsed body.
     raw = Groq(api_key=api_key).chat.completions.with_raw_response.create(
@@ -1642,6 +2140,7 @@ def _translate_text(text: str, api_key: str) -> str:
     )
     _update_translate_usage(raw.headers)
     chat = raw.parse()
+    _translate_ctx.append(text)  # rolling source context for the next line
     return (chat.choices[0].message.content or "").strip()
 
 
@@ -1690,9 +2189,10 @@ def _maybe_translate(text: str, api_key: str) -> str:
         return "⚠ 翻譯失敗"
 
 
-def _transcribe(audio: np.ndarray, api_key: str):
+def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
     """Transcribe *audio*, dispatching to cloud (Groq) or local (whisper.cpp)
-    based on `_backend`."""
+    based on `_backend`. *reason* is the chunk cut type ('cap' keeps a seam
+    overlap → boundary dedup runs; everything else has no seam)."""
     global _transcribing
 
     # Two-layer silence gate against Whisper hallucination on near-silent input:
@@ -1701,9 +2201,18 @@ def _transcribe(audio: np.ndarray, api_key: str):
     #       speech threshold. Whisper hallucinates on brief-speech-then-silence.
     # Thresholds tuned permissive (catch soft speech) — repetition_trim +
     # loop detection still handle the false-positive case.
+    def _gated(weak: bool):
+        # When a chunk is gated out but had some audible (non-silence) energy,
+        # leave a faint hint so the user knows audio was skipped rather than
+        # assuming silence — instead of silently swallowing a quiet speaker.
+        if weak and _recording:
+            _set_status("· 偵測到微弱聲音,未轉錄")
+        else:
+            _restore_idle_status()
+
     rms = float(np.sqrt(np.mean(audio ** 2)))
     if rms < TRANSCRIBE_MIN_RMS:
-        _restore_idle_status()
+        _gated(weak=rms >= SILENCE_THRESHOLD)
         return
 
     frame = int(SAMPLE_RATE * 0.1)  # 100 ms frames
@@ -1718,7 +2227,7 @@ def _transcribe(audio: np.ndarray, api_key: str):
         # A short interjection in a long quiet cap chunk has a low ratio but
         # enough real speech (>= MIN_ACTIVE_SPEECH) to keep.
         if active_ratio < VOICE_ACTIVITY_RATIO and active_seconds < MIN_ACTIVE_SPEECH:
-            _restore_idle_status()
+            _gated(weak=active_seconds > 0)
             return
 
     ts = datetime.now().strftime("%H:%M:%S")
@@ -1731,21 +2240,25 @@ def _transcribe(audio: np.ndarray, api_key: str):
 
     try:
         if _backend == "local":
-            text = _transcribe_local(audio, prompt)
+            text, conf = _transcribe_local(audio, prompt)
         else:
-            text = _transcribe_cloud(audio, api_key, prompt)
+            text, conf = _transcribe_cloud(audio, api_key, prompt)
 
         text = _drop_hallucinations((text or "").strip(), _language)
         if text:
-            cleaned = _dedup_boundary(_trim_repetition(text))
+            # collapse punctuation-free repetition loops first, then sentence-
+            # level trim, then boundary dedup (only on a 'cap' seam).
+            collapsed = _collapse_runs(text)
+            cleaned = _dedup_boundary(_trim_repetition(collapsed), from_cap=(reason == "cap"))
+            cleaned = apply_vocab_corrections(_strip_display_labels(cleaned))
             if cleaned.strip():
                 tr = _maybe_translate(cleaned, api_key)
-                _append_line(cleaned, tr=tr, ts=ts)
-                # If the result still shows a repetition loop after trimming,
-                # the chunk was unreliable — don't poison the next chunk's
-                # prompt chain. Also strip speaker labels before chaining so a
-                # hallucinated "余婷:" prefix doesn't prime the next chunk.
-                if not _is_repetition_loop(text):
+                _append_line(cleaned, tr=tr, ts=ts, conf=conf)
+                # If the result still shows a repetition loop, the chunk was
+                # unreliable — don't poison the next chunk's prompt chain. Also
+                # strip speaker labels before chaining so a hallucinated "余婷:"
+                # prefix doesn't prime the next chunk.
+                if not (_is_repetition_loop(collapsed) or _has_runaway_repeat(text)):
                     _update_prompt_chain(_strip_speaker_labels(cleaned))
     except Exception as e:
         _append_line(f"Error: {e}", ts=ts)
@@ -1765,8 +2278,35 @@ def _restore_idle_status():
     _set_status("暫停中" if _paused else "錄音中…")
 
 
-def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
-    """Cloud backend — Groq Whisper API."""
+def _assemble_cloud(body: dict) -> tuple[str, str]:
+    """Build (text, conf) from a Groq verbose_json body. Drops segments on a
+    STRONG combined hallucination signal (no_speech_prob high AND avg_logprob
+    very low), and flags the line 'low' on a softer low-confidence signal — a
+    model-confidence layer the energy gate + text heuristics lack."""
+    segs = body.get("segments") or []
+    if not segs:
+        return (body.get("text", "") or "").strip(), ""
+    kept, nsps, lps = [], [], []
+    for s in segs:
+        t = (s.get("text") or "").strip()
+        if not t:
+            continue
+        nsp, lp = s.get("no_speech_prob"), s.get("avg_logprob")
+        if (isinstance(nsp, (int, float)) and isinstance(lp, (int, float))
+                and nsp > CLOUD_NSP_DROP and lp < CLOUD_LOGPROB_DROP):
+            continue  # confident-hallucination → drop the segment
+        kept.append(t)
+        if isinstance(nsp, (int, float)):
+            nsps.append(nsp)
+        if isinstance(lp, (int, float)):
+            lps.append(lp)
+    text = " ".join(kept).strip()
+    low = (nsps and max(nsps) > CLOUD_NSP_LOWCONF) or (lps and min(lps) < CLOUD_LOGPROB_LOWCONF)
+    return text, ("low" if low else "")
+
+
+def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> tuple[str, str]:
+    """Cloud backend — Groq Whisper API. Returns (text, conf)."""
     tmp = tempfile.NamedTemporaryFile(prefix="mt_", suffix=".wav", delete=False)
     tmp.close()
     try:
@@ -1776,7 +2316,9 @@ def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
-        kwargs: dict = dict(model="whisper-large-v3-turbo")
+        # verbose_json so we can read per-segment no_speech_prob / avg_logprob
+        # (the typed response only exposes .text → use with_raw_response.json()).
+        kwargs: dict = dict(model=load_cloud_model(), response_format="verbose_json")
         if _language != "auto":
             kwargs["language"] = _language
         if prompt:
@@ -1784,14 +2326,15 @@ def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
 
         with open(tmp.name, "rb") as f:
             kwargs["file"] = ("chunk.wav", f, "audio/wav")
-            result = Groq(api_key=api_key).audio.transcriptions.create(**kwargs)
-        return result.text
+            raw = Groq(api_key=api_key).audio.transcriptions.with_raw_response.create(**kwargs)
+        return _assemble_cloud(raw.json())
     finally:
         os.unlink(tmp.name)
 
 
-def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
+def _transcribe_local(audio: np.ndarray, prompt: str) -> tuple[str, str]:
     """Local backend — inference runs in the LocalWhisperWorker subprocess.
+    Returns (text, conf).
 
     See module-level comments on _local_worker for why this isn't in-process."""
     worker = _local_worker
@@ -1807,16 +2350,17 @@ def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
 def _transcribe_file_cloud(path: str, fname: str, api_key: str,
                            language: str, prompt: str) -> str:
     """Cloud upload — hand the original file straight to Groq, which accepts
-    common audio/video containers, so no local decode is needed."""
-    kw: dict = dict(model="whisper-large-v3-turbo")
+    common audio/video containers, so no local decode is needed. Uses the
+    higher-accuracy non-turbo large-v3 (batch/offline → no latency cost)."""
+    kw: dict = dict(model=CLOUD_MODEL_BATCH, response_format="verbose_json")
     if language != "auto":
         kw["language"] = language
     if prompt:
         kw["prompt"] = prompt
     with open(path, "rb") as af:
         kw["file"] = (fname, af)
-        result = Groq(api_key=api_key).audio.transcriptions.create(**kw)
-    return result.text
+        raw = Groq(api_key=api_key).audio.transcriptions.with_raw_response.create(**kw)
+    return _assemble_cloud(raw.json())[0]
 
 
 def _transcribe_file_local(path: str, language: str, prompt: str) -> str:
@@ -1830,7 +2374,7 @@ def _transcribe_file_local(path: str, language: str, prompt: str) -> str:
     from pywhispercpp.model import Model
     audio = Model._load_audio(path)
     worker = _ensure_local_worker(model_path)
-    return worker.transcribe(audio, language, prompt)
+    return worker.transcribe(audio, language, prompt)[0]
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

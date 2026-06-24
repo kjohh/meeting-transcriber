@@ -12,3 +12,13 @@ Notion
 TestFlight
 OKR
 PRD
+
+# ── 精準取代（wrong=>right）──
+# 某個詞老是被聽錯時，用 => 做輸出端的直接取代。
+# 這類行「不會」進 prompt，而是在轉錄完成後對文字做 find/replace，
+# 兩個 backend 都適用，也不會誘發 Whisper 重複迴圈。
+# 左邊英文不分大小寫；中文需完全相符。
+# 例：
+# 飛馬=>Figma
+# 闕本=>Chopin
+# greenfreight=>GoFreight

@@ -211,6 +211,16 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 }
 #transcript .ts { color: var(--text2); font-size: 11px; opacity: 0.7; user-select: none; margin-right: 2px; }
 #transcript .line { margin-bottom: 6px; }
+/* Low-confidence line: dimmed body + an amber dot after the timestamp. */
+.line.low-conf .body { opacity: 0.55; }
+.line.low-conf .ts::after { content: ' ·'; color: #d08700; font-weight: 700; }
+/* Persistent "dropped a span" marker — survives into save/copy. */
+.line.dropped { color: #c77800; font-style: italic; opacity: 0.9; }
+/* Inline-editable transcript body. */
+.body[contenteditable] { cursor: text; }
+.body[contenteditable]:focus { outline: 1px solid var(--accent); border-radius: 3px; padding: 0 2px; }
+#queue-badge { display: none; font-size: 11px; color: var(--text2); margin-left: 8px; }
+#queue-badge.show { display: inline; }
 
 /* Translation mode: split each line into original (left) + 中文 (right). */
 #cols-head { display: none; }
@@ -471,9 +481,9 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
   <!-- Tier 2 — session settings + tools, lighter weight (labelled, no bare icons) -->
   <div class="controls-sub">
     <select id="lang-select" onchange="onLangChange()" style="padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);cursor:pointer">
-      <option value="auto">自動</option>
-      <option value="zh">強制中文</option>
-      <option value="en">強制英文</option>
+      <option value="zh" selected>中文(建議,含英文夾雜)</option>
+      <option value="en">英文</option>
+      <option value="auto">自動偵測</option>
     </select>
     <select id="backend-select" onchange="onBackendChange()" style="padding:0 8px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text);cursor:pointer">
       <option value="local">🔒 本機轉錄</option>
@@ -658,6 +668,16 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
         </div>
       </div>
 
+      <!-- Cloud transcription quality -->
+      <div class="settings-section">
+        <div class="settings-section-title">雲端轉錄品質</div>
+        <div class="hint">只影響「🌐 雲端轉錄」的<strong>即時</strong>模式。large-v3 較準但較慢;turbo 較快。上傳檔案一律用 large-v3(離線無延遲考量)。</div>
+        <select id="cloud-model-select" onchange="onCloudModelChange()" style="margin-top:8px;height:32px;padding:0 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text)">
+          <option value="whisper-large-v3-turbo">turbo(較快,預設)</option>
+          <option value="whisper-large-v3">large-v3(較準,較慢)</option>
+        </select>
+      </div>
+
     </div>
     <div class="modal-footer">
       <button class="btn-secondary" onclick="closeSettings()">關閉</button>
@@ -719,7 +739,8 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
       <div class="hint">
         會議常出現的<strong>專有名詞、品牌、縮寫、人名</strong>放這裡,
         Whisper 模型會優先辨識成這些詞,避免被聽成相似發音的字。<br>
-        每行一個,以 <code>#</code> 開頭的行是註解。儲存後下一段轉錄就會生效。
+        每行一個,以 <code>#</code> 開頭的行是註解。<strong>錄音中也能改</strong>,儲存後下一段轉錄就生效。<br>
+        若某個詞老是被聽錯,用 <code>聽錯的字=&gt;正確的字</code> 做精準取代(直接改輸出,不佔 prompt 額度)。
       </div>
       <textarea id="vocab-textarea" placeholder="Figma&#10;ChatGPT&#10;Anthropic&#10;OKR&#10;PRD&#10;Notion&#10;TestFlight"></textarea>
     </div>
@@ -744,6 +765,7 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 </div>
 
 <div class="loading-bar" id="loading-bar"></div>
+<span id="queue-badge"></span>
 
 <div class="busy-overlay" id="busy-overlay">
   <div class="busy-card">
@@ -837,6 +859,7 @@ es.onmessage = ({data}) => {
       document.getElementById('lang-select').value = lang;
     }
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
+    if (msg.cloud_model) { const s = document.getElementById('cloud-model-select'); if (s) s.value = msg.cloud_model; }
     if (msg.translate_usage) _lastUsage = msg.translate_usage;
     if (typeof msg.translate === 'boolean') setTranslateUI(msg.translate);
     if (msg.models) modelStatus = msg.models;
@@ -873,28 +896,66 @@ es.onmessage = ({data}) => {
     renderTranslateUsage(_lastUsage);
   } else if (msg.type === 'mic_test_level') {
     _micTestLatest = msg.data;
+  } else if (msg.type === 'queue') {
+    // Live transcribe backlog — early warning before chunks start getting
+    // dropped (queue maxsize). Only surfaced once it's actually building up.
+    const b = document.getElementById('queue-badge');
+    if (msg.data > 2) { b.textContent = `佇列 ${msg.data}`; b.classList.add('show'); }
+    else { b.classList.remove('show'); }
+  } else if (msg.type === 'upload_done') {
+    hideBusy();
   }
 };
 
 // Build one transcript row. Via DOM nodes, never innerHTML — transcript text is
 // raw model output and may contain "<", ">" etc.; only the timestamp is styled.
-function _buildRow(ts, tag, body) {
+function _buildRow(ts, tag, body, opts) {
+  opts = opts || {};
   const row = document.createElement('div');
-  row.className = 'line';
+  row.className = 'line'
+    + (opts.conf === 'low' ? ' low-conf' : '')
+    + (opts.dropped ? ' dropped' : '');
   if (ts) {
     const tsSpan = document.createElement('span');
     tsSpan.className = 'ts';
     tsSpan.textContent = `[${ts}]` + (tag ? ` [${tag}]` : '');
     row.appendChild(tsSpan);
-    row.appendChild(document.createTextNode(' ' + (body || '')));
-  } else {
-    row.textContent = body || '';
+    row.appendChild(document.createTextNode(' '));
   }
+  // Body in its own span so only the text is editable (not the timestamp).
+  const bodySpan = document.createElement('span');
+  bodySpan.className = 'body';
+  bodySpan.textContent = body || '';
+  if (opts.editable) {
+    bodySpan.contentEditable = 'true';
+    bodySpan.spellcheck = false;
+    bodySpan.title = '雙擊可編輯,離開時自動儲存';
+    bodySpan.addEventListener('blur', () => commitLineEdit(bodySpan, opts.kind));
+    bodySpan.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); bodySpan.blur(); }
+    });
+  }
+  row.appendChild(bodySpan);
   return row;
 }
 
+// Persist an inline transcript edit back into the server's _lines (a DOM-only
+// edit wouldn't survive into the saved file). Row index in its board == server
+// line index, because every line is appended to #transcript in order.
+function commitLineEdit(span, kind) {
+  const boardId = kind === 'tr' ? 'transcript-zh' : 'transcript';
+  const rows = [...document.querySelectorAll('#' + boardId + ' .line')];
+  const index = rows.indexOf(span.closest('.line'));
+  if (index < 0) return;
+  const field = kind === 'tr' ? 'tr' : 'text';
+  fetch('/line', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({index, [field]: span.innerText.trim()})
+  });
+}
+
 function appendLine(line) {
-  // line: {ts, text, tr, tag}. (Defensive: wrap a bare string.)
+  // line: {ts, text, tr, tag, conf}. (Defensive: wrap a bare string.)
   if (typeof line === 'string') line = {ts: '', text: line, tr: '', tag: ''};
 
   // Reveal the boards on first line
@@ -904,16 +965,20 @@ function appendLine(line) {
     document.getElementById('transcript-empty').style.display = 'none';
   }
 
-  // Original → 逐字稿 board
+  const dropped = line.tag === 'dropped';
+
+  // Original → 逐字稿 board (editable unless it's an auto-generated gap marker)
   const orig = document.getElementById('transcript');
-  orig.appendChild(_buildRow(line.ts, line.tag, line.text));
+  orig.appendChild(_buildRow(line.ts, line.tag, line.text,
+    {conf: line.conf, dropped, editable: !dropped, kind: 'orig'}));
   orig.scrollTop = orig.scrollHeight;
 
   // Translation → its own board (only while translation is on). Always append a
   // row — even the failure marker — so the two boards stay row-aligned.
   if (translateOn) {
     const zh = document.getElementById('transcript-zh');
-    zh.appendChild(_buildRow(line.ts, line.tag, line.tr || ''));
+    zh.appendChild(_buildRow(line.ts, line.tag, line.tr || '',
+      {dropped, editable: !dropped, kind: 'tr'}));
     zh.scrollTop = zh.scrollHeight;
   }
 
@@ -971,12 +1036,19 @@ function sync() {
   const sessionInProgress = recording;
   const activeRecording   = recording && !paused;
   const transcriptEmpty   = document.querySelectorAll('#transcript .line').length === 0;
+  const backend           = document.getElementById('backend-select').value;
 
-  document.getElementById('lang-select').disabled    = sessionInProgress;
+  // Cloud reads _language per chunk, so it can switch mid-session (takes effect
+  // next chunk). Local can't without respawning the model on a zh↔en boundary,
+  // so it stays locked while recording.
+  document.getElementById('lang-select').disabled    = sessionInProgress && backend === 'local';
   document.getElementById('backend-select').disabled = sessionInProgress;
   document.getElementById('translate-toggle').disabled = sessionInProgress;  // set before recording, locked mid-session
   document.getElementById('btn-upload').disabled = sessionInProgress;
-  document.getElementById('btn-vocab').disabled  = sessionInProgress;
+  // Vocab stays editable mid-session: /vocab rewrites the file with no restart
+  // and load_vocab() runs per-chunk, so an added term self-applies next chunk
+  // (corrections too). This is the recognition learning loop.
+  document.getElementById('btn-vocab').disabled  = false;
   document.getElementById('btn-save').disabled = activeRecording || transcriptEmpty;
   document.getElementById('btn-new').disabled  = activeRecording || (!sessionInProgress && transcriptEmpty);
 
@@ -1126,6 +1198,12 @@ function onBackendChange() {
 }
 
 function onLangChange() {
+  const language = document.getElementById('lang-select').value;
+  // Apply live (cloud can switch mid-session; server rejects a local mid-session
+  // switch, but the selector is disabled in that case so this won't fire then).
+  fetch('/language', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({language})})
+    .then(r => r.json())
+    .then(d => { if (d && d.ok === false && d.error) setStatus(d.error); });
   maybeWarnCloudZh();
 }
 
@@ -1140,6 +1218,13 @@ function maybeWarnCloudZh() {
     return true;
   }
   return false;
+}
+
+function onCloudModelChange() {
+  const model = document.getElementById('cloud-model-select').value;
+  fetch('/cloud_model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model})})
+    .then(r => r.json())
+    .then(() => setStatus('雲端即時模型已更新' + (model.endsWith('turbo') ? '(turbo)。' : '(large-v3,較準較慢)。')));
 }
 
 /* ── Live EN→ZH translation toggle ── */
@@ -1189,6 +1274,13 @@ function onTranslateToggle() {
     setStatus('翻譯需要 Groq 金鑰(走雲端)— 點右上角「⚙ 設定」填寫。');
     tg.checked = false;
     return;
+  }
+  // Consent at the point of action: translation always uploads text to Groq,
+  // even when ASR runs locally. Surface that before enabling on local backend.
+  const backend = document.getElementById('backend-select').value;
+  if (on && backend === 'local') {
+    const ok = window.confirm('翻譯會把逐字稿「文字」傳到 Groq 雲端 — 即使你選了本機轉錄(語音本身仍只在本機處理)。確定開啟翻譯?');
+    if (!ok) { tg.checked = false; return; }
   }
   setTranslateUI(on);
   fetch('/translate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: on})});
@@ -1662,10 +1754,13 @@ function uploadFile(input) {
   fd.append('file', file);
   fd.append('key', key || '');
   fd.append('language', language);
-  setStatus(`正在上傳 ${file.name}…`);
+  // Long files take minutes — show the busy overlay (cleared by the server's
+  // 'upload_done' SSE event) instead of a one-line status that reads as idle.
+  showBusy('轉錄上傳檔案', '長檔可能需要幾分鐘,完成後會自動顯示');
+  setStatus(`正在轉錄 ${file.name}…`);
   fetch('/upload', {method:'POST', body: fd})
     .then(r => r.json())
-    .then(d => { if (!d.ok) setStatus('錯誤:' + d.error); });
+    .then(d => { if (!d.ok) { hideBusy(); setStatus('錯誤:' + d.error); } });
   input.value = '';
 }
 
