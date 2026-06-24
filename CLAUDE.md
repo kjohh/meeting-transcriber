@@ -2,6 +2,16 @@
 
 個人用會議逐字稿工具。使用者介紹 / 安裝在 `README.md`。本檔聚焦 AI 進入此 repo 該知道的架構決策、設計理由、踩過的坑。
 
+## ⚠️ 發佈規則（Kyle 2026-06-23 lock，絕不違反）
+
+**沒有 Kyle 當下明確說「發佈 / 發版 / release / 發 vX.Y.Z」,絕對不要跑 `scripts/release.sh` 或 `gh release create`。** 發到 GitHub Releases = 使用者會下載的對外動作,一律等他明說。
+
+- 修 bug / 做功能 / `build-app.sh` build 進 `dist/` 給他本機測 → 可以做。
+- commit / push 到 branch → 修正流程的一部分可做,但別過度。
+- **release(發新版本)→ 一定等 Kyle 當下明確指令,不要「修好順手發版」。**
+
+（2026-06-23 因連續自作主張發 v0.1.9 / v0.1.10 被糾正。Kyle 只在 v0.1.8 說過「推上去發布」,後面兩版我擅自發了。）
+
 ## 檔案佈局
 
 ```
