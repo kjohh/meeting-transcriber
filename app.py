@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import wave
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime
 from multiprocessing.connection import Connection
 from typing import Any, Optional
@@ -379,6 +379,24 @@ def save_cloud_model(model: str):
     _write_config(cfg)
 
 
+# Local model used when language is forced "zh". Breeze is Traditional-Chinese
+# fine-tuned (best for pure Chinese); large-v3-turbo is general multilingual and
+# tends to handle dense zh/en code-switching + English proper nouns better.
+# Default Breeze (unchanged); exposed so the user can A/B for their meetings.
+_ZH_MODELS = ("breeze-q8", "large-v3-turbo-q8_0")
+
+
+def load_zh_model() -> str:
+    m = _read_config().get("zh_model", "breeze-q8")
+    return m if m in _ZH_MODELS else "breeze-q8"
+
+
+def save_zh_model(model: str):
+    cfg = _read_config()
+    cfg["zh_model"] = model if model in _ZH_MODELS else "breeze-q8"
+    _write_config(cfg)
+
+
 def load_onboarding_completed() -> bool:
     return bool(_read_config().get("onboarding_completed", False))
 
@@ -401,7 +419,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.11"  # Bumped on each release. Used to gate one-time
+APP_VERSION = "0.1.12"  # Bumped on each release. Used to gate one-time
                        # `tccutil reset` of stale entries across upgrades.
 
 
@@ -439,12 +457,13 @@ def save_onboarding_completed(value: bool):
 def pick_local_model(language: str) -> str:
     """Choose best local model for a given language.
 
-    - Force-Chinese → Breeze ASR 25 (繁中 fine-tuned)
+    - Force-Chinese → user-selectable (default Breeze ASR 25, 繁中 fine-tuned;
+      can switch to large-v3-turbo for heavy zh/en code-switching)
     - Auto / English → large-v3-turbo-q8_0 (general, handles every language
       via Whisper's auto-detect)
     """
     if language == "zh":
-        return "breeze-q8"
+        return load_zh_model()
     return "large-v3-turbo-q8_0"
 
 
@@ -896,7 +915,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'cloud_model':load_cloud_model(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'cloud_model':load_cloud_model(),'zh_model':load_zh_model(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -1243,6 +1262,17 @@ def route_cloud_model():
         save_cloud_model(model)
         return jsonify({"ok": True, "cloud_model": load_cloud_model()})
     return jsonify({"ok": True, "cloud_model": load_cloud_model()})
+
+
+@app.route("/zh_model", methods=["GET", "POST"])
+def route_zh_model():
+    """Get/set the local model used when language is forced 'zh' (Breeze vs
+    large-v3-turbo). Takes effect on the next /start (the worker respawns for
+    the new model path)."""
+    if request.method == "POST":
+        save_zh_model((request.json or {}).get("model", "breeze-q8"))
+    return jsonify({"ok": True, "zh_model": load_zh_model(),
+                    "models": _model_status_payload()})
 
 
 @app.route("/language", methods=["POST"])
@@ -1703,6 +1733,19 @@ def _update_prompt_chain(text: str):
 
 
 _SENT_SPLIT_RE = re.compile(r'(?<=[。\.!?！？])\s*')
+# Clause-level split — ALSO breaks on commas. Whisper's zh repetition loops are
+# usually comma-separated run-ons with no sentence-ending punctuation
+# ("…用途,…用途,…用途,"), so the sentence splitter saw them as ONE sentence and
+# the repetition guards missed them entirely. Used by the repetition detectors.
+_CLAUSE_SPLIT_RE = re.compile(r'(?<=[。\.!?！？,，、;；])\s*')
+_CLAUSE_PUNCT = "。.!?！？,，、;；:：…「」\"' \t"
+
+
+def _norm_clause(c: str) -> str:
+    """Normalize a clause for repetition comparison: lowercase + strip
+    surrounding punctuation/space, so "…用途," and "…用途" (Whisper punctuates
+    inconsistently) compare equal."""
+    return c.strip().strip(_CLAUSE_PUNCT).lower()
 
 # Hallucinated dialogue labels Whisper emits during fast turn-taking
 # ("余婷:", "Brad:", "OK，余婷：先講…"). Matches 1-4 CJK chars OR
@@ -1873,32 +1916,37 @@ def _trim_repetition(text: str, max_repeat: int = 2) -> str:
 
     Whisper's repetition-loop failure mode emits the same phrase N times in a
     row when it loses confidence (often primed by a prompt token). This keeps
-    at most ``max_repeat`` consecutive copies of each sentence.
+    at most ``max_repeat`` consecutive copies of each clause. Splits on clauses
+    (commas too), since zh loops are comma-separated with no sentence enders.
     """
-    parts = [p for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+    parts = [p for p in _CLAUSE_SPLIT_RE.split(text) if p.strip()]
     if len(parts) < 2:
         return text
     out: list[str] = []
     prev = None
     count = 0
+    trimmed = False
     for p in parts:
-        norm = p.strip().lower()
+        norm = _norm_clause(p)
         if norm == prev:
             count += 1
             if count > max_repeat:
+                trimmed = True
                 continue
         else:
             prev = norm
             count = 1
         out.append(p)
+    if not trimmed:
+        return text  # nothing repeated → leave original formatting untouched
     return ' '.join(out)
 
 
 def _is_repetition_loop(text: str) -> bool:
-    """True if *text* contains 3+ consecutive identical sentences (the
-    signature of a Whisper repetition loop). Used to suppress prompt-chain
-    propagation so the next chunk isn't primed with poisonous context."""
-    parts = [p.strip().lower() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+    """True if *text* contains 3+ consecutive identical clauses (the signature
+    of a Whisper repetition loop). Used to suppress prompt-chain propagation so
+    the next chunk isn't primed with poisonous context."""
+    parts = [_norm_clause(p) for p in _CLAUSE_SPLIT_RE.split(text) if p.strip()]
     if len(parts) < 3:
         return False
     prev, count = None, 0
@@ -1912,11 +1960,23 @@ def _is_repetition_loop(text: str) -> bool:
     return False
 
 
-# A unit (≤12 chars) repeated 3+ times in a row, tolerating zh/en separators
-# between copies. Catches Whisper loops that _trim_repetition/_is_repetition_loop
-# MISS because they split on sentence punctuation — and zh loops ("好的好的好的…",
-# "對，對，對，對…") usually have none.
-_RUN_REPEAT_RE = re.compile(r'(.{1,12}?)(?:[，、,。.!?！？\s]*\1){2,}')
+def _is_loop_hallucination(text: str) -> bool:
+    """True when ONE substantial clause dominates the chunk and repeats 3+ times
+    — the signature of a pure repetition-loop hallucination (e.g. the classic
+    "…用途,…用途,…用途,…用途,…用途" on near-silent audio). Such a chunk is dropped
+    wholesale, unlike an emphatic real repeat ("對對對"), which is short and is
+    handled by _collapse_runs instead."""
+    clauses = [_norm_clause(c) for c in _CLAUSE_SPLIT_RE.split(text) if _norm_clause(c)]
+    if len(clauses) < 3:
+        return False
+    top, n = Counter(clauses).most_common(1)[0]
+    return len(top) >= 6 and n >= 3 and n / len(clauses) >= 0.5
+
+
+# A unit (≤30 chars) repeated 3+ times in a row, tolerating zh/en separators
+# between copies. Catches no-separator loops and longer Chinese phrase loops
+# (the 12-char cap missed "我們可以更快地了解它們的用途"-length units).
+_RUN_REPEAT_RE = re.compile(r'(.{1,30}?)(?:[，、,。.!?！？\s]*\1){2,}')
 
 
 def _collapse_runs(text: str) -> str:
@@ -2245,6 +2305,12 @@ def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
             text, conf = _transcribe_cloud(audio, api_key, prompt)
 
         text = _drop_hallucinations((text or "").strip(), _language)
+        if text and _is_loop_hallucination(text):
+            # The whole chunk is a repetition-loop hallucination (e.g. the
+            # classic "…用途,…用途,…用途" on near-silent audio). Drop it entirely
+            # and do NOT chain it — showing even a trimmed version is noise, and
+            # chaining it snowballs the rest of the session.
+            text = ""
         if text:
             # collapse punctuation-free repetition loops first, then sentence-
             # level trim, then boundary dedup (only on a 'cap' seam).

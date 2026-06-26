@@ -211,9 +211,10 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 }
 #transcript .ts { color: var(--text2); font-size: 11px; opacity: 0.7; user-select: none; margin-right: 2px; }
 #transcript .line { margin-bottom: 6px; }
-/* Low-confidence line: dimmed body + an amber dot after the timestamp. */
-.line.low-conf .body { opacity: 0.55; }
-.line.low-conf .ts::after { content: ' ·'; color: #d08700; font-weight: 700; }
+/* Low-confidence line: a small amber dot after the timestamp. The body text is
+   kept at full opacity — dimming it read as "this content matters less", which
+   was misleading because low-confidence lines are often still correct. */
+.line.low-conf .ts::after { content: ' ●'; color: #d08700; font-size: 9px; vertical-align: middle; }
 /* Persistent "dropped a span" marker — survives into save/copy. */
 .line.dropped { color: #c77800; font-style: italic; opacity: 0.9; }
 /* Inline-editable transcript body. */
@@ -678,6 +679,16 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
         </select>
       </div>
 
+      <!-- Local Chinese model -->
+      <div class="settings-section">
+        <div class="settings-section-title">本機中文模型</div>
+        <div class="hint">語言選「中文」時的本機模型。<strong>Breeze</strong> 是繁中特化(純中文最準);<strong>large-v3</strong> 是通用多語,中英夾雜 + 英文專名通常較好。會議很多英文夾雜可試 large-v3,下次開始錄音生效。</div>
+        <select id="zh-model-select" onchange="onZhModelChange()" style="margin-top:8px;height:32px;padding:0 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface2);color:var(--text)">
+          <option value="breeze-q8">Breeze(繁中特化,預設)</option>
+          <option value="large-v3-turbo-q8_0">large-v3(中英夾雜較佳)</option>
+        </select>
+      </div>
+
     </div>
     <div class="modal-footer">
       <button class="btn-secondary" onclick="closeSettings()">關閉</button>
@@ -860,6 +871,7 @@ es.onmessage = ({data}) => {
     }
     if (msg.backend) document.getElementById('backend-select').value = msg.backend;
     if (msg.cloud_model) { const s = document.getElementById('cloud-model-select'); if (s) s.value = msg.cloud_model; }
+    if (msg.zh_model) { const s = document.getElementById('zh-model-select'); if (s) s.value = msg.zh_model; }
     if (msg.translate_usage) _lastUsage = msg.translate_usage;
     if (typeof msg.translate === 'boolean') setTranslateUI(msg.translate);
     if (msg.models) modelStatus = msg.models;
@@ -915,6 +927,7 @@ function _buildRow(ts, tag, body, opts) {
   row.className = 'line'
     + (opts.conf === 'low' ? ' low-conf' : '')
     + (opts.dropped ? ' dropped' : '');
+  if (opts.conf === 'low') row.title = 'Whisper 對這行信心較低,建議核對';
   if (ts) {
     const tsSpan = document.createElement('span');
     tsSpan.className = 'ts';
@@ -1225,6 +1238,18 @@ function onCloudModelChange() {
   fetch('/cloud_model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model})})
     .then(r => r.json())
     .then(() => setStatus('雲端即時模型已更新' + (model.endsWith('turbo') ? '(turbo)。' : '(large-v3,較準較慢)。')));
+}
+
+function onZhModelChange() {
+  const model = document.getElementById('zh-model-select').value;
+  fetch('/zh_model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model})})
+    .then(r => r.json())
+    .then(d => {
+      if (d.models) modelStatus = d.models;
+      const need = d.models && (!d.models[model] || !d.models[model].downloaded);
+      if (need) { setStatus('該模型尚未下載 — 開啟下載視窗。'); openSettings('models', model); }
+      else setStatus('本機中文模型已設為 ' + (model.startsWith('breeze') ? 'Breeze。' : 'large-v3(下次錄音生效)。'));
+    });
 }
 
 /* ── Live EN→ZH translation toggle ── */
