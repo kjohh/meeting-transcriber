@@ -211,10 +211,6 @@ select:disabled { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 }
 #transcript .ts { color: var(--text2); font-size: 11px; opacity: 0.7; user-select: none; margin-right: 2px; }
 #transcript .line { margin-bottom: 6px; }
-/* Low-confidence line: a small amber dot after the timestamp. The body text is
-   kept at full opacity — dimming it read as "this content matters less", which
-   was misleading because low-confidence lines are often still correct. */
-.line.low-conf .ts::after { content: ' ●'; color: #d08700; font-size: 9px; vertical-align: middle; }
 /* Persistent "dropped a span" marker — survives into save/copy. */
 .line.dropped { color: #c77800; font-style: italic; opacity: 0.9; }
 /* Inline-editable transcript body. */
@@ -924,10 +920,7 @@ es.onmessage = ({data}) => {
 function _buildRow(ts, tag, body, opts) {
   opts = opts || {};
   const row = document.createElement('div');
-  row.className = 'line'
-    + (opts.conf === 'low' ? ' low-conf' : '')
-    + (opts.dropped ? ' dropped' : '');
-  if (opts.conf === 'low') row.title = 'Whisper 對這行信心較低,建議核對';
+  row.className = 'line' + (opts.dropped ? ' dropped' : '');
   if (ts) {
     const tsSpan = document.createElement('span');
     tsSpan.className = 'ts';
@@ -968,7 +961,7 @@ function commitLineEdit(span, kind) {
 }
 
 function appendLine(line) {
-  // line: {ts, text, tr, tag, conf}. (Defensive: wrap a bare string.)
+  // line: {ts, text, tr, tag}. (Defensive: wrap a bare string.)
   if (typeof line === 'string') line = {ts: '', text: line, tr: '', tag: ''};
 
   // Reveal the boards on first line
@@ -983,7 +976,7 @@ function appendLine(line) {
   // Original → 逐字稿 board (editable unless it's an auto-generated gap marker)
   const orig = document.getElementById('transcript');
   orig.appendChild(_buildRow(line.ts, line.tag, line.text,
-    {conf: line.conf, dropped, editable: !dropped, kind: 'orig'}));
+    {dropped, editable: !dropped, kind: 'orig'}));
   orig.scrollTop = orig.scrollHeight;
 
   // Translation → its own board (only while translation is on). Always append a

@@ -96,17 +96,6 @@ PROMPT_MAX_CHARS = 330    # hard cap on the assembled prompt (~224 Whisper token
 LOCAL_BEAM_SIZE = 5       # beam search (default greedy beam=-1 is lower accuracy);
                           # needs params_sampling_strategy=1 on the Model to engage
 
-# ── Model-confidence post-filter (layered AFTER the energy gate) ──
-# Conservative: drop a segment only on a STRONG combined low-confidence signal;
-# flag (amber, non-destructive) on a softer signal. No eval harness yet, so these
-# err toward keeping real speech — tune against real meeting clips before raising.
-LOCAL_PROB_DROP = 0.25       # local: drop a segment whose geo-mean prob is below this
-LOCAL_PROB_LOWCONF = 0.55    # local: flag the line when min kept prob is below this
-CLOUD_NSP_DROP = 0.85        # cloud: drop a segment when no_speech_prob > this AND…
-CLOUD_LOGPROB_DROP = -1.0    # …avg_logprob < this (both must hold)
-CLOUD_NSP_LOWCONF = 0.6      # cloud: flag the line when max kept no_speech_prob > this…
-CLOUD_LOGPROB_LOWCONF = -0.9 # …or min kept avg_logprob < this
-
 # ── Cloud (Groq) model selection ──
 CLOUD_MODEL_LIVE = "whisper-large-v3-turbo"  # live default: speed helps serial display
 CLOUD_MODEL_BATCH = "whisper-large-v3"       # upload/batch: no latency cost → use accuracy
@@ -286,14 +275,12 @@ def _set_status(msg: str):
     _broadcast("status", msg)
 
 
-def _append_line(text: str, tr: str = "", tag: str = "", ts: Optional[str] = None,
-                 conf: str = ""):
+def _append_line(text: str, tr: str = "", tag: str = "", ts: Optional[str] = None):
     line = {
         "ts": ts or datetime.now().strftime("%H:%M:%S"),
         "text": text,
         "tr": tr,
         "tag": tag,
-        "conf": conf,  # "" normal, "low" = model was unsure (rendered de-emphasized)
     }
     _lines.append(line)
     _broadcast("transcript", line)
@@ -574,10 +561,9 @@ def _whisper_subprocess_main(model_path: str, conn: Any) -> None:
             # NOTE: the whisper.cpp beam_search param REQUIRES both keys —
             # {"beam_size": N} alone raises KeyError 'patience' on every call,
             # which would make this whole branch fall back to greedy and also
-            # silently disable suppress_nst + extract_probability.
+            # silently disable suppress_nst.
             k["beam_search"] = {"beam_size": LOCAL_BEAM_SIZE, "patience": -1.0}
             k["suppress_nst"] = True   # suppress non-speech tokens ([Music], 字幕…) at decode
-            k["extract_probability"] = True
         return model.transcribe(audio, **k)
 
     while True:
@@ -601,22 +587,8 @@ def _whisper_subprocess_main(model_path: str, conn: Any) -> None:
                 # gracefully to a plain decode rather than failing the chunk.
                 segments = _run(audio, kw, with_extras=False)
 
-            kept, probs = [], []
-            for s in segments:
-                t = s.text.strip()
-                if not t:
-                    continue
-                p = getattr(s, "probability", float("nan"))
-                # Drop only a segment with a VALID, strongly-low probability —
-                # NaN (prob not computed) is always kept.
-                if isinstance(p, float) and not np.isnan(p) and p < LOCAL_PROB_DROP:
-                    continue
-                kept.append(t)
-                if isinstance(p, float) and not np.isnan(p):
-                    probs.append(p)
-            text = " ".join(kept)
-            conf = "low" if probs and min(probs) < LOCAL_PROB_LOWCONF else ""
-            conn.send({"status": "ok", "text": text, "conf": conf})
+            text = " ".join(s.text.strip() for s in segments if s.text.strip())
+            conn.send({"status": "ok", "text": text})
         except Exception as e:
             conn.send({"status": "error", "error": str(e)})
 
@@ -680,8 +652,7 @@ class LocalWhisperWorker:
             self.close()
             raise RuntimeError(f"whisper subprocess: {err}")
 
-    def transcribe(self, audio: np.ndarray, language: str, prompt: str) -> tuple[str, str]:
-        """Returns (text, conf) where conf is "low" when the model was unsure."""
+    def transcribe(self, audio: np.ndarray, language: str, prompt: str) -> str:
         if self._conn is None:
             raise RuntimeError("Worker not started")
         # Pipe is duplex but single send/recv pair — serialise so two
@@ -694,7 +665,7 @@ class LocalWhisperWorker:
             result = self._conn.recv()
         if result.get("status") == "error":
             raise RuntimeError(result["error"])
-        return result.get("text", ""), result.get("conf", "")
+        return result.get("text", "")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -2300,9 +2271,9 @@ def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
 
     try:
         if _backend == "local":
-            text, conf = _transcribe_local(audio, prompt)
+            text = _transcribe_local(audio, prompt)
         else:
-            text, conf = _transcribe_cloud(audio, api_key, prompt)
+            text = _transcribe_cloud(audio, api_key, prompt)
 
         text = _drop_hallucinations((text or "").strip(), _language)
         if text and _is_loop_hallucination(text):
@@ -2319,7 +2290,7 @@ def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
             cleaned = apply_vocab_corrections(_strip_display_labels(cleaned))
             if cleaned.strip():
                 tr = _maybe_translate(cleaned, api_key)
-                _append_line(cleaned, tr=tr, ts=ts, conf=conf)
+                _append_line(cleaned, tr=tr, ts=ts)
                 # If the result still shows a repetition loop, the chunk was
                 # unreliable — don't poison the next chunk's prompt chain. Also
                 # strip speaker labels before chaining so a hallucinated "余婷:"
@@ -2344,35 +2315,8 @@ def _restore_idle_status():
     _set_status("暫停中" if _paused else "錄音中…")
 
 
-def _assemble_cloud(body: dict) -> tuple[str, str]:
-    """Build (text, conf) from a Groq verbose_json body. Drops segments on a
-    STRONG combined hallucination signal (no_speech_prob high AND avg_logprob
-    very low), and flags the line 'low' on a softer low-confidence signal — a
-    model-confidence layer the energy gate + text heuristics lack."""
-    segs = body.get("segments") or []
-    if not segs:
-        return (body.get("text", "") or "").strip(), ""
-    kept, nsps, lps = [], [], []
-    for s in segs:
-        t = (s.get("text") or "").strip()
-        if not t:
-            continue
-        nsp, lp = s.get("no_speech_prob"), s.get("avg_logprob")
-        if (isinstance(nsp, (int, float)) and isinstance(lp, (int, float))
-                and nsp > CLOUD_NSP_DROP and lp < CLOUD_LOGPROB_DROP):
-            continue  # confident-hallucination → drop the segment
-        kept.append(t)
-        if isinstance(nsp, (int, float)):
-            nsps.append(nsp)
-        if isinstance(lp, (int, float)):
-            lps.append(lp)
-    text = " ".join(kept).strip()
-    low = (nsps and max(nsps) > CLOUD_NSP_LOWCONF) or (lps and min(lps) < CLOUD_LOGPROB_LOWCONF)
-    return text, ("low" if low else "")
-
-
-def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> tuple[str, str]:
-    """Cloud backend — Groq Whisper API. Returns (text, conf)."""
+def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> str:
+    """Cloud backend — Groq Whisper API."""
     tmp = tempfile.NamedTemporaryFile(prefix="mt_", suffix=".wav", delete=False)
     tmp.close()
     try:
@@ -2382,9 +2326,7 @@ def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> tuple[str
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
-        # verbose_json so we can read per-segment no_speech_prob / avg_logprob
-        # (the typed response only exposes .text → use with_raw_response.json()).
-        kwargs: dict = dict(model=load_cloud_model(), response_format="verbose_json")
+        kwargs: dict = dict(model=load_cloud_model())
         if _language != "auto":
             kwargs["language"] = _language
         if prompt:
@@ -2392,15 +2334,14 @@ def _transcribe_cloud(audio: np.ndarray, api_key: str, prompt: str) -> tuple[str
 
         with open(tmp.name, "rb") as f:
             kwargs["file"] = ("chunk.wav", f, "audio/wav")
-            raw = Groq(api_key=api_key).audio.transcriptions.with_raw_response.create(**kwargs)
-        return _assemble_cloud(raw.json())
+            result = Groq(api_key=api_key).audio.transcriptions.create(**kwargs)
+        return result.text
     finally:
         os.unlink(tmp.name)
 
 
-def _transcribe_local(audio: np.ndarray, prompt: str) -> tuple[str, str]:
+def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
     """Local backend — inference runs in the LocalWhisperWorker subprocess.
-    Returns (text, conf).
 
     See module-level comments on _local_worker for why this isn't in-process."""
     worker = _local_worker
@@ -2418,15 +2359,15 @@ def _transcribe_file_cloud(path: str, fname: str, api_key: str,
     """Cloud upload — hand the original file straight to Groq, which accepts
     common audio/video containers, so no local decode is needed. Uses the
     higher-accuracy non-turbo large-v3 (batch/offline → no latency cost)."""
-    kw: dict = dict(model=CLOUD_MODEL_BATCH, response_format="verbose_json")
+    kw: dict = dict(model=CLOUD_MODEL_BATCH)
     if language != "auto":
         kw["language"] = language
     if prompt:
         kw["prompt"] = prompt
     with open(path, "rb") as af:
         kw["file"] = (fname, af)
-        raw = Groq(api_key=api_key).audio.transcriptions.with_raw_response.create(**kw)
-    return _assemble_cloud(raw.json())[0]
+        result = Groq(api_key=api_key).audio.transcriptions.create(**kw)
+    return result.text
 
 
 def _transcribe_file_local(path: str, language: str, prompt: str) -> str:
@@ -2440,7 +2381,7 @@ def _transcribe_file_local(path: str, language: str, prompt: str) -> str:
     from pywhispercpp.model import Model
     audio = Model._load_audio(path)
     worker = _ensure_local_worker(model_path)
-    return worker.transcribe(audio, language, prompt)[0]
+    return worker.transcribe(audio, language, prompt)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
