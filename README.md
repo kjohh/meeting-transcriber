@@ -7,7 +7,7 @@
 | Backend | 模型 | 速度（10s 音訊） | 隱私 | 需要 |
 |---|---|---|---|---|
 | 🌐 Cloud (Groq) | `whisper-large-v3-turbo` | 0.5–1s | 音訊經 Groq server | 免費 Groq API key |
-| 🔒 Local (whisper.cpp) | `large-v3-turbo-q8_0` / `breeze-q8` | 1–3s（Apple Silicon Mac） | 完全本機 | 模型檔（首次自動下載） |
+| 🔒 Local (whisper.cpp) | `large-v3-turbo-q8_0` / `breeze-q8` | 1–3s（Apple Silicon Mac） | 完全本機 | 內建基本模型，開箱即用；中文強化模型背景自動下載 |
 
 Local 模式預設用通用 Whisper turbo 處理所有語言；當你在工具列把語言切成「強制中文」時，才會自動換用 **Breeze ASR 25**（聯發科繁中強化版），辨識中文 / 中英夾雜場景顯著優於通用 Whisper。
 
@@ -28,15 +28,14 @@ Local 模式預設用通用 Whisper turbo 處理所有語言；當你在工具�
 > 3. 跳「確定要打開?」→ 按「**打開**」
 > 4. 之後雙擊就不會再被擋
 
-**需求**:macOS 13+,**強烈建議 Apple Silicon Mac**(Intel Mac 可跑但本機推論會非常慢)。
+**需求**：macOS 14.4 以上，**僅支援 Apple Silicon Mac**（M1 以後）。Intel Mac 無法執行。
 
 第一次打開會帶你走 onboarding：
 1. 解釋工具用途
-2. 一鍵授權螢幕錄製 + 麥克風（含 live 波形測試）
-3. 選擇雲端 / 本機模式（雲端模式會請你填 Groq 金鑰並即時驗證；本機模式之後按開始錄音時會引導下載模型）
+2. 開啟「系統音訊錄製」與麥克風權限（含即時音量測試），不需要螢幕錄製權限
+3. 選擇雲端 / 本機模式（雲端模式會請你填 Groq 金鑰並即時驗證；本機模式用內建模型馬上能錄，中文強化模型在背景下載，下載完下一場會議自動換上）
 4. 完成 → 按 ● 開始錄音
 
-> macOS 15 之後系統每月會跳一次螢幕錄製確認對話框，按「允許」即可，不影響使用。
 
 > 💡 **建議戴耳機**。不戴耳機時，線上會議對方的聲音會從喇叭播出、又被你的麥克風收一次，造成回音與重複收音，辨識品質會下降。戴耳機可避免（工具沒有回音消除）。
 
@@ -72,10 +71,10 @@ cd native && swift build -c release && cd ..
 - **Repetition trim**：Whisper 經典的「同句重複 N 次」hallucination 自動截斷為最多 2 次
 - **自訂詞彙表**：UI 內編輯 → `.vocab.local`（gitignored）→ 每次 chunk 即時讀取，prime Whisper 認識專有名詞 / 品牌 / 縮寫 / 人名
 - **Backend 切換**：UI dropdown 一鍵切雲端 / 本機，敏感會議走本地
-- **金鑰即時驗證**：填寫 Groq 金鑰時直接打 API 測試，無效不存
+- **金鑰即時驗證**：填寫 Groq 金鑰時直接打 API 測試，無效不存；金鑰存在 macOS 鑰匙圈，不寫進設定檔
 - **模型 cache 共用 lazy-take-notes**：本機若已裝過 [lazy-take-notes](https://github.com/CJHwong/lazy-take-notes)，模型不會重複下載
 - **原生 Save 對話框**：透過 pywebview JS API bridge 呼叫 macOS save panel
-- **權限自動偵測**：onboarding 內 polling `CGPreflightScreenCaptureAccess` + `AVCaptureDevice.authorizationStatus`，授權完成瞬間顯示綠 ✓
+- **權限自動偵測**：onboarding 內 polling 系統音訊權限（helper `--preflight`）+ `AVCaptureDevice.authorizationStatus`，授權完成瞬間顯示綠 ✓
 
 ## UI 狀態機
 
@@ -89,13 +88,13 @@ session 期間語言 / backend 鎖定（避免「UI 改了但 in-flight session 
 
 ## 技術細節
 
-- **系統音擷取**：Swift binary 用 ScreenCaptureKit (macOS 13+)，不需要 BlackHole 等虛擬音訊裝置
+- **系統音擷取**：Swift binary 用 Core Audio process tap (macOS 14.4+)，權限是「僅系統音訊錄製」，不需要 BlackHole 等虛擬音訊裝置
 - **前端即時更新**：Server-Sent Events (`/events`)
 - **設定儲存**：
   - Source mode：`./.config.json` + `./.vocab.local`（gitignored）
   - Bundle mode：`~/Library/Application Support/Meeting Transcriber/`
 - **本地模型 cache**：`~/Library/Application Support/pywhispercpp/models/`（與 lazy-take-notes 共用）
-- **TCC 處理**：每次 py2app rebuild 產生新 signature hash → macOS 視為不同 app → `scripts/build-app.sh` 會自動 `tccutil reset` 清舊紀錄
+- **簽章**：`scripts/sign-and-package.sh` 由內而外簽章 + hardened runtime。設 `DEVELOPER_ID`（+ `NOTARY_PROFILE`）會公證並產出 .dmg；沒設時是 ad-hoc 開發版，build 腳本會 `tccutil reset` 清舊授權
 
 ## 未來計畫
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 import atexit
 import io
 import json
+import logging
 import multiprocessing as mp
 import os
 import queue
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -16,7 +18,7 @@ import time
 import wave
 from collections import Counter, deque
 from datetime import datetime
-from multiprocessing.connection import Connection
+from logging.handlers import RotatingFileHandler
 from typing import Any, Optional
 
 import numpy as np
@@ -28,7 +30,7 @@ from groq import Groq
 
 SAMPLE_RATE = 16000
 
-# Silence-aware chunking parameters (ported from lazy-take-notes).
+# Silence-aware chunking parameters (approach inspired by lazy-take-notes).
 # A chunk is triggered when EITHER the buffer hits CHUNK_DURATION (hard cap)
 # OR the tail goes silent for PAUSE_DURATION while the body had speech (natural
 # sentence boundary). OVERLAP samples are retained between chunks so the next
@@ -57,7 +59,7 @@ MIN_ACTIVE_SPEECH = 0.6         # seconds — absolute floor of real speech. A
                                 # ratio but enough real speech to keep; the
                                 # ratio gate alone would discard it.
 
-PORT = 8765
+PORT = 0  # real port assigned at launch (bound to a free one; see __main__)
 
 # Consecutive failed system-audio (re)connects before we stop retrying and
 # fall back to mic-only for the rest of the session.
@@ -125,44 +127,169 @@ def _user_data_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+APP_NAME = "Meeting Transcriber"
+LOG_DIR = os.path.expanduser(f"~/Library/Logs/{APP_NAME}")
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+WHISPER_LOG_FILE = os.path.join(LOG_DIR, "whisper.log")
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUPS = 3
+
+log = logging.getLogger("mt")
+
+
+class _StreamToLogger(io.TextIOBase):
+    """File-like sink so existing print(..., file=sys.stderr) calls and
+    Flask/werkzeug output land in the log file inside the .app, where no
+    terminal is attached."""
+
+    def __init__(self, level: int):
+        self._level = level
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                log.log(self._level, line.rstrip())
+        return len(s)
+
+    def flush(self):
+        if self._buf.strip():
+            log.log(self._level, self._buf.rstrip())
+        self._buf = ""
+
+
+class _RedactFilter(logging.Filter):
+    """Keep the per-launch session token (it rides on the first URL the
+    window opens) and any Groq key out of the log file."""
+    _pat = re.compile(r"([?&]t=)[A-Za-z0-9_\-]+|gsk_[A-Za-z0-9]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        red = self._pat.sub(lambda m: (m.group(1) or "") + "<redacted>", msg)
+        if red != msg:
+            record.msg, record.args = red, ()
+        return True
+
+
+def setup_logging():
+    """Rotating log in ~/Library/Logs/<App>/ (app.log, 3 × 2 MB). In the .app,
+    stdout/stderr are routed into it too; in a source run they stay on the
+    terminal and are mirrored to the file."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES,
+                                  backupCount=LOG_BACKUPS, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    handler.addFilter(_RedactFilter())
+    try:
+        os.chmod(LOG_FILE, 0o600)
+    except OSError:
+        pass
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    if _is_frozen_bundle():
+        sys.stdout = _StreamToLogger(logging.INFO)
+        sys.stderr = _StreamToLogger(logging.WARNING)
+    else:
+        root.addHandler(logging.StreamHandler(sys.__stderr__))
+    log.info("%s %s starting (pid %d)", APP_NAME, APP_VERSION, os.getpid())
+
+
 BINARY = os.path.join(_resource_dir(), "native/.build/release/coreaudio_tap")
 CONFIG_FILE = os.path.join(_user_data_dir(), ".config.json")
+# Autosaved copy of the live transcript. Written on every new / edited line so
+# a crash or ⌘Q never loses a meeting; offered back on next launch.
+DRAFT_FILE = os.path.join(_user_data_dir(), ".draft.json")
 VOCAB_FILE = os.path.join(_user_data_dir(), ".vocab.local")
 
-# Hugging Face model registry — borrowed from lazy-take-notes/hf_model_resolver.
-# Models are cached in pywhispercpp's MODELS_DIR so this app shares the cache
-# with lazy-take-notes (no double-download on machines that have both).
+# Downloadable local models. Pinned to a repo commit and verified against the
+# file's SHA256 (Hugging Face serves the LFS sha256 as the X-Linked-ETag), so a
+# truncated or tampered download is never loaded. Stored in pywhispercpp's
+# MODELS_DIR (shared with lazy-take-notes: no double download on machines that
+# have both).
 BREEZE_REPO = "alan314159/Breeze-ASR-25-whispercpp"
 WHISPER_CPP_REPO = "ggerganov/whisper.cpp"
-MODEL_REGISTRY: dict[str, tuple[str, str]] = {
-    # alias: (hf_repo, filename)
-    "large-v3-turbo-q8_0": (WHISPER_CPP_REPO, "ggml-large-v3-turbo-q8_0.bin"),
-    "breeze-q8":           (BREEZE_REPO, "ggml-model-q8_0.bin"),
+MODEL_REGISTRY: dict[str, dict] = {
+    "large-v3-turbo-q8_0": {
+        "repo": WHISPER_CPP_REPO,
+        "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+        "file": "ggml-large-v3-turbo-q8_0.bin",
+        "size": 874188075,
+        "sha256": "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
+    },
+    "breeze-q8": {
+        "repo": BREEZE_REPO,
+        "revision": "c7f120183c8e8ad932f315e04e3d0359d839702d",
+        "file": "ggml-model-q8_0.bin",
+        "size": 1656129708,
+        "sha256": "669eb226a0e23b42465a6d2f60ce1902fbd534e19faab59511730420eb25e90d",
+    },
 }
+
+# Small multilingual model shipped inside the app so local transcription works
+# the moment onboarding ends, with zero download. Used only until the model the
+# user's language wants has been downloaded (in the background).
+BUNDLED_MODEL = "small-q5_1"
+BUNDLED_MODEL_FILE = "ggml-small-q5_1.bin"
+
+
+def bundled_model_path() -> Optional[str]:
+    candidates = [
+        os.path.join(_resource_dir(), "models", BUNDLED_MODEL_FILE),        # .app
+        os.path.join(_resource_dir(), "build-cache", BUNDLED_MODEL_FILE),   # source run
+    ]
+    return next((p for p in candidates if os.path.exists(p)), None)
+
 
 app = Flask(__name__, static_folder=os.path.join(_resource_dir(), "static"))
 
 
-_ALLOWED_ORIGINS = frozenset([
-    "",  # no-Origin requests come from pywebview / curl localhost / direct browser bar
-    f"http://localhost:{PORT}",
-    f"http://127.0.0.1:{PORT}",
-])
+def _allowed_origins() -> frozenset:
+    return frozenset([
+        "",  # top-level navigation from pywebview sends no Origin
+        f"http://localhost:{PORT}",
+        f"http://127.0.0.1:{PORT}",
+    ])
+
+
+# Per-launch secret. The window opens `/?t=<token>`; that first request trades
+# the token for an HttpOnly, SameSite=Strict cookie, and every later request
+# must carry it. Only our own webview ever sees the token, so another program
+# on this Mac (or a web page) can no longer start a recording or pull the
+# transcript through the local server. MT_NO_TOKEN=1 disables it for
+# debugging the page in a normal browser.
+SESSION_TOKEN = secrets.token_urlsafe(32)
+SESSION_COOKIE = "mt_session"
+
+
+def _token_required() -> bool:
+    return os.environ.get("MT_NO_TOKEN") != "1"
 
 
 @app.before_request
 def _enforce_origin():
-    """Block cross-origin requests from arbitrary websites.
+    """Two checks on every request:
 
-    Flask binds localhost, so external attackers can't reach this — but any
-    browser tab the user opens to a malicious page could `fetch('http://
-    localhost:8765/start')` and silently drive the transcriber. The browser
-    always sends an `Origin` header on cross-origin fetches, so checking it
-    is sufficient to block that class of attack. Same-origin requests from
-    the pywebview UI have an Origin of `http://localhost:8765`."""
+    1. Origin: a browser tab on a malicious site could `fetch()` this
+       localhost server; browsers always send Origin on cross-origin requests,
+       so anything not from our own page is rejected.
+    2. Session token (see SESSION_TOKEN): blocks local non-browser callers,
+       which can send any Origin they like (or none)."""
     origin = request.headers.get("Origin", "")
-    if origin not in _ALLOWED_ORIGINS:
+    if origin not in _allowed_origins():
         abort(403)
+    if not _token_required():
+        return None
+    if request.cookies.get(SESSION_COOKIE) == SESSION_TOKEN:
+        return None
+    if request.path == "/" and secrets.compare_digest(request.args.get("t", ""), SESSION_TOKEN):
+        resp = app.redirect("/")  # drop the token from the visible URL
+        resp.set_cookie(SESSION_COOKIE, SESSION_TOKEN, httponly=True, samesite="Strict", path="/")
+        return resp
+    abort(403)
+
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 
@@ -188,6 +315,15 @@ _mix_gain_mic = 1.0
 _chunk_worker_thread: Optional[threading.Thread] = None
 _transcribe_consumer_thread: Optional[threading.Thread] = None
 _mic_test_stream = None  # separate stream used by onboarding mic preview
+_main_window = None      # pywebview window; set in __main__
+
+
+def _set_quit_guard(on: bool):
+    """Ask before closing the window only while a recording is running.
+    pywebview reads `confirm_close` at close time, so flipping it here is
+    enough (a custom `closing` handler that opens a dialog deadlocks ⌘Q)."""
+    if _main_window is not None:
+        _main_window.confirm_close = on
 
 # Recording-lifecycle mutations (start/stop/pause/clear, swift_proc, mic_stream,
 # worker threads) all serialise through this lock so a double-click or a
@@ -284,19 +420,164 @@ def _append_line(text: str, tr: str = "", tag: str = "", ts: Optional[str] = Non
     }
     _lines.append(line)
     _broadcast("transcript", line)
+    save_draft()
 
 
 def _format_line(line: dict) -> str:
     """Flatten a transcript line to plain text for save / download. When a
     translation is present, the original and translation go on two lines."""
     head = f"[{line['ts']}]"
-    if line.get("tag"):
+    if line.get("tag") and line["tag"] != "dropped":  # internal marker, not a label
         head += f" [{line['tag']}]"
     text = line.get("text", "")
     tr = line.get("tr", "")
     if tr:
         return f"{head} {text}\n    ↳ {tr}"
     return f"{head} {text}"
+
+
+# ─── Update check ─────────────────────────────────────────────────────────────
+
+RELEASES_API = "https://api.github.com/repos/kjohh/meeting-transcriber/releases/latest"
+UPDATE_CHECK_INTERVAL = 24 * 3600
+_update_info: Optional[dict] = None  # {"version", "url"} once a newer release is seen
+
+
+def _version_tuple(v: str) -> tuple:
+    nums = re.findall(r"\d+", v)
+    return tuple(int(n) for n in nums[:3]) if nums else (0,)
+
+
+def check_for_update():
+    """Once a day, ask GitHub for the latest release. Newer than us → tell the
+    page (SSE 'update'), which shows a small download link. Failures are
+    silent: this is a convenience, not something to bother the user with."""
+    global _update_info
+    cfg = _read_config()
+    now = time.time()
+    cached = cfg.get("update_seen")
+    if cached and now - cfg.get("update_checked_at", 0) < UPDATE_CHECK_INTERVAL:
+        if _version_tuple(cached.get("version", "")) > _version_tuple(APP_VERSION):
+            _update_info = cached
+            _broadcast("update", _update_info)
+        return
+    try:
+        import urllib.request
+        req = urllib.request.Request(RELEASES_API, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"MeetingTranscriber/{APP_VERSION}",
+        })
+        with urllib.request.urlopen(req, timeout=8) as r:
+            rel = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        log.info("update check skipped: %s", e)
+        return
+    latest = {"version": (rel.get("tag_name") or "").lstrip("v"), "url": rel.get("html_url") or ""}
+    cfg = _read_config()
+    cfg["update_checked_at"] = now
+    cfg["update_seen"] = latest
+    _write_config(cfg)
+    if latest["url"] and _version_tuple(latest["version"]) > _version_tuple(APP_VERSION):
+        _update_info = latest
+        log.info("update available: %s", latest["version"])
+        _broadcast("update", _update_info)
+
+
+def format_transcript(lines: list[dict], fmt: str) -> str:
+    """Whole transcript as plain text ("txt") or Markdown ("md"). Markdown
+    gives each segment its own paragraph with a bold timestamp and puts the
+    translation (if any) in a quote under it."""
+    if fmt != "md":
+        return "\n".join(_format_line(l) for l in lines)
+    out = ["# 會議逐字稿", "",
+           f"- 匯出時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+           f"- 段數：{sum(1 for l in lines if l.get('tag') != 'dropped')}", ""]
+    for l in lines:
+        head = f"**{l.get('ts', '')}**"
+        tag = l.get("tag", "")
+        text = (l.get("text") or "").strip()
+        if tag == "dropped":
+            out.append(f"*{text}*")
+        else:
+            if tag:
+                head += f" · {tag}"
+            out.append(f"{head}  \n{text}")
+            if l.get("tr"):
+                out.append(f"> {l['tr'].strip()}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def load_export_format() -> str:
+    return "md" if _read_config().get("export_format") == "md" else "txt"
+
+
+def save_export_format(fmt: str):
+    cfg = _read_config()
+    cfg["export_format"] = "md" if fmt == "md" else "txt"
+    _write_config(cfg)
+
+
+# ─── Transcript draft (autosave) ──────────────────────────────────────────────
+
+_draft_lock = threading.Lock()
+
+
+def save_draft(saved: bool = False):
+    """Atomically write the current transcript to DRAFT_FILE. `saved` marks
+    that the user has exported this exact content, so a relaunch doesn't
+    offer to restore something they already have."""
+    with _draft_lock:
+        lines = [dict(l) for l in _lines]
+        if not lines:
+            clear_draft(locked=True)
+            return
+        payload = {"saved": saved, "updated": datetime.now().isoformat(timespec="seconds"),
+                   "lines": lines}
+        tmp = DRAFT_FILE + ".tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, DRAFT_FILE)
+        except OSError as e:
+            log.warning("draft save failed: %s", e)
+
+
+def clear_draft(locked: bool = False):
+    def _rm():
+        for p in (DRAFT_FILE, DRAFT_FILE + ".tmp"):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+    if locked:
+        _rm()
+    else:
+        with _draft_lock:
+            _rm()
+
+
+def load_draft() -> Optional[dict]:
+    """The unsaved draft from a previous run, or None. A draft the user had
+    already saved is discarded here."""
+    try:
+        with open(DRAFT_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.warning("draft unreadable, discarding: %s", e)
+        clear_draft()
+        return None
+    if d.get("saved") or not d.get("lines"):
+        clear_draft()
+        return None
+    return d
+
+
+# Set at launch from load_draft(); cleared once the user restores or discards.
+_pending_draft: Optional[dict] = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -319,16 +600,103 @@ def _write_config(cfg: dict):
         json.dump(cfg, f)
 
 
+KEYCHAIN_SERVICE = "Meeting Transcriber"
+KEYCHAIN_ACCOUNT = "groq_api_key"
+
+
+def _keychain_query() -> dict:
+    import Security as Sec
+    return {
+        Sec.kSecClass: Sec.kSecClassGenericPassword,
+        Sec.kSecAttrService: KEYCHAIN_SERVICE,
+        Sec.kSecAttrAccount: KEYCHAIN_ACCOUNT,
+    }
+
+
+def keychain_get() -> str:
+    try:
+        import Security as Sec
+        q = _keychain_query()
+        q[Sec.kSecReturnData] = True
+        q[Sec.kSecMatchLimit] = Sec.kSecMatchLimitOne
+        status, data = Sec.SecItemCopyMatching(q, None)
+        if status == 0 and data is not None:
+            return bytes(data).decode("utf-8")
+    except Exception as e:
+        log.warning("keychain read failed: %s", e)
+    return ""
+
+
+def keychain_set(value: str) -> bool:
+    try:
+        import Security as Sec
+        from Foundation import NSData
+        Sec.SecItemDelete(_keychain_query(), )
+        if not value:
+            return True
+        item = _keychain_query()
+        raw = value.encode("utf-8")
+        item[Sec.kSecValueData] = NSData.dataWithBytes_length_(raw, len(raw))
+        item[Sec.kSecAttrLabel] = "Meeting Transcriber：Groq 金鑰"
+        status, _ = Sec.SecItemAdd(item, None)
+        if status != 0:
+            log.warning("keychain write failed: OSStatus %s", status)
+        return status == 0
+    except Exception as e:
+        log.warning("keychain write failed: %s", e)
+        return False
+
+
+_api_key_cache: Optional[str] = None
+# Set once the key has been read at launch. The Keychain read can block on a
+# macOS "allow access" prompt (e.g. after an unsigned dev rebuild), so it runs
+# in the background and the page is told the result via SSE 'has_key'
+# instead of the page's first load waiting on it.
+_key_loaded = threading.Event()
+
+
+def preload_api_key():
+    try:
+        has = bool(load_api_key())
+    finally:
+        _key_loaded.set()
+    _broadcast("has_key", has)
+
+
+def has_api_key_nonblocking() -> bool:
+    if os.environ.get("GROQ_API_KEY"):
+        return True
+    return _key_loaded.is_set() and bool(_api_key_cache)
+
+
 def load_api_key() -> str:
+    """Groq key: env var (dev) > macOS Keychain. Cached in memory so the
+    Keychain isn't hit on every chunk. A key left in the JSON config by older
+    versions is moved into the Keychain and removed from the file."""
+    global _api_key_cache
     if k := os.environ.get("GROQ_API_KEY", ""):
         return k
-    return _read_config().get("groq_api_key", "")
+    if _api_key_cache is not None:
+        return _api_key_cache
+    cfg = _read_config()
+    legacy = cfg.get("groq_api_key", "")
+    if legacy:
+        if keychain_set(legacy):
+            cfg.pop("groq_api_key", None)
+            _write_config(cfg)
+            log.info("moved Groq key from config file to Keychain")
+        _api_key_cache = legacy
+        return legacy
+    _api_key_cache = keychain_get()
+    return _api_key_cache
 
 
 def save_api_key(key: str):
-    cfg = _read_config()
-    cfg["groq_api_key"] = key
-    _write_config(cfg)
+    global _api_key_cache
+    if not keychain_set(key):
+        raise RuntimeError("無法把金鑰存進鑰匙圈")
+    _api_key_cache = key
+    _key_loaded.set()
 
 
 def load_backend() -> str:
@@ -406,31 +774,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.12"  # Bumped on each release. Used to gate one-time
-                       # `tccutil reset` of stale entries across upgrades.
-
-
-def handle_version_change():
-    """On version change, allow one fresh permission reset.
-
-    Stale TCC entries (granted to the previous build's hash) make the new
-    build silently fail capture even though System Settings shows toggle ON.
-    `tccutil reset` clears them once per version — gated by config flag so
-    repeated clicks of "立即重新授權" don't keep wiping fresh grants."""
-    cfg = _read_config()
-    if cfg.get("last_seen_version") != APP_VERSION:
-        cfg["last_seen_version"] = APP_VERSION
-        cfg["first_perm_trigger_done"] = False
-        _write_config(cfg)
-
-
-# NOTE: there is intentionally no startup "needs revalidation" check. It
-# proved unreliable on ad-hoc-signed apps (CGPreflight + ground-truth spawn
-# both false-positive). Permission problems are surfaced reactively instead:
-# the sys-audio-warning banner fires off the Swift binary's own stderr (the
-# only reliable signal), and its "立即重新授權" button opens the revalidation
-# modal on demand. handle_version_change() still arms a one-shot tccutil reset
-# for the first revalidation click after an upgrade.
+APP_VERSION = "0.1.12"  # Single source of truth; setup.py reads it for the bundle.
 
 
 def save_onboarding_completed(value: bool):
@@ -442,248 +786,293 @@ def save_onboarding_completed(value: bool):
 # ─── Local whisper backend ────────────────────────────────────────────────────
 
 def pick_local_model(language: str) -> str:
-    """Choose best local model for a given language.
+    """The model the user's language *wants* (it may not be downloaded yet).
 
     - Force-Chinese → user-selectable (default Breeze ASR 25, 繁中 fine-tuned;
       can switch to large-v3-turbo for heavy zh/en code-switching)
-    - Auto / English → large-v3-turbo-q8_0 (general, handles every language
-      via Whisper's auto-detect)
+    - Auto / English → large-v3-turbo-q8_0
     """
     if language == "zh":
         return load_zh_model()
     return "large-v3-turbo-q8_0"
 
 
+def resolve_local_model(language: str) -> tuple[str, Optional[str]]:
+    """(alias, path) actually used for *language*: the wanted model when it is
+    on disk, else the bundled small model. Resolved per /start, so a model that
+    finishes downloading mid-meeting takes over from the next session, never
+    in the middle of one."""
+    wanted = pick_local_model(language)
+    path = model_local_path(wanted)
+    if path:
+        return wanted, path
+    return BUNDLED_MODEL, bundled_model_path()
+
+
+def _model_dir(alias: str) -> str:
+    from pywhispercpp.constants import MODELS_DIR
+    spec = MODEL_REGISTRY[alias]
+    if alias.startswith("breeze"):
+        return os.path.join(MODELS_DIR, "breeze")
+    owner, repo_name = spec["repo"].split("/")
+    return os.path.join(MODELS_DIR, "hf", f"{owner}__{repo_name}")
+
+
 def model_local_path(alias: str) -> Optional[str]:
-    """Return the cached on-disk path for *alias*, or None if not downloaded."""
+    """Cached on-disk path for *alias*, or None if missing or incomplete.
+    A size check (cheap) guards against a half-written file; the full SHA256
+    check runs once, right after download."""
     from pywhispercpp.constants import MODELS_DIR
 
     if alias not in MODEL_REGISTRY:
         return None
-    repo, fname = MODEL_REGISTRY[alias]
-    owner, repo_name = repo.split("/")
-    # Match lazy-take-notes' layout so caches are shared.
-    if alias.startswith("breeze"):
-        candidate = os.path.join(MODELS_DIR, "breeze", fname)
-    elif alias.startswith("large-v3-turbo"):
-        # lazy-take-notes uses 'whisper-cpp', but pywhispercpp uses 'hf/owner__repo'
-        # We check both for compatibility.
-        candidates = [
-            os.path.join(MODELS_DIR, "whisper-cpp", fname),
-            os.path.join(MODELS_DIR, "hf", f"{owner}__{repo_name}", fname),
-        ]
-        return next((p for p in candidates if os.path.exists(p)), None)
-    else:
-        candidate = os.path.join(MODELS_DIR, "hf", f"{owner}__{repo_name}", fname)
-    return candidate if os.path.exists(candidate) else None
+    spec = MODEL_REGISTRY[alias]
+    candidates = [os.path.join(_model_dir(alias), spec["file"])]
+    if alias.startswith("large-v3-turbo"):
+        # lazy-take-notes stores it under 'whisper-cpp/'.
+        candidates.append(os.path.join(MODELS_DIR, "whisper-cpp", spec["file"]))
+    for p in candidates:
+        try:
+            if os.path.getsize(p) == spec["size"]:
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _sha256(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+DOWNLOAD_ATTEMPTS = 4
+DOWNLOAD_BLOCK = 1024 * 1024
+
+
+def _model_url(spec: dict) -> str:
+    return f"https://huggingface.co/{spec['repo']}/resolve/{spec['revision']}/{spec['file']}"
+
+
+def _fetch_resumable(url: str, part_path: str, expected_size: int, on_progress=None):
+    """Stream *url* into *part_path*, continuing from whatever is already on
+    disk (HTTP Range). Progress is reported from the byte count on disk, so a
+    resumed download starts at its real percentage, not at 0."""
+    import urllib.error
+    import urllib.request
+
+    have = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+    if have > expected_size:          # stale / foreign file: start over
+        os.unlink(part_path)
+        have = 0
+    if have == expected_size:
+        return
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"MeetingTranscriber/{APP_VERSION}",
+        "Range": f"bytes={have}-",
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        if e.code == 416:             # nothing left to send
+            return
+        raise
+    with resp:
+        if have and resp.status != 206:   # server ignored the range: rewrite
+            have = 0
+        mode = "ab" if have else "wb"
+        last_pct = -1
+        with open(part_path, mode) as out:
+            while True:
+                block = resp.read(DOWNLOAD_BLOCK)
+                if not block:
+                    break
+                out.write(block)
+                have += len(block)
+                pct = min(100, have * 100 // expected_size)
+                if on_progress and pct != last_pct:
+                    last_pct = pct
+                    on_progress(pct)
+    if have != expected_size:
+        raise RuntimeError(f"連線中斷（收到 {have} / {expected_size} bytes），將從中斷處繼續")
 
 
 def download_model(alias: str, on_progress=None) -> str:
-    """Download *alias* from HF Hub into MODELS_DIR. Returns local path."""
-    from huggingface_hub import hf_hub_download
-    from pywhispercpp.constants import MODELS_DIR
+    """Download *alias* into MODELS_DIR and verify it. Returns the local path.
 
+    Written to "<file>.part" and only renamed into place after the SHA256
+    matches, so model_local_path never sees a half-written file. Interrupted
+    downloads (network drop, app quit) continue from the .part file; a
+    checksum mismatch deletes it so the next attempt starts clean."""
     if alias not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model alias: {alias}")
-    repo, fname = MODEL_REGISTRY[alias]
-    owner, repo_name = repo.split("/")
-    if alias.startswith("breeze"):
-        cache_dir = os.path.join(MODELS_DIR, "breeze")
-    else:
-        cache_dir = os.path.join(MODELS_DIR, "hf", f"{owner}__{repo_name}")
+    spec = MODEL_REGISTRY[alias]
+    cache_dir = _model_dir(alias)
     os.makedirs(cache_dir, exist_ok=True)
+    dest = os.path.join(cache_dir, spec["file"])
+    part = dest + ".part"
 
-    kwargs = dict(repo_id=repo, filename=fname, local_dir=cache_dir)
-    if on_progress:
-        kwargs["tqdm_class"] = _make_progress_tqdm(on_progress)
-    return hf_hub_download(**kwargs)
-
-
-def _make_progress_tqdm(callback):
-    """Build a tqdm-compatible class that pipes progress to *callback*(percent)."""
-    class _Progress:
-        def __init__(self, *args, **kwargs):
-            self.total = kwargs.get("total", 0) or 0
-            self.n = 0
-            if self.total > 0:
-                callback(0)
-        def update(self, n=1):
-            self.n += n
-            if self.total > 0:
-                callback(min(int(self.n / self.total * 100), 100))
-        def close(self): pass
-        def set_description(self, *a, **k): pass
-        def set_description_str(self, *a, **k): pass
-        def refresh(self): pass
-        def __enter__(self): return self
-        def __exit__(self, *a): self.close()
-    return _Progress
-
-
-def _whisper_subprocess_main(model_path: str, conn: Any) -> None:
-    """Subprocess entry: load model once, then loop on transcription requests.
-
-    Runs inside a `multiprocessing.spawn` child so whisper.cpp inference
-    can't compete with the parent's WKWebView + Flask for the GIL, and so
-    macOS's QoS / thermal scheduler isn't forced to keep inference on a
-    P-core just because the parent is a user-interactive GUI app. Result:
-    sustained transcription stops pinning P-cores and the Mac stops
-    getting hot.
-
-    Permanently redirects C-level stdout/stderr to /dev/null so whisper.cpp's
-    fprintf() calls don't escape to the parent's Flask log.
-    """
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.close(devnull)
-
-    try:
-        from pywhispercpp.model import Model
-        # params_sampling_strategy=1 = beam search (greedy=0 is the default and
-        # lower-accuracy); the beam_search dict per-call tunes beam_size.
-        model = Model(model_path, params_sampling_strategy=1,
-                      print_progress=False, print_realtime=False)
-    except Exception as e:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
-            conn.send({"status": "error", "error": f"model load failed: {e}"})
-        finally:
-            conn.close()
-        return
-
-    conn.send({"status": "ready"})
-
-    def _run(audio, kw, with_extras):
-        """Transcribe; with_extras adds beam/prob/NST params that some builds may
-        reject — caller retries without them on failure."""
-        k = dict(kw)
-        if with_extras:
-            # NOTE: the whisper.cpp beam_search param REQUIRES both keys —
-            # {"beam_size": N} alone raises KeyError 'patience' on every call,
-            # which would make this whole branch fall back to greedy and also
-            # silently disable suppress_nst.
-            k["beam_search"] = {"beam_size": LOCAL_BEAM_SIZE, "patience": -1.0}
-            k["suppress_nst"] = True   # suppress non-speech tokens ([Music], 字幕…) at decode
-        return model.transcribe(audio, **k)
-
-    while True:
-        try:
-            req = conn.recv()
-        except EOFError:
-            break
-        if req is None:
-            break
-        try:
-            kw: dict = {}
-            if req.get("language") and req["language"] != "auto":
-                kw["language"] = req["language"]
-            if req.get("prompt"):
-                kw["initial_prompt"] = req["prompt"]
-            audio = req["audio"].astype(np.float32)
-            try:
-                segments = _run(audio, kw, with_extras=True)
-            except Exception:
-                # A whisper.cpp build that rejects the extra kwargs — degrade
-                # gracefully to a plain decode rather than failing the chunk.
-                segments = _run(audio, kw, with_extras=False)
-
-            text = " ".join(s.text.strip() for s in segments if s.text.strip())
-            conn.send({"status": "ok", "text": text})
+            _fetch_resumable(_model_url(spec), part, spec["size"], on_progress)
+            if _sha256(part) != spec["sha256"]:
+                os.unlink(part)
+                raise RuntimeError("檔案檢查碼不符，已刪除，將重新下載")
+            os.replace(part, dest)
+            log.info("model %s downloaded and verified (attempt %d)", alias, attempt)
+            return dest
         except Exception as e:
-            conn.send({"status": "error", "error": str(e)})
+            last_err = e
+            log.warning("model %s download attempt %d failed: %s", alias, attempt, e)
+            if attempt < DOWNLOAD_ATTEMPTS:
+                time.sleep(min(2 ** attempt, 20))
+    raise RuntimeError(f"下載失敗（已重試 {DOWNLOAD_ATTEMPTS} 次）：{last_err}")
 
-    conn.close()
+
+# ─── Local whisper worker process ────────────────────────────────────────────
+#
+# Inference runs in a single-process pool (spawn), not in the GUI process:
+# whisper.cpp holds the GIL for the whole decode, and macOS keeps a
+# user-interactive GUI process's threads on performance cores, so in-process
+# inference froze the UI and ran the Mac hot. The pool's initializer loads
+# the model once per process; each chunk is one submitted task.
+
+_pool_model = None       # set inside the worker process only
+_pool_load_error = ""
+
+
+def _pool_init(model_path: str) -> None:
+    """Worker-process initializer: send whisper.cpp's C-level output to
+    whisper.log (kept for diagnosis, truncated past LOG_MAX_BYTES) and load
+    the model. A load failure is recorded rather than raised, so the parent
+    gets the reason from _pool_ready() instead of an opaque broken pool."""
+    global _pool_model, _pool_load_error
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if os.path.exists(WHISPER_LOG_FILE) and os.path.getsize(WHISPER_LOG_FILE) > LOG_MAX_BYTES:
+            os.truncate(WHISPER_LOG_FILE, 0)
+        fd = os.open(WHISPER_LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    except OSError:
+        fd = os.open(os.devnull, os.O_WRONLY)
+    for target in (1, 2):
+        os.dup2(fd, target)
+    os.close(fd)
+    try:
+        # whisper.cpp model files start with the ggml magic; pywhispercpp
+        # happily "loads" anything else and only fails (or crashes) later.
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"lmgg":
+                raise RuntimeError("not a whisper model file")
+        from pywhispercpp.model import Model
+        # params_sampling_strategy=1 = beam search (greedy=0 is lower accuracy);
+        # the per-call beam_search dict sets the beam size.
+        _pool_model = Model(model_path, params_sampling_strategy=1,
+                            print_progress=False, print_realtime=False)
+    except Exception as e:
+        _pool_load_error = f"model load failed: {e}"
+
+
+def _pool_ready() -> str:
+    """Round-trip used right after start: '' when the model loaded."""
+    return _pool_load_error or ("" if _pool_model is not None else "model not loaded")
+
+
+def _pool_transcribe(audio: np.ndarray, language: str, prompt: str) -> str:
+    kw: dict = {}
+    if language and language != "auto":
+        kw["language"] = language
+    if prompt:
+        kw["initial_prompt"] = prompt
+    try:
+        # NOTE: whisper.cpp's beam_search param needs BOTH keys; beam_size
+        # alone raises KeyError 'patience' and silently drops to greedy.
+        segments = _pool_model.transcribe(
+            audio, beam_search={"beam_size": LOCAL_BEAM_SIZE, "patience": -1.0},
+            suppress_nst=True, **kw)  # suppress non-speech tokens ([Music], 字幕…)
+    except Exception:
+        # A pywhispercpp build that rejects the extra params: plain decode.
+        segments = _pool_model.transcribe(audio, **kw)
+    return " ".join(t for t in (seg.text.strip() for seg in segments) if t)
 
 
 class LocalWhisperWorker:
-    """Owns the whisper inference subprocess.
+    """One whisper model in one worker process.
 
-    Lifecycle: ``start()`` spawns a child, loads the model, blocks until ready.
-    ``transcribe()`` is the synchronous request/response over the pipe.
-    ``close()`` signals the child to exit and reaps it.
+    App-scoped: the first /start (or upload) for a model pays the load, later
+    sessions reuse the live process; a different model path means a new
+    worker. Calls are serialised; a call that exceeds its timeout, or a worker
+    process that died, marks this worker dead so the caller respawns it."""
 
-    Worker is **app-scoped, not session-scoped** — first /start with a
-    given model path spawns and pays the ~1-3s model load; subsequent
-    /start calls (same language → same model path) reuse the still-alive
-    worker so the user doesn't wait for model load between sessions. A
-    language change picks a different model alias, which we detect via
-    model_path mismatch and respawn.
-    """
-
-    # Hard caps. Model load over Pipe handshake is fast (a few seconds at
-    # most); transcription of a 25s chunk on M-series with q8 is under 10s
-    # in the bad case. 120s leaves margin without hanging forever if the
-    # child wedges.
     _LOAD_TIMEOUT = 120.0
     _TRANSCRIBE_TIMEOUT = 180.0
 
     def __init__(self, model_path: str) -> None:
-        self.model_path = model_path  # public — caller compares for reuse
-        self._process: Optional[Any] = None
-        self._conn: Optional[Connection] = None
+        self.model_path = model_path  # public: caller compares for reuse
+        self._pool = None
         self._lock = threading.Lock()
 
-    def is_alive(self) -> bool:
-        """True if the subprocess is up and the pipe is healthy."""
-        return (
-            self._process is not None
-            and self._process.is_alive()
-            and self._conn is not None
-        )
-
     def start(self) -> None:
-        ctx = mp.get_context("spawn")
-        parent_conn, child_conn = ctx.Pipe(duplex=True)
-        self._process = ctx.Process(
-            target=_whisper_subprocess_main,
-            args=(self.model_path, child_conn),
-            daemon=True,
-        )
-        self._process.start()
-        child_conn.close()
-        self._conn = parent_conn
+        from concurrent.futures import ProcessPoolExecutor
+        self._pool = ProcessPoolExecutor(
+            max_workers=1, mp_context=mp.get_context("spawn"),
+            initializer=_pool_init, initargs=(self.model_path,))
+        err = self._run(_pool_ready, timeout=self._LOAD_TIMEOUT)
+        if err:
+            self.close()
+            raise RuntimeError(f"whisper worker: {err}")
 
-        if not self._conn.poll(timeout=self._LOAD_TIMEOUT):
-            self.close()
-            raise RuntimeError("whisper subprocess: timeout loading model")
-        msg = self._conn.recv()
-        if msg.get("status") != "ready":
-            err = msg.get("error", "unknown")
-            self.close()
-            raise RuntimeError(f"whisper subprocess: {err}")
+    def is_alive(self) -> bool:
+        return self._pool is not None and not getattr(self._pool, "_broken", False)
 
     def transcribe(self, audio: np.ndarray, language: str, prompt: str) -> str:
-        if self._conn is None:
-            raise RuntimeError("Worker not started")
-        # Pipe is duplex but single send/recv pair — serialise so two
-        # _transcribe calls (shouldn't happen with single consumer, but
-        # defensive) can't interleave bytes on the same Connection.
         with self._lock:
-            self._conn.send({"audio": audio, "language": language, "prompt": prompt})
-            if not self._conn.poll(timeout=self._TRANSCRIBE_TIMEOUT):
-                raise RuntimeError("whisper subprocess: transcribe timeout")
-            result = self._conn.recv()
-        if result.get("status") == "error":
-            raise RuntimeError(result["error"])
-        return result.get("text", "")
+            return self._run(_pool_transcribe, audio.astype(np.float32), language, prompt,
+                             timeout=self._TRANSCRIBE_TIMEOUT)
+
+    def _run(self, fn, *args, timeout: float):
+        from concurrent.futures import TimeoutError as FutureTimeout
+        from concurrent.futures.process import BrokenProcessPool
+        if self._pool is None:
+            raise RuntimeError("Worker not started")
+        try:
+            return self._pool.submit(fn, *args).result(timeout=timeout)
+        except FutureTimeout:
+            self._kill()
+            raise RuntimeError("本機轉錄逾時")
+        except BrokenProcessPool:
+            self._kill()
+            raise RuntimeError("本機轉錄程序意外結束")
+
+    def _processes(self) -> list:
+        return list((getattr(self._pool, "_processes", None) or {}).values())
+
+    def _kill(self) -> None:
+        procs = self._processes()
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
 
     def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.send(None)
-            except Exception:
-                pass
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
-        if self._process is not None:
-            self._process.join(timeout=5)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=2)
-            self._process = None
+        """Let the worker finish its current task (up to 5 s), then stop it."""
+        procs = self._processes()
+        pool, self._pool = self._pool, None
+        if pool is None:
+            return
+        pool.shutdown(wait=False, cancel_futures=True)
+        deadline = time.monotonic() + 5
+        for p in procs:
+            p.join(max(0.0, deadline - time.monotonic()))
+            if p.is_alive():
+                p.terminate()
+                p.join(1)
 
 
 def save_vocab(text: str):
@@ -708,10 +1097,11 @@ def read_vocab_raw() -> str:
 
 
 def cleanup_orphan_tempfiles():
-    """Remove any mt_*.wav left in TMPDIR by previous crashed runs."""
+    """Remove temp files (chunk WAVs, uploaded / decoded files) left in
+    TMPDIR by previous crashed runs. All of them are named mt_*."""
     tmp_dir = tempfile.gettempdir()
     for name in os.listdir(tmp_dir):
-        if name.startswith("mt_") and name.endswith(".wav"):
+        if name.startswith("mt_"):
             try:
                 os.unlink(os.path.join(tmp_dir, name))
             except OSError:
@@ -878,6 +1268,12 @@ def index():
     return send_file(os.path.join(_resource_dir(), "static/index.html"))
 
 
+def _draft_summary() -> Optional[dict]:
+    if not _pending_draft or _lines:
+        return None
+    return {"count": len(_pending_draft["lines"]), "updated": _pending_draft.get("updated", "")}
+
+
 @app.route("/events")
 def events():
     q: queue.Queue = queue.Queue(maxsize=200)
@@ -886,7 +1282,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','key':load_api_key(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'cloud_model':load_cloud_model(),'zh_model':load_zh_model(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','has_key':has_api_key_nonblocking(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'cloud_model':load_cloud_model(),'zh_model':load_zh_model(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated(),'draft':_draft_summary(),'version':APP_VERSION,'download':dict(_download_state),'update':_update_info,'export_format':load_export_format()})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -904,6 +1300,18 @@ def events():
     )
 
 
+@app.route("/notices")
+def route_notices():
+    """Third-party license notices (shown in Settings → 關於)."""
+    path = os.path.join(_resource_dir(), "THIRD_PARTY_NOTICES.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            body = f.read()
+    except OSError:
+        body = "# 第三方軟體授權聲明\n\n找不到授權聲明檔。"
+    return Response(body, mimetype="text/plain; charset=utf-8")
+
+
 @app.route("/key", methods=["POST"])
 def route_key():
     """Validate against Groq before persisting — saving an invalid key
@@ -918,12 +1326,15 @@ def route_key():
         msg = str(e)
         low = msg.lower()
         if "401" in msg or "invalid" in low or "auth" in low:
-            return jsonify({"ok": False, "error": "金鑰無效,請確認複製完整。"})
+            return jsonify({"ok": False, "error": "金鑰無效，請確認有完整複製。"})
         if "connection" in low or "network" in low or "timeout" in low:
-            return jsonify({"ok": False, "error": "無法連線到 Groq,請檢查網路。"})
-        return jsonify({"ok": False, "error": f"驗證失敗: {msg[:120]}"})
+            return jsonify({"ok": False, "error": "無法連線到 Groq，請檢查網路。"})
+        return jsonify({"ok": False, "error": f"驗證失敗：{msg[:120]}"})
 
-    save_api_key(key)
+    try:
+        save_api_key(key)
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)})
     return jsonify({"ok": True})
 
 
@@ -951,23 +1362,27 @@ def route_start():
     global _sys_capture_thread, _mic_gate_deadline, _mix_gain_sys, _mix_gain_mic
 
     data = request.json or {}
-    key = data.get("key", "").strip()
     language = data.get("language", "auto")
     backend = data.get("backend", "cloud")
+    # Never sent by the page; lives in the Keychain. Only read when something
+    # will use it, so local-only use never touches the Keychain.
+    key = load_api_key() if (backend == "cloud" or _translate_enabled) else ""
 
     if backend == "cloud" and not key:
-        return jsonify({"ok": False, "error": "No API key (required for cloud backend)"})
+        return jsonify({"ok": False, "error": "雲端模式需要 Groq 金鑰，請到設定填寫，或改用本機模式。"})
+    using_fallback = False
     if backend == "local":
-        alias = pick_local_model(language)
-        model_path = model_local_path(alias)
+        alias, model_path = resolve_local_model(language)
         if model_path is None:
-            return jsonify({"ok": False, "error": f"Local model not downloaded: {alias}"})
+            return jsonify({"ok": False, "error": "找不到語音模型，請重新安裝 App。"})
+        using_fallback = alias == BUNDLED_MODEL
+        log.info("start: local model %s%s", alias, " (bundled fallback)" if using_fallback else "")
     if not os.path.exists(BINARY):
-        return jsonify({"ok": False, "error": "Binary missing — run: cd native && swift build -c release"})
+        return jsonify({"ok": False, "error": "找不到音訊擷取元件，請重新安裝 App。"})
 
     with _lifecycle_lock:
         if _recording:
-            return jsonify({"ok": False, "error": "Already recording"})
+            return jsonify({"ok": False, "error": "已經在錄音中"})
 
         _language = language
         _backend = backend
@@ -979,7 +1394,8 @@ def route_start():
         # gate now so a mic-only session records from t=0 (no 3s dead start).
         _sys_ready.clear()
         _mic_gate_deadline = time.monotonic() + MIC_GATE_GRACE
-        if not _screen_capture_granted():
+        sys_perm = _system_audio_permission()
+        if sys_perm != "authorized":
             _sys_ready.set()
         _mix_gain_sys = 1.0
         _mix_gain_mic = 1.0
@@ -1000,13 +1416,14 @@ def route_start():
         # recordings don't re-pay the ~1-3s model load).
         if backend == "local":
             try:
-                _set_status("Loading local whisper model…")
+                _set_status("正在載入本機語音模型…")
                 _ensure_local_worker(model_path)
             except Exception as e:
                 _recording = False
                 _broadcast("state", {"recording": False, "paused": False})
-                _set_status(f"⚠ 模型啟動失敗: {e}")
-                return jsonify({"ok": False, "error": f"Whisper subprocess failed to start: {e}"})
+                log.exception("local model failed to start")
+                _set_status("⚠ 本機語音模型啟動失敗")
+                return jsonify({"ok": False, "error": f"本機語音模型啟動失敗：{e}"})
 
         # Mic stream — its failure (denied mic permission) is what should abort
         # /start. Roll the half-started state back so _recording doesn't stay
@@ -1024,8 +1441,9 @@ def route_start():
                 _mic_stream = None
             _recording = False
             _broadcast("state", {"recording": False, "paused": False})
-            _set_status(f"啟動失敗:{e}")
-            return jsonify({"ok": False, "error": f"無法啟動錄音:{e}"})
+            log.exception("mic stream failed to start")
+            _set_status("無法使用麥克風")
+            return jsonify({"ok": False, "error": f"無法使用麥克風，請確認系統設定中已允許 Meeting Transcriber 使用麥克風。（{e}）"})
 
         # System audio runs under a supervisor thread that re-spawns the Swift
         # capture if macOS stops the ScreenCaptureKit stream mid-recording
@@ -1036,7 +1454,12 @@ def route_start():
         _sys_capture_thread.start()
 
         _broadcast("state", {"recording": True, "paused": False})
-        _set_status("Starting system audio capture…")
+        _set_quit_guard(True)
+        _set_status("正在連接電腦音訊…")
+        if sys_perm == "denied":
+            # The tap delivers silence without the grant; say so up front
+            # instead of letting the remote side go missing unnoticed.
+            _broadcast("sys_audio", {"ok": False, "msg": "permission denied"})
 
         _transcribe_consumer_thread = threading.Thread(
             target=_transcribe_consumer, args=(key,), daemon=True,
@@ -1050,7 +1473,9 @@ def route_start():
         # doesn't stall when the screen sleeps.
         _start_caffeinate()
 
-    return jsonify({"ok": True})
+    # Tell the UI when the bundled small model is standing in, so it can say
+    # the better model is coming (and will be used from the next meeting).
+    return jsonify({"ok": True, "fallback_model": using_fallback})
 
 
 @app.route("/pause", methods=["POST"])
@@ -1099,6 +1524,7 @@ def route_stop():
             return jsonify({"ok": True})  # idempotent
         _recording = False
         _paused = False
+        _set_quit_guard(False)
 
         _stop_caffeinate()  # let the Mac sleep again once recording ends
 
@@ -1134,7 +1560,7 @@ def route_stop():
     # check still handle cleanup on app exit / language switch.
 
     _broadcast("state", {"recording": False, "paused": False})
-    _set_status(f"Stopped — {len(_lines)} segment(s) transcribed")
+    _set_status(f"已停止，共 {len(_lines)} 段逐字稿。")
     return jsonify({"ok": True})
 
 
@@ -1144,17 +1570,17 @@ def route_upload():
     # local-only / no-key user must be able to transcribe an uploaded file too,
     # which is the whole point of the privacy-preserving local mode.
     backend = load_backend()
-    key = request.form.get("key", "").strip()
+    key = load_api_key() if (backend == "cloud" or _translate_enabled) else ""
     language = request.form.get("language", "auto")
     if language not in ("auto", "zh", "en"):
         language = "auto"
 
     if backend == "cloud" and not key:
-        return jsonify({"ok": False, "error": "雲端模式需要 Groq 金鑰(或切到本機模式)"})
+        return jsonify({"ok": False, "error": "雲端模式需要 Groq 金鑰，或切換到本機模式。"})
 
     f = request.files.get("file")
     if not f:
-        return jsonify({"ok": False, "error": "No file"})
+        return jsonify({"ok": False, "error": "沒有收到檔案"})
 
     suffix = os.path.splitext(f.filename)[1] or ".wav"
     tmp = tempfile.NamedTemporaryFile(prefix="mt_", suffix=suffix, delete=False)
@@ -1162,28 +1588,39 @@ def route_upload():
     fname = f.filename
 
     def _do():
-        ts = datetime.now().strftime("%H:%M:%S")
-        _set_status(f"轉錄中:{fname} — 長檔可能需要幾分鐘…")
-        try:
-            vocab = load_vocab()
-            prompt = vocab
-            if language == "zh":
-                prompt = (vocab + " " + _BILINGUAL_PROMPT).strip()
-            if backend == "local":
-                text = _transcribe_file_local(tmp.name, language, prompt)
-            else:
-                text = _transcribe_file_cloud(tmp.name, fname, key, language, prompt)
+        vocab = load_vocab()
+        prompt = vocab
+        if language == "zh":
+            prompt = (vocab + " " + _BILINGUAL_PROMPT).strip()
+
+        def _on_segment(offset: float, text: str):
             # Same post-processing as the live path: strip non-speech markers /
             # stock fillers, collapse + trim repetition loops (a long file can
             # loop just like a live chunk), then apply vocab corrections.
             text = _drop_hallucinations((text or "").strip(), language)
+            if text and _is_loop_hallucination(text):
+                text = ""
             if text:
                 text = apply_vocab_corrections(_trim_repetition(_collapse_runs(text)))
+            if not text:
+                return
             tr = _maybe_translate(text, key) if text else ""
-            _append_line(text, tr=tr, tag=fname, ts=ts)
+            _append_line(text, tr=tr, tag=fname, ts=_fmt_offset(offset))
+
+        def _on_progress(done: int, total: int):
+            if total > 1:
+                _set_status(f"正在轉錄 {fname}（{min(done + 1, total)}/{total} 段）…" if done < total
+                            else f"{fname} 轉錄完成。")
+                _broadcast("upload_progress", {"done": done, "total": total})
+
+        _set_status(f"正在轉錄 {fname}，長檔可能需要幾分鐘…")
+        try:
+            transcribe_upload(tmp.name, fname, backend, key, language, prompt,
+                              _on_segment, _on_progress)
             _set_status("檔案轉錄完成。")
         except Exception as e:
-            _append_line(f"Upload error: {e}", tag=fname, ts=ts)
+            log.exception("upload transcription failed")
+            _append_line(f"⚠ 檔案轉錄失敗：{_friendly_error(e)}", tag="dropped", ts="00:00:00")
             _set_status("檔案轉錄失敗。")
         finally:
             os.unlink(tmp.name)
@@ -1202,6 +1639,33 @@ def route_clear():
         with _buf_lock:
             _lines.clear()
     _translate_ctx.clear()
+    clear_draft()
+    return jsonify({"ok": True})
+
+
+@app.route("/draft/restore", methods=["POST"])
+def route_draft_restore():
+    """Load the previous run's unsaved transcript back into the session."""
+    global _pending_draft
+    draft = _pending_draft
+    if not draft:
+        return jsonify({"ok": False, "error": "沒有可恢復的逐字稿"})
+    with _lifecycle_lock:
+        if _recording or _lines:
+            return jsonify({"ok": False, "error": "目前已有逐字稿，無法恢復"})
+        with _buf_lock:
+            _lines.extend(dict(l) for l in draft["lines"])
+    _pending_draft = None
+    save_draft()
+    return jsonify({"ok": True, "lines": _lines})
+
+
+@app.route("/draft/discard", methods=["POST"])
+def route_draft_discard():
+    global _pending_draft
+    _pending_draft = None
+    if not _lines:
+        clear_draft()
     return jsonify({"ok": True})
 
 
@@ -1222,6 +1686,7 @@ def route_line():
             _lines[idx]["text"] = str(data["text"])
         if "tr" in data:
             _lines[idx]["tr"] = str(data["tr"])
+    save_draft()
     return jsonify({"ok": True})
 
 
@@ -1258,7 +1723,7 @@ def route_language():
     if lang not in ("auto", "zh", "en"):
         return jsonify({"ok": False, "error": "bad language"})
     if _recording and _backend == "local" and lang != _language:
-        return jsonify({"ok": False, "error": "本機模式錄音中無法切換語言(需重新開始)"})
+        return jsonify({"ok": False, "error": "本機模式錄音中無法切換語言，請結束這場會議再切換。"})
     _language = lang
     return jsonify({"ok": True, "language": lang})
 
@@ -1276,15 +1741,60 @@ def route_vocab_post():
 
 
 def _model_status_payload() -> dict:
-    """Return per-model {alias: {downloaded: bool, path: str|None}}."""
+    """Per-model {alias: {downloaded, size}} plus the bundled model."""
     out = {}
-    for alias in MODEL_REGISTRY:
-        path = model_local_path(alias)
-        out[alias] = {
-            "downloaded": path is not None,
-            "path": path,
-        }
+    for alias, spec in MODEL_REGISTRY.items():
+        out[alias] = {"downloaded": model_local_path(alias) is not None, "size": spec["size"]}
+    out[BUNDLED_MODEL] = {"downloaded": bundled_model_path() is not None, "bundled": True}
     return out
+
+
+def start_model_download(alias: str) -> tuple[bool, str]:
+    """Start a background download of *alias* (no-op if it's already on disk).
+    Progress goes out as SSE 'download' events; completion re-broadcasts the
+    model table so the UI can say the better model is ready."""
+    if alias not in MODEL_REGISTRY:
+        return False, f"Unknown model: {alias}"
+    if model_local_path(alias):
+        return True, "already downloaded"
+    with _download_lock:
+        if _download_state["active"]:
+            return False, "已經有一個模型正在下載"
+        _download_state.update({"active": True, "percent": 0, "model": alias, "error": ""})
+    _broadcast("download", dict(_download_state))
+
+    def _on_progress(percent: int):
+        with _download_lock:
+            changed = percent != _download_state["percent"]
+            _download_state["percent"] = percent
+        if changed:
+            _broadcast("download", dict(_download_state))
+
+    def _do():
+        try:
+            download_model(alias, on_progress=_on_progress)
+            with _download_lock:
+                _download_state.update({"active": False, "percent": 100})
+        except Exception as e:
+            with _download_lock:
+                _download_state.update({"active": False, "error": str(e)})
+        _broadcast("download", dict(_download_state))
+        _broadcast("models", _model_status_payload())
+
+    threading.Thread(target=_do, daemon=True).start()
+    return True, "started"
+
+
+def auto_download_preferred_model():
+    """After onboarding (and on every launch after it), fetch the model the
+    current language wants if the user is on the local backend and it's
+    missing. A download interrupted by quitting resumes here."""
+    if not load_onboarding_completed() or load_backend() != "local":
+        return
+    wanted = pick_local_model(_language)
+    if model_local_path(wanted) is None:
+        ok, msg = start_model_download(wanted)
+        log.info("auto-download %s: %s", wanted, msg)
 
 
 @app.route("/backend", methods=["GET"])
@@ -1301,7 +1811,7 @@ def route_backend_get():
 def route_backend_post():
     backend = (request.json or {}).get("backend", "cloud")
     if backend not in ("cloud", "local"):
-        return jsonify({"ok": False, "error": "Invalid backend"})
+        return jsonify({"ok": False, "error": "不支援的轉錄方式"})
     save_backend(backend)
     return jsonify({"ok": True, "backend": backend})
 
@@ -1321,40 +1831,15 @@ def route_translate():
 @app.route("/onboarding/complete", methods=["POST"])
 def route_onboarding_complete():
     save_onboarding_completed(True)
+    auto_download_preferred_model()
     return jsonify({"ok": True})
 
 
 @app.route("/model/download", methods=["POST"])
 def route_model_download():
-    """Kick off a background HF Hub download. Progress is exposed via /backend
-    (the SSE stream also broadcasts 'download' events)."""
-    alias = (request.json or {}).get("model", "")
-    if alias not in MODEL_REGISTRY:
-        return jsonify({"ok": False, "error": f"Unknown model: {alias}"})
-    with _download_lock:
-        if _download_state["active"]:
-            return jsonify({"ok": False, "error": "Another download in progress"})
-        _download_state.update({"active": True, "percent": 0, "model": alias, "error": ""})
-
-    def _on_progress(percent: int):
-        with _download_lock:
-            _download_state["percent"] = percent
-        _broadcast("download", dict(_download_state))
-
-    def _do():
-        try:
-            download_model(alias, on_progress=_on_progress)
-            with _download_lock:
-                _download_state.update({"active": False, "percent": 100})
-            _broadcast("download", dict(_download_state))
-            _broadcast("models", _model_status_payload())
-        except Exception as e:
-            with _download_lock:
-                _download_state.update({"active": False, "error": str(e)})
-            _broadcast("download", dict(_download_state))
-
-    threading.Thread(target=_do, daemon=True).start()
-    return jsonify({"ok": True})
+    """Manually start a model download (Settings). Progress: SSE 'download'."""
+    ok, msg = start_model_download((request.json or {}).get("model", ""))
+    return jsonify({"ok": ok, "error": "" if ok else msg})
 
 
 @app.route("/debug")
@@ -1384,10 +1869,19 @@ def route_debug():
 
 @app.route("/transcript")
 def route_transcript():
-    content = "\n".join(_format_line(l) for l in _lines)
-    fname = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    fmt = load_export_format()
+    content = format_transcript(_lines, fmt)
+    save_draft(saved=True)
+    fname = f"逐字稿_{datetime.now().strftime('%Y%m%d_%H%M')}.{fmt}"
     buf = io.BytesIO(content.encode("utf-8"))
-    return send_file(buf, as_attachment=True, download_name=fname, mimetype="text/plain")
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype="text/markdown" if fmt == "md" else "text/plain")
+
+
+@app.route("/export_format", methods=["POST"])
+def route_export_format():
+    save_export_format((request.json or {}).get("format", "txt"))
+    return jsonify({"ok": True, "format": load_export_format()})
 
 
 # ─── Audio threads ────────────────────────────────────────────────────────────
@@ -1467,15 +1961,21 @@ def _watch_sys_stderr(proc, ready: threading.Event):
             return
 
 
-def _screen_capture_granted() -> bool:
-    """Preflight the screen-recording grant WITHOUT triggering a prompt. Used to
-    decide whether to even arm the mic-alignment gate — if system audio can't be
-    captured, mic must record from t=0 (mic-only fallback)."""
+def _system_audio_permission() -> str:
+    """Ask the capture helper for the system-audio grant WITHOUT prompting.
+    Returns "authorized" | "denied" | "unknown" (never asked yet).
+
+    The helper, not this process, does the check: TCC attributes it to its
+    responsible process (this app), and the check lives next to the code that
+    actually opens the Core Audio tap."""
+    if not os.path.exists(BINARY):
+        return "unknown"
     try:
-        from Quartz import CGPreflightScreenCaptureAccess
-        return bool(CGPreflightScreenCaptureAccess())
-    except Exception:
-        return True  # can't tell → assume granted; the grace deadline still backstops
+        out = subprocess.run([BINARY, "--preflight"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    return out if out in ("authorized", "denied", "unknown") else "unknown"
 
 
 def _sys_capture_supervisor():
@@ -1505,7 +2005,7 @@ def _sys_capture_supervisor():
         except Exception as e:
             _sys_ready.set()  # mic-only fallback: open the mic gate immediately
             _broadcast("sys_audio", {"ok": False, "msg": f"spawn failed: {e}"})
-            _set_status("⚠ 系統音擷取程式啟動失敗,僅麥克風錄音中")
+            _set_status("⚠ 無法錄製電腦的聲音，目前只錄麥克風。")
             return
         _swift_proc = proc
         ready = threading.Event()
@@ -1527,13 +2027,13 @@ def _sys_capture_supervisor():
         if fails > MAX_SYS_RECONNECT:
             _sys_ready.set()  # give up on system audio → don't keep withholding mic
             _broadcast("sys_audio", {"ok": False, "msg": "system audio stopped"})
-            _set_status("⚠ 系統音抓不到 — 系統設定 → 隱私權 → 螢幕錄製 找到 Meeting Transcriber 並開啟")
+            _set_status("⚠ 錄不到電腦的聲音，目前只錄麥克風。")
             return
         # A transient stream stop self-heals on the next spawn (usually < 1s).
         # Don't raise the red "擷取失敗" banner for that — it flashes and
         # vanishes, which only alarms the user. Use the low-key status line;
         # the banner is reserved for the genuine give-up case (fails > MAX).
-        _set_status("系統音短暫中斷,重新連線中…")
+        _set_status("電腦音訊短暫中斷，重新連線中…")
         time.sleep(min(2 ** fails, 8) if fails else 1)
 
 
@@ -1641,7 +2141,7 @@ def _should_trigger(buf_len: int) -> tuple[bool, str]:
 
 def _is_pause_boundary(audio: np.ndarray) -> bool:
     """Check whether the tail of *audio* is silent and the body had speech —
-    indicating a natural sentence boundary (lazy-take-notes' VAD heuristic)."""
+    indicating a natural sentence boundary (idea from lazy-take-notes)."""
     pause_samples = int(SAMPLE_RATE * PAUSE_DURATION)
     if len(audio) < pause_samples + int(SAMPLE_RATE * MIN_SPEECH):
         return False
@@ -2034,12 +2534,12 @@ def _queue_chunk(mixed: np.ndarray, reason: str, drop_label: str):
     except queue.Full:
         secs = max(1, round(len(mixed) / SAMPLE_RATE))
         print(f"WARN: transcribe queue full, dropping {drop_label} (~{secs}s)", file=sys.stderr)
-        _append_line(f"⚠ 略過約 {secs} 秒音訊 — 轉錄跟不上錄音速度", tag="dropped")
-        _set_status("⚠ Transcribe 跟不上速度,跳過一段")
+        _append_line(f"⚠ 略過約 {secs} 秒音訊：轉錄跟不上錄音速度", tag="dropped")
+        _set_status("⚠ 轉錄跟不上速度，跳過一段")
 
 
 def _chunk_worker(api_key: str):
-    """Silence-aware chunk loop (ported from lazy-take-notes).
+    """Silence-aware chunk loop (approach inspired by lazy-take-notes).
 
     Triggers on either CHUNK_DURATION (hard cap) or PAUSE_DURATION of tail
     silence (natural sentence boundary). Pushes chunks to `_transcribe_queue`
@@ -2237,7 +2737,7 @@ def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
         # leave a faint hint so the user knows audio was skipped rather than
         # assuming silence — instead of silently swallowing a quiet speaker.
         if weak and _recording:
-            _set_status("· 偵測到微弱聲音,未轉錄")
+            _set_status("偵測到微弱聲音，未轉錄")
         else:
             _restore_idle_status()
 
@@ -2264,7 +2764,7 @@ def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
     ts = datetime.now().strftime("%H:%M:%S")
     _transcribing = True
     _broadcast("transcribing", True)
-    _set_status(f"Transcribing [{ts}]…")
+    _set_status("轉錄中…")
 
     vocab = load_vocab()
     prompt = _build_prompt(vocab)
@@ -2298,12 +2798,28 @@ def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
                 if not (_is_repetition_loop(collapsed) or _has_runaway_repeat(text)):
                     _update_prompt_chain(_strip_speaker_labels(cleaned))
     except Exception as e:
-        _append_line(f"Error: {e}", ts=ts)
+        log.exception("chunk transcription failed")
+        _append_line(f"⚠ 這一段轉錄失敗：{_friendly_error(e)}", tag="dropped", ts=ts)
     finally:
         _transcribing = False
         _broadcast("transcribing", False)
 
     _restore_idle_status()
+
+
+def _friendly_error(e: Exception) -> str:
+    """Short, user-language reason for a failed chunk (details go to the log)."""
+    msg = str(e)
+    low = msg.lower()
+    if "401" in msg or "invalid api key" in low:
+        return "Groq 金鑰無效"
+    if "429" in msg or "rate limit" in low:
+        return "Groq 用量暫時達到上限，稍後會恢復"
+    if "timeout" in low:
+        return "處理逾時"
+    if "connection" in low or "network" in low:
+        return "網路連線問題"
+    return msg[:80]
 
 
 def _restore_idle_status():
@@ -2354,37 +2870,177 @@ def _transcribe_local(audio: np.ndarray, prompt: str) -> str:
 # Distinct from the streaming `_transcribe_*` helpers above: those take a numpy
 # chunk from the live recording loop, these take an uploaded file on disk.
 
-def _transcribe_file_cloud(path: str, fname: str, api_key: str,
-                           language: str, prompt: str) -> str:
-    """Cloud upload — hand the original file straight to Groq, which accepts
-    common audio/video containers, so no local decode is needed. Uses the
-    higher-accuracy non-turbo large-v3 (batch/offline → no latency cost)."""
+# Groq rejects uploads above its per-file limit (25 MB on the free tier).
+# Anything bigger is decoded and sent as ~10-minute 16 kHz mono WAV pieces
+# (10 min ≈ 19 MB), which also keeps local transcription memory-bounded and
+# lets the UI show progress on long recordings.
+UPLOAD_DIRECT_MAX_BYTES = 24 * 1024 * 1024
+UPLOAD_SEGMENT_SECONDS = 600
+UPLOAD_CUT_SEARCH_SECONDS = 15  # look this far back for a quiet cut point
+_FFMPEG_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def _find_ffmpeg() -> Optional[str]:
+    import shutil
+    return shutil.which("ffmpeg") or next(
+        (os.path.join(d, "ffmpeg") for d in _FFMPEG_DIRS if os.path.exists(os.path.join(d, "ffmpeg"))),
+        None)
+
+
+def decode_to_wav16k(src: str) -> str:
+    """Decode any common audio/video file to a temp 16 kHz mono 16-bit WAV.
+    macOS's built-in afconvert covers mp3 / m4a / aac / wav / aiff / caf /
+    flac / mp4 / mov; ffmpeg (if the user happens to have it) covers the
+    rest (webm, ogg, mkv…). Caller deletes the returned file."""
+    out = tempfile.NamedTemporaryFile(prefix="mt_", suffix=".wav", delete=False).name
+    try:
+        r = subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", src, out],
+                           capture_output=True, timeout=1800)
+        if r.returncode == 0 and os.path.getsize(out) > 44:
+            return out
+        ff = _find_ffmpeg()
+        if ff:
+            r = subprocess.run([ff, "-nostdin", "-y", "-i", src, "-ac", "1", "-ar", "16000",
+                                "-c:a", "pcm_s16le", "-f", "wav", out],
+                               capture_output=True, timeout=1800)
+            if r.returncode == 0 and os.path.getsize(out) > 44:
+                return out
+        raise RuntimeError("無法讀取這個檔案。支援 mp3、m4a、wav、aiff、flac、mp4、mov 等常見格式。")
+    except Exception:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        raise
+
+
+def iter_wav_segments(wav_path: str, seg_seconds: float = UPLOAD_SEGMENT_SECONDS):
+    """Yield (start_seconds, float32 audio) pieces of a 16 kHz mono WAV,
+    reading it incrementally. Each cut lands on the quietest 100 ms frame in
+    the last UPLOAD_CUT_SEARCH_SECONDS of the piece, so words aren't split."""
+    frame = int(SAMPLE_RATE * 0.1)
+    seg = int(seg_seconds * SAMPLE_RATE)
+    search = min(int(UPLOAD_CUT_SEARCH_SECONDS * SAMPLE_RATE), seg // 2)
+    search -= search % frame
+    with wave.open(wav_path, "rb") as w:
+        buf = np.zeros(0, dtype=np.int16)
+        start = 0  # samples consumed so far
+        while True:
+            need = seg - len(buf)
+            if need > 0:
+                raw = w.readframes(need)
+                buf = np.concatenate([buf, np.frombuffer(raw, dtype=np.int16)])
+            if len(buf) < seg:  # end of file
+                if len(buf) > SAMPLE_RATE // 2:
+                    yield start / SAMPLE_RATE, buf.astype(np.float32) / 32768.0
+                return
+            region = buf[seg - search: seg].astype(np.float32)
+            nf = len(region) // frame
+            rms = np.sqrt(np.mean(region[: nf * frame].reshape(nf, frame) ** 2, axis=1))
+            cut = seg - search + int(np.argmin(rms)) * frame
+            yield start / SAMPLE_RATE, buf[:cut].astype(np.float32) / 32768.0
+            start += cut
+            buf = buf[cut:]
+
+
+def wav_duration(wav_path: str) -> float:
+    with wave.open(wav_path, "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+
+def _fmt_offset(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def _groq_transcribe_file(fileobj, fname: str, api_key: str, language: str, prompt: str) -> str:
     kw: dict = dict(model=CLOUD_MODEL_BATCH)
     if language != "auto":
         kw["language"] = language
     if prompt:
         kw["prompt"] = prompt
-    with open(path, "rb") as af:
-        kw["file"] = (fname, af)
-        result = Groq(api_key=api_key).audio.transcriptions.create(**kw)
-    return result.text
+    kw["file"] = (fname, fileobj)
+    return Groq(api_key=api_key).audio.transcriptions.create(**kw).text
 
 
-def _transcribe_file_local(path: str, language: str, prompt: str) -> str:
-    """Local upload — decode the file to mono-16k numpy (pywhispercpp's static
-    loader: WAV natively, other formats via ffmpeg) then run it through the
-    same app-scoped whisper subprocess used for live recording."""
-    alias = pick_local_model(language)
-    model_path = model_local_path(alias)
-    if model_path is None:
-        raise RuntimeError(f"本機模型尚未下載:{alias}")
-    from pywhispercpp.model import Model
-    audio = Model._load_audio(path)
-    worker = _ensure_local_worker(model_path)
-    return worker.transcribe(audio, language, prompt)
+def _wav_bytes(audio: np.ndarray) -> bytes:
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+    return bio.getvalue()
+
+
+def transcribe_upload(path: str, fname: str, backend: str, api_key: str, language: str,
+                      base_prompt: str, on_segment, on_progress):
+    """Transcribe an uploaded file, calling on_segment(offset_seconds, text)
+    per piece and on_progress(done, total) as it goes.
+
+    Cloud + small file: the original file goes straight to Groq (it accepts
+    audio/video containers; nothing to decode). Everything else is decoded
+    and transcribed in pieces, each primed with the tail of the previous
+    piece's text for continuity."""
+    if backend == "cloud" and os.path.getsize(path) <= UPLOAD_DIRECT_MAX_BYTES:
+        on_progress(0, 1)
+        with open(path, "rb") as f:
+            on_segment(0.0, _groq_transcribe_file(f, fname, api_key, language, base_prompt))
+        on_progress(1, 1)
+        return
+
+    wav = decode_to_wav16k(path)
+    try:
+        total = max(1, int(np.ceil(wav_duration(wav) / UPLOAD_SEGMENT_SECONDS)))
+        worker = None
+        if backend == "local":
+            _, model_path = resolve_local_model(language)
+            if model_path is None:
+                raise RuntimeError("找不到語音模型，請重新安裝 App。")
+            worker = _ensure_local_worker(model_path)
+        prev_tail = ""
+        on_progress(0, total)
+        for i, (offset, audio) in enumerate(iter_wav_segments(wav, UPLOAD_SEGMENT_SECONDS), start=1):
+            prompt = (base_prompt + (" " + prev_tail if prev_tail else "")).strip()[-PROMPT_MAX_CHARS:]
+            if worker is not None:
+                text = worker.transcribe(audio, language, prompt)
+            else:
+                text = _groq_transcribe_file(io.BytesIO(_wav_bytes(audio)), "segment.wav",
+                                             api_key, language, prompt)
+            on_segment(offset, text)
+            if text:
+                prev_tail = text.strip()[-PROMPT_CHAIN_CHARS:]
+            on_progress(i, max(total, i))
+    finally:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
+
+# Strings pywebview draws natively (menus, the quit confirmation).
+UI_LOCALIZATION = {
+    "global.quitConfirmation": "正在錄音。結束 App 會停止錄音，已轉出的逐字稿會自動保留，下次開啟可以恢復。確定要結束嗎？",
+    "global.ok": "好",
+    "global.quit": "結束",
+    "global.cancel": "繼續錄音",
+    "global.saveFile": "儲存檔案",
+    "cocoa.menu.about": "關於",
+    "cocoa.menu.services": "服務",
+    "cocoa.menu.view": "顯示方式",
+    "cocoa.menu.edit": "編輯",
+    "cocoa.menu.hide": "隱藏",
+    "cocoa.menu.hideOthers": "隱藏其他",
+    "cocoa.menu.showAll": "全部顯示",
+    "cocoa.menu.quit": "結束",
+    "cocoa.menu.fullscreen": "進入全螢幕",
+    "cocoa.menu.cut": "剪下",
+    "cocoa.menu.copy": "拷貝",
+    "cocoa.menu.paste": "貼上",
+    "cocoa.menu.selectAll": "全選",
+}
 
 if __name__ == "__main__":
     # MUST be first — under py2app's frozen bundle, spawn re-enters the entry
@@ -2396,9 +3052,11 @@ if __name__ == "__main__":
 
     import webview
 
+    setup_logging()
+    threading.Thread(target=preload_api_key, daemon=True).start()
+    _pending_draft = load_draft()
     cleanup_orphan_tempfiles()
     reap_orphan_audio_taps()
-    handle_version_change()
     _translate_enabled = load_translate()  # restore the toggle from config
 
     # Belt-and-braces shutdown hook: if the user force-quits, closes the
@@ -2420,44 +3078,26 @@ if __name__ == "__main__":
     class JSAPI:
         """Bridge exposed to the webview JS as `window.pywebview.api`."""
 
-        def trigger_screen_capture_permission(self):
-            """Spawn the audio binary so macOS surfaces the screen-recording
-            dialog, and keep it alive long enough for the user to read +
-            click "Open System Settings" / "Allow".
-
-            Earlier 1.5s timeout was too short — the binary would terminate
-            before the user could respond, and the entry never got added to
-            System Settings. We spawn in a background thread and let it run
-            up to 20s, returning immediately so the JS API call doesn't
-            block the UI. Polling picks up the grant state separately."""
+        def request_system_audio_permission(self):
+            """Show macOS's "System Audio Recording" prompt (first time only;
+            once decided, macOS won't ask again and the user changes it in
+            System Settings). Runs in the background because the helper waits
+            for the user's answer; the UI polls check_system_audio_permission."""
             if not os.path.exists(BINARY):
-                return {"ok": False, "error": "音訊擷取程式找不到 — bundle 可能損壞"}
+                return {"ok": False, "error": "找不到音訊擷取元件，請重新安裝 App。"}
 
-            def _probe():
+            def _request():
                 try:
-                    proc = subprocess.Popen(
-                        [BINARY], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                    )
-                    # Live up to 20s. Exit early if the binary self-terminates
-                    # (e.g. ScreenCaptureKit threw immediately because TCC said
-                    # no after user declined).
-                    for _ in range(200):
-                        time.sleep(0.1)
-                        if proc.poll() is not None:
-                            break
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                    subprocess.run([BINARY, "--request"], capture_output=True, timeout=180)
                 except Exception as e:
-                    print(f"NOTE: permission probe error: {e}", file=sys.stderr)
+                    print(f"NOTE: system audio permission request failed: {e}", file=sys.stderr)
 
-            threading.Thread(target=_probe, daemon=True).start()
+            threading.Thread(target=_request, daemon=True).start()
             return {"ok": True}
 
-        def open_screen_recording_settings(self):
-            """Open System Settings → Privacy → Screen Recording directly."""
+        def open_system_audio_settings(self):
+            """Open System Settings at the recording-permissions pane (it holds
+            the "System Audio Recording Only" list)."""
             try:
                 subprocess.Popen([
                     "open",
@@ -2467,56 +3107,27 @@ if __name__ == "__main__":
             except Exception as e:
                 return {"ok": False, "error": str(e)}
 
-        def reset_and_request_permission(self):
-            """Trigger fresh macOS permission prompts.
+        def open_microphone_settings(self):
+            try:
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+                ])
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
 
-            On the first click after an app version change, also `tccutil
-            reset` stale entries from the previous build's signature —
-            without that step macOS may silently apply the stale grant to
-            our new hash and ScreenCaptureKit will still fail. The version
-            gate (`first_perm_trigger_done`) ensures we only reset once per
-            version, so repeat clicks don't wipe a grant the user just
-            earned."""
-            cfg = _read_config()
-            if not cfg.get("first_perm_trigger_done", False):
-                for service in ("ScreenCapture", "Microphone"):
-                    try:
-                        subprocess.run(
-                            ["tccutil", "reset", service, "com.kylehsia.meeting-transcriber"],
-                            check=False, timeout=5, capture_output=True,
-                        )
-                    except Exception as e:
-                        print(f"NOTE: tccutil reset {service} failed: {e}", file=sys.stderr)
-                cfg["first_perm_trigger_done"] = True
-                _write_config(cfg)
-
-            screen_result = self.trigger_screen_capture_permission()
-
-            # Mic prompt — use AVFoundation's dedicated permission-request API
-            # rather than implicitly via sd.InputStream. More reliable
-            # because we don't have to keep a mic stream open + the API
-            # is purpose-built for this prompt.
-            def _trigger_mic_prompt():
-                try:
-                    from AVFoundation import AVCaptureDevice
-                    AVCaptureDevice.requestAccessForMediaType_completionHandler_(
-                        "soun", lambda granted: None,
-                    )
-                except Exception as e:
-                    print(f"NOTE: mic prompt trigger failed: {e}", file=sys.stderr)
-
-            threading.Thread(target=_trigger_mic_prompt, daemon=True).start()
-            return screen_result
-
-        def dismiss_revalidation(self):
-            """Persistent escape hatch — user knows they have permissions even
-            if our detection is reporting a false-negative. Persists a config
-            flag (kept for forward-compat; the frontend also stops surfacing
-            the sys-audio warning for the rest of the session)."""
-            cfg = _read_config()
-            cfg["revalidation_dismissed"] = True
-            _write_config(cfg)
+        def reveal_logs(self):
+            """Show the log folder in Finder (Settings → 顯示記錄檔)."""
+            os.makedirs(LOG_DIR, exist_ok=True)
+            target = LOG_FILE if os.path.exists(LOG_FILE) else LOG_DIR
+            subprocess.Popen(["open", "-R", target])
             return {"ok": True}
+
+        def check_system_audio_permission(self):
+            """Current system-audio grant, without prompting."""
+            status = _system_audio_permission()
+            return {"ok": True, "granted": status == "authorized", "status": status}
 
         def check_microphone_permission(self):
             """Return current microphone authorisation status without
@@ -2569,68 +3180,111 @@ if __name__ == "__main__":
                 _mic_test_stream = None
             return {"ok": True}
 
-        def check_screen_capture_permission(self):
-            """Query the current screen-capture permission state without
-            triggering the permission dialog. Used by the onboarding modal to
-            poll for completion after the user grants access in System Settings.
-
-            Uses Quartz's `CGPreflightScreenCaptureAccess` — a documented
-            preflight API that returns the current grant state without
-            requesting it. Screen recording + system audio share the same
-            TCC service (`kTCCServiceScreenCapture`), so this is accurate
-            for our case.
-            """
-            try:
-                from Quartz import CGPreflightScreenCaptureAccess
-                granted = bool(CGPreflightScreenCaptureAccess())
-                return {"ok": True, "granted": granted}
-            except Exception as e:
-                return {"ok": False, "granted": False, "error": str(e)}
-
         def save_transcript(self):
-            """Show native macOS save dialog and write transcript to chosen path."""
+            """Native save dialog. Format follows the extension the user ends
+            up with (.md → Markdown, anything else → plain text); the default
+            name uses the format chosen in Settings."""
             if not _lines:
-                return {"ok": False, "error": "Nothing to save"}
-            default_name = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                return {"ok": False, "error": "沒有內容可以儲存"}
+            fmt = load_export_format()
+            default_name = f"逐字稿_{datetime.now().strftime('%Y%m%d_%H%M')}.{fmt}"
             win = webview.windows[0] if webview.windows else None
             if not win:
-                return {"ok": False, "error": "Window not ready"}
-            result = win.create_file_dialog(
-                webview.SAVE_DIALOG,
-                save_filename=default_name,
-            )
+                return {"ok": False, "error": "視窗尚未就緒，請稍後再試"}
+            result = win.create_file_dialog(webview.SAVE_DIALOG, save_filename=default_name)
             if not result:
                 return {"ok": False, "cancelled": True}
             path = result if isinstance(result, str) else result[0]
+            out_fmt = "md" if path.lower().endswith((".md", ".markdown")) else "txt"
             try:
                 with open(path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(_format_line(l) for l in _lines))
+                    f.write(format_transcript(_lines, out_fmt))
+                save_draft(saved=True)
                 return {"ok": True, "path": path}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
 
-    # Flask runs in a daemon thread; dies automatically when the window closes
-    threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False, debug=False),
-        daemon=True,
-    ).start()
-    time.sleep(0.6)  # let Flask start before opening the window
+    # Bind to a free port chosen by the OS. A fixed port failed outright when
+    # something else held it (blank window), and a second copy of the app
+    # would silently talk to the first one's server. make_server() returns
+    # with the socket already listening, so the window can open immediately:
+    # no sleep-and-hope.
+    from werkzeug.serving import make_server
+    _server = make_server("127.0.0.1", int(os.environ.get("MT_PORT", "0")), app, threaded=True)
+    PORT = _server.server_port
+    log.info("serving on 127.0.0.1:%d", PORT)
+    # Daemon thread: dies with the process when the window closes.
+    threading.Thread(target=_server.serve_forever, daemon=True).start()
+    auto_download_preferred_model()
+    threading.Thread(target=check_for_update, daemon=True).start()
 
     window = webview.create_window(
-        "Meeting Transcriber",
-        f"http://localhost:{PORT}",
+        APP_NAME,
+        f"http://localhost:{PORT}/?t={SESSION_TOKEN}",
         width=1000,
         height=680,
         min_size=(720, 440),
         js_api=JSAPI(),
     )
-    # NOTE: no `events.closing` handler. Opening a native confirmation dialog
-    # from inside pywebview's closing callback re-enters the GUI event loop and
-    # deadlocks the app on ⌘Q ("not responding"). atexit (_shutdown_cleanup)
-    # still reaps the Swift binary + whisper subprocess on quit. If a
-    # close-confirmation is wanted later, use create_window(confirm_close=True)
-    # (pywebview's built-in, which handles this safely) rather than a custom
-    # closing handler that opens a dialog.
+    _main_window = window
 
-    webview.start()
+    # ── Native menus + keyboard shortcuts ──
+    # pywebview's MenuAction has no shortcut support, so the key equivalents
+    # are attached to the NSMenuItems after the menu bar exists (see
+    # _install_shortcuts). Each action just forwards to the page, which
+    # decides whether the action is allowed in the current state.
+    from webview.menu import Menu, MenuAction, MenuSeparator
+
+    def _page(action: str):
+        try:
+            window.evaluate_js(f"onMenu({json.dumps(action)})")
+        except Exception as e:
+            log.warning("menu action %s failed: %s", action, e)
+
+    def menu_settings(): _page("settings")
+    def menu_new(): _page("new")
+    def menu_save(): _page("save")
+    def menu_upload(): _page("upload")
+    def menu_record(): _page("record")
+
+    SHORTCUTS = {  # menu title → key (⌘ + key)
+        "設定…": ",",
+        "新會議": "n",
+        "儲存逐字稿…": "s",
+        "上傳錄音檔…": "o",
+    }
+    app_menus = [
+        Menu("__app__", [MenuAction("設定…", menu_settings)]),
+        Menu("檔案", [
+            MenuAction("新會議", menu_new),
+            MenuAction("儲存逐字稿…", menu_save),
+            MenuSeparator(),
+            MenuAction("上傳錄音檔…", menu_upload),
+        ]),
+        Menu("錄音", [MenuAction("開始／暫停錄音（空白鍵）", menu_record)]),
+    ]
+
+    def _install_shortcuts():
+        window.events.shown.wait(15)
+        try:
+            import AppKit
+            from PyObjCTools import AppHelper
+
+            def _assign():
+                def walk(menu):
+                    for item in menu.itemArray():
+                        key = SHORTCUTS.get(str(item.title()))
+                        if key:
+                            item.setKeyEquivalent_(key)
+                            item.setKeyEquivalentModifierMask_(AppKit.NSEventModifierFlagCommand)
+                        if item.hasSubmenu():
+                            walk(item.submenu())
+                main = AppKit.NSApp.mainMenu()
+                if main is not None:
+                    walk(main)
+            AppHelper.callAfter(_assign)
+        except Exception as e:
+            log.warning("could not install menu shortcuts: %s", e)
+
+    webview.start(_install_shortcuts, localization=UI_LOCALIZATION, menu=app_menus)
     # webview.start() blocks until window is closed — process exits cleanly

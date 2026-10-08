@@ -10,3 +10,6 @@ build/
 dist/
 *.egg-info/
 icon.icns
+build-cache/
+.draft.json
+.draft.json.tmp

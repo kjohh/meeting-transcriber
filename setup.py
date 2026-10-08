@@ -8,8 +8,10 @@ Output:
     dist/Meeting Transcriber.app
 
 Notes:
-- Models are NOT bundled. First-launch onboarding downloads them via
-  pywhispercpp into ~/Library/Application Support/pywhispercpp/models/.
+- One small model (build-cache/ggml-small-q5_1.bin, fetched + checksummed by
+  scripts/build-app.sh) is bundled under Contents/Resources/models/ so local
+  transcription works with zero download. The larger models are downloaded
+  in the background into ~/Library/Application Support/pywhispercpp/models/.
 - Config/vocab live in ~/Library/Application Support/Meeting Transcriber/
   when running from the bundle.
 - The Swift coreaudio_tap binary is bundled under Contents/Resources/native/.
@@ -28,9 +30,17 @@ if not _m:
     raise SystemExit("setup.py: could not find APP_VERSION in app.py")
 APP_VERSION = _m.group(1)
 
+# The bundle identifier is what macOS TCC keys permissions on. Once the first
+# notarized build ships it must never change (users would have to re-grant
+# microphone + system audio). Settle the product name first.
+BUNDLE_ID = "com.kylehsia.meeting-transcriber"
+APP_NAME = "Meeting Transcriber"
+
 DATA_FILES = [
     ("static", ["static/index.html"]),
     ("native/.build/release", ["native/.build/release/coreaudio_tap"]),
+    ("models", ["build-cache/ggml-small-q5_1.bin"]),
+    ("", ["THIRD_PARTY_NOTICES.md"]),
 ]
 
 OPTIONS = {
@@ -44,13 +54,12 @@ OPTIONS = {
         "pywhispercpp",
         "pywhispercpp.model",
         "pywhispercpp.constants",
-        "huggingface_hub",
         "sounddevice",
         "numpy",
         "flask",
         "groq",
-        "Quartz",
         "AVFoundation",
+        "Security",
     ],
     # Packages listed here are extracted as plain directories instead of being
     # zipped into python313.zip. Required for any package shipping dylibs
@@ -60,7 +69,6 @@ OPTIONS = {
         "pywhispercpp",
         "sounddevice",
         "_sounddevice_data",
-        "huggingface_hub",
         "groq",
         "flask",
         "werkzeug",
@@ -82,18 +90,28 @@ OPTIONS = {
         "scipy",
         "pytest",
         "PIL",
+        # Build tooling, never imported at runtime. Excluding it also keeps
+        # its vendored packages (one of them LGPL-3.0) out of the bundle.
+        "setuptools",
+        "pkg_resources",
+        "wheel",
     ],
     "plist": {
-        "CFBundleName": "Meeting Transcriber",
-        "CFBundleDisplayName": "Meeting Transcriber",
-        "CFBundleIdentifier": "com.kylehsia.meeting-transcriber",
+        "CFBundleName": APP_NAME,
+        "CFBundleDisplayName": APP_NAME,
+        "CFBundleIdentifier": BUNDLE_ID,
         "CFBundleVersion": APP_VERSION,
         "CFBundleShortVersionString": APP_VERSION,
+        "CFBundleDevelopmentRegion": "zh_TW",
         "NSMicrophoneUsageDescription":
-            "Meeting Transcriber needs microphone access to transcribe your voice during meetings.",
-        "NSScreenCaptureDescription":
-            "Meeting Transcriber needs screen recording permission to capture system audio (the remote side of online meetings).",
-        "LSMinimumSystemVersion": "13.0",
+            "用來把你說的話轉成逐字稿。錄音只在你按下開始後進行。",
+        # Core Audio process tap (macOS 14.4+): "System Audio Recording Only".
+        # Replaces the old Screen Recording permission; the screen is never read.
+        "NSAudioCaptureUsageDescription":
+            "用來擷取電腦播放的聲音（例如線上會議中對方的聲音），轉成逐字稿。不會讀取你的畫面。",
+        "LSMinimumSystemVersion": "14.4",
+        # Apple Silicon only: local transcription is too slow on Intel to be usable.
+        "LSArchitecturePriority": ["arm64"],
         "LSUIElement": False,
         "NSHighResolutionCapable": True,
     },

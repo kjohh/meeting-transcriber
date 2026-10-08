@@ -1,4 +1,4 @@
-# Claude Guidelines — Meeting Transcriber
+# Codex Guidelines — Meeting Transcriber
 
 個人用會議逐字稿工具。使用者介紹 / 安裝在 `README.md`。本檔聚焦 AI 進入此 repo 該知道的架構決策、設計理由、踩過的坑。
 
@@ -19,20 +19,13 @@ app.py                                     ← Flask + pywebview entry，所有�
 static/index.html                          ← 前端單檔（含 CSS / JS）
 setup.py                                   ← py2app 打包設定
 requirements.txt                           ← Python deps
-native/Sources/coreaudio_tap/main.swift    ← Core Audio process tap 系統音擷取（+ --preflight / --request 權限查詢）
+native/Sources/coreaudio_tap/main.swift    ← ScreenCaptureKit 系統音擷取
 native/.build/release/coreaudio_tap        ← 編譯後的 binary（不進 git，但 py2app 會 bundle 進 .app）
-scripts/build-app.sh                       ← 完整 build：icon → 內建模型（checksum）→ Swift → py2app → sign-and-package
-scripts/sign-and-package.sh                ← 由內而外簽章 + hardened runtime；DEVELOPER_ID 時公證 + dmg
-entitlements.plist / entitlements-dev.plist ← release 最小集（麥克風）/ ad-hoc 開發版多 disable-library-validation
-THIRD_PARTY_NOTICES.md                     ← 第三方授權（App 內「設定 → 關於」顯示）
-tests/test_pure.py                         ← 純函式 unittest：python3.13 -m unittest discover -s tests
-build-cache/ggml-small-q5_1.bin            ← 內建基本模型（build 腳本下載 + SHA256 驗證，gitignored）
+scripts/build-app.sh                       ← 完整 build：icon → py2app → deep codesign → TCC reset → onboarding flag reset
 scripts/build-icon.sh                      ← 1024×1024 PNG → icon.icns (用 sips + iconutil)
 scripts/release.sh                         ← ditto-zip + gh release create 上傳到 GitHub Releases
 assets/icon.png                            ← 1024×1024 source icon
-~/Library/Logs/Meeting Transcriber/        ← app.log（rotating）+ whisper.log
-.draft.json                                ← 逐字稿自動存檔（同 .config.json 的目錄規則）
-.config.json                               ← backend + onboarding flag 等設定（Groq 金鑰在鑰匙圈，不在這裡）（git-ignored，source mode 在 project root；bundle mode 在 ~/Library/Application Support/Meeting Transcriber/）
+.config.json                               ← API key + backend + onboarding flag（git-ignored，source mode 在 project root；bundle mode 在 ~/Library/Application Support/Meeting Transcriber/）
 .vocab.local                               ← 自訂詞彙（git-ignored，同上規則）
 .vocab.local.example                       ← 詞彙範本
 dist/Meeting Transcriber.app               ← py2app 產出（git-ignored）
@@ -57,7 +50,7 @@ coreaudio_tap ─────┘                                                
 
 ### UI 為什麼是 Flask + pywebview，而非 tkinter
 
-macOS 系統 Python 的 Tk (8.5) 在 dark mode 下渲染全黑，故走 Flask + pywebview。Flask 在 daemon thread 啟動，pywebview 用 WKWebView 打開 `http://localhost:<隨機 port>/?t=<token>`，視窗關閉 = process 結束。pywebview 也提供 JS API bridge 讓前端能呼叫 native macOS API（權限查詢與請求 / 打開系統設定 / 存檔對話框 / 顯示記錄檔）。
+macOS 系統 Python 的 Tk (8.5) 在 dark mode 下渲染全黑，故走 Flask + pywebview。Flask 在 daemon thread 啟動，pywebview 用 WKWebView 打開 `http://localhost:8765`，視窗關閉 = process 結束。pywebview 也提供 JS API bridge 讓前端能呼叫 native macOS API（screen capture trigger / open settings / save file dialog）。
 
 ### Source mode vs bundle mode 的路徑分流
 
@@ -65,25 +58,9 @@ macOS 系統 Python 的 Tk (8.5) 在 dark mode 下渲染全黑，故走 Flask + 
 - `_resource_dir()` → bundle: `Contents/Resources/`，source: project root。用來找 Swift binary 跟 static/。
 - `_user_data_dir()` → bundle: `~/Library/Application Support/Meeting Transcriber/`，source: project root。用來寫 config / vocab（bundle 內部 read-only）。
 
-### 系統音：Core Audio process tap（macOS 14.4+）
+### 為什麼用 ScreenCaptureKit 而非 BlackHole
 
-原本用 ScreenCaptureKit，要「螢幕錄製」權限、macOS 15 起每月重問。改成 `CATapDescription` + private aggregate device，權限是「僅系統音訊錄製」（`NSAudioCaptureUsageDescription`），不讀畫面。Swift binary 把 float32 PCM 16kHz mono 從 stdout 噴出，stderr 協定 `READY` / `ERROR:`。預設輸出裝置換掉（接耳機、藍牙斷線）時 helper 以 exit 2 結束，由 `_sys_capture_supervisor` 重新 spawn。
-
-- 權限查詢走 TCC SPI（同 insidegui/AudioCap 做法），在 helper 內：`--preflight` 不跳視窗、`--request` 跳系統對話框。TCC 把 helper 歸屬到 responsible process（.app），所以從 terminal 直接跑 helper 會以 terminal 的身分查，測試要用 .app。
-- 沒權限時 tap 不報錯，只是沒資料（aggregate device 不會 running），所以 `/start` 先 preflight，denied 就直接顯示警示。
-- `stop()` 不能在 IO queue 上呼叫（`AudioDeviceStop` 會等 IOProc → deadlock），listener 用獨立 queue。
-
-### 本機轉錄子程序
-
-`LocalWhisperWorker` 用單一 process 的 `ProcessPoolExecutor`（spawn）。initializer 把 whisper.cpp 的 C 輸出導到 whisper.log、檢查 ggml magic 後載入模型；每段音訊是一個 task。逾時或子程序死掉就把 worker 標成失效，下次 `_ensure_local_worker` 重建。
-
-### 本機 API 保護
-
-Flask 綁隨機 port（`make_server(..., 0)`，不再 sleep 等啟動）。每次啟動產生 `SESSION_TOKEN`，視窗開 `/?t=<token>` 換成 HttpOnly + SameSite=Strict cookie，之後每個 request 都要帶。加上 Origin 檢查，網頁與本機其他程式都打不進來。log 會 redact token 與 `gsk_` 金鑰。debug 用瀏覽器開頁面時設 `MT_NO_TOKEN=1`。
-
-### 金鑰：macOS 鑰匙圈
-
-Groq 金鑰存 Keychain（generic password，service `Meeting Transcriber`），舊版 `.config.json` 裡的會自動搬過去並刪除。前端只拿 `has_key`。啟動時背景讀取（`preload_api_key`），因為 ad-hoc 重新 build 後簽章變了，讀鑰匙圈會跳「允許存取」視窗並卡住該 thread；Developer ID 簽章穩定就不會。
+ScreenCaptureKit 是 macOS 13+ 原生 API，不需安裝虛擬音訊裝置。Swift binary 把 float32 PCM 16kHz mono 從 stdout 噴出，Python 用 subprocess 讀。
 
 ### 為什麼是 silence-aware chunking 而非固定秒數
 
@@ -131,23 +108,13 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 
 關鍵限制:翻譯**一律走 Groq**(需金鑰),與 ASR backend 無關 —— 本機 ASR + 雲端翻譯仍會把文字上傳 Groq。Whisper 內建 translate 只能 X→英文,做不到英→中,所以走 LLM。延遲 = ASR + 翻譯,逐句非逐字。`_format_line` 統一 save/download 的雙語輸出格式。
 
-### 本機模型：內建小模型 + 背景下載
+### Backend 模型自動選擇
 
-`ggml-small-q5_1.bin`（190 MB）打包在 `Contents/Resources/models/`，所以本機模式裝好就能錄。`resolve_local_model(language)`：想要的模型（`zh` → `load_zh_model()`，預設 breeze-q8；`en` / `auto` → large-v3-turbo-q8_0）已下載就用它，否則用內建小模型。每次 `/start` 重新決定，所以下載完成後從下一場會議生效，錄音中途不換。onboarding 完成、每次啟動、切到本機或切語言時，`auto_download_preferred_model` / `ensureWantedModel` 會在背景下載缺的模型。
-
-下載（`download_model`）是自己寫的 HTTP Range 續傳（不用 huggingface_hub）：寫到 `<file>.part`，進度從磁碟上的位元組算，SHA256（HF 的 X-Linked-ETag）對了才改名就位，失敗重試 4 次。`model_local_path` 只做檔案大小檢查（完整 SHA256 只在下載完跑一次）。
+`pick_local_model(language)`：`zh` / `zh-en` → `breeze-q8`（Breeze ASR 25 繁中強化）；`en` / `auto` → `large-v3-turbo-q8_0`。UI 上 user 只選 backend (cloud/local) + language。
 
 ### 模型 cache 路徑
 
-`pywhispercpp.constants.MODELS_DIR` = `~/Library/Application Support/pywhispercpp/models/`。**與 lazy-take-notes 共用**。
-
-### 上傳檔案
-
-`decode_to_wav16k` 用 macOS 內建 `afconvert`（mp3/m4a/wav/aiff/flac/mp4/mov），失敗才找 ffmpeg（webm/ogg 等）。雲端且 ≤ 24 MB 直接傳原檔；其他情況切成約 10 分鐘一段（在最後 15 秒內最安靜的 100ms 切），逐段轉錄、帶上一段結尾當 prompt，時間戳是檔案內的位置（00:10:00）。
-
-### 逐字稿自動存檔 / 關閉確認
-
-每新增或編輯一行就原子寫入 `.draft.json`；使用者儲存後標成 saved。啟動時有未儲存草稿就詢問恢復或捨棄。錄音中關視窗：`_set_quit_guard` 切換 pywebview 的 `confirm_close`（它在關閉當下才讀），不要用 closing handler 開 dialog（會 deadlock）。
+`pywhispercpp.constants.MODELS_DIR` = `~/Library/Application Support/pywhispercpp/models/`。**與 lazy-take-notes 共用**。`model_local_path()` 會檢查多個可能路徑（lazy-take-notes 用 `whisper-cpp/`，pywhispercpp 直接 download 用 `hf/owner__repo/`）。
 
 ### 金鑰驗證
 
@@ -155,10 +122,10 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 
 ### Onboarding flow
 
-四步 wizard：歡迎 → 系統音訊＋麥克風權限（含 polling 偵測 + mic live waveform 測試）→ 選 backend（雲端有 inline key input）→ 完成。Flag 存 `.config.json` 的 `onboarding_completed`。Settings 內「重新看引導」可繞 flag 重跑。
+四步 wizard：歡迎 → 螢幕＋麥克風授權（含 polling 偵測 + mic live waveform 測試）→ 選 backend（雲端有 inline key input）→ 完成。Flag 存 `.config.json` 的 `onboarding_completed`。Settings 內「重新看引導」可繞 flag 重跑。
 
 權限偵測純查詢（不觸發系統 prompt）：
-- 系統音訊：`coreaudio_tap --preflight`（TCC SPI，在 helper 內查）
+- 螢幕：`Quartz.CGPreflightScreenCaptureAccess()`
 - 麥克風：`AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_('soun')`
 
 Mic 偵測 fallback：若 `_micTestRunning`（sd.InputStream 已成功開），即使 AVFoundation 回 not-granted 也視為已授權（stream 開得起來表示授權真的有）。
@@ -183,17 +150,17 @@ Mic 偵測 fallback：若 `_micTestRunning`（sd.InputStream 已成功開），�
 
 ### Flask 設定
 
-- 隨機 port（`MT_PORT` 可指定），threaded，daemon thread
+- Port 8765，`use_reloader=False`
+- Threaded mode，daemon thread
 
 ### Build / 簽章流程
 
-跑 `./scripts/build-app.sh`：icon → 內建模型（checksum）→ Swift helper → py2app → `sign-and-package.sh`。
-
-- 簽章由內而外逐一簽每個 Mach-O（dylib、.so、`MacOS/python`、Swift helper）→ Python.framework → app，全部開 hardened runtime。不用 `--deep`（公證會擋沒 runtime / timestamp 的巢狀 binary）。
-- `DEVELOPER_ID="Developer ID Application: …"` 時加 timestamp、用 `entitlements.plist`（只有麥克風）；再設 `NOTARY_PROFILE`（`xcrun notarytool store-credentials` 建的 profile）會公證 app + dmg 並 staple。
-- 沒設時是 ad-hoc 開發版，用 `entitlements-dev.plist`：ad-hoc 沒有 Team ID，hardened runtime 會拒絕載入 Python.framework（"different Team IDs"），所以開發版多一個 disable-library-validation。開發版每次 build 簽章都變，build 腳本會 `tccutil reset AudioCapture / Microphone`。
-- `RESET_ONBOARDING=1 ./scripts/build-app.sh` 才會清 onboarding flag。
-- Bundle ID（`setup.py` 的 `BUNDLE_ID`）第一個公證版發出後就不能改，改了使用者要全部重新授權。
+跑 `./scripts/build-app.sh` 一次搞定：
+1. 從 `assets/icon.png` 生 `icon.icns`（若不存在）
+2. `py2app` 打包到 `dist/Meeting Transcriber.app`
+3. **`codesign --force --deep --sign -`** 整個 bundle ad-hoc sign（py2app 只簽 main wrapper，沒簽內嵌 coreaudio_tap → TCC 不 inherit 授權 → 每次 spawn child binary 都會重新要求授權，所以必須 deep sign）
+4. **`tccutil reset ScreenCapture / Microphone com.kylehsia.meeting-transcriber`** 清掉舊 TCC 紀錄（每次 rebuild signature hash 都不同 → macOS 視為新 app → 舊授權對新 app 無效，但 System Settings UI 因為 bundle id 相同顯示舊 entry，誤導使用者）
+5. 清 `~/Library/Application Support/Meeting Transcriber/.config.json` 的 `onboarding_completed` flag → 下次跑會跳 onboarding
 
 ### 全域 audio state
 
@@ -205,17 +172,22 @@ Mic 偵測 fallback：若 `_micTestRunning`（sd.InputStream 已成功開），�
 
 ### Pause 會釋放系統音擷取
 
-`/pause` 期間 `_sys_capture_supervisor` 會 terminate Swift proc 並 idle（不持有 audio tap），resume 時自動重 spawn。代價：resume 後系統音有 ~1s 重連空窗。`_read_sys_stdout` 在 `_paused` 時也會 return（迴圈條件含 `not _paused`），這正是觸發 supervisor 釋放的訊號。麥克風 stream 不釋放（很輕、resume 要立即可用）。
+`/pause` 期間 `_sys_capture_supervisor` 會 terminate Swift proc 並 idle（不持有 ScreenCaptureKit tap，避免 replayd 持續燒 CPU），resume 時自動重 spawn。代價：resume 後系統音有 ~1s 重連空窗。`_read_sys_stdout` 在 `_paused` 時也會 return（迴圈條件含 `not _paused`），這正是觸發 supervisor 釋放的訊號。麥克風 stream 不釋放（很輕、resume 要立即可用）。
 
 ## 已知坑與限制
 
-### macOS TCC 跟 ad-hoc 簽章
+### macOS TCC 跟 py2app rebuild
 
-ad-hoc 簽章每次 build 都不同，TCC 與鑰匙圈都把它當新 app：權限要重給、讀金鑰會跳允許視窗。Developer ID 簽章後就穩定。App 內原本的「重新授權」modal 與 `tccutil reset` 補救已移除。
+每次 py2app rebuild 產生新 code signature hash → macOS TCC 視為「同 bundle id 但不同 app instance」→ 舊授權對新 build 無效。System Settings UI 因為 bundle id 顯示同一個 entry，導致使用者以為「已授權」但 CGPreflight 回 false。`build-app.sh` 用 `tccutil reset` 解決，但 user 每次 update 版本都要重新授權。Apple Developer ID 簽章 ($99/yr) 才能避免。
 
 ### Whisper hallucination
 
 Mitigations 已寫進 code：silence trigger 不保留 overlap、voice activity gate（ratio + 絕對語音時長 `MIN_ACTIVE_SPEECH` 下限，短插話不被誤丟）、repetition trim + loop 偵測 + 隔離 prompt chain、cross-chunk `_dedup_boundary`、zh-lock 只丟 stock-filler 英文。殘留 case：環境噪音穩定大（持續打字 / 風扇）可能讓 silence 偵測失靈 → buffer 一直長到 25s hard cap。對 personal 用沒影響。
+
+### macOS 螢幕錄製授權
+
+- 第一次：橘色鎖 dialog → 系統設定授權
+- 月度：藍色舉手 dialog → macOS 15+ 強制 monthly re-confirm，**無法完全免除**（除非有 Apple Developer entitlement）
 
 ### Groq 隱私
 
@@ -225,7 +197,8 @@ Services Agreement 明訂禁止用客戶 input 訓練。但音訊仍會經 Groq 
 
 - 整體 UI / branding rebrand — gradient / glow / motion，更 fancy 的視覺
 - 換 fancy 名字
+- Apple Developer 帳號 + Developer ID 簽章 + Notarization → 解決 TCC reset / 月度 prompt
 - LLM summary / action items
 - Speaker diarization
-- 匯出 docx
+- 匯出 docx / markdown
 - Chunk 參數 UI 化（CHUNK_DURATION / PAUSE_DURATION 等）
