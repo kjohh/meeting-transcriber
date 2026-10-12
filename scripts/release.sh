@@ -38,7 +38,7 @@ if [ ! -f "$DMG" ]; then
 fi
 
 # Refuse to ship a dmg that Gatekeeper would block (ad-hoc / unnotarized).
-echo "→ Checking Gatekeeper on $DMG…"
+echo "→ Checking Gatekeeper on ${DMG}…"
 if ! spctl -a -t open --context context:primary-signature "$DMG" 2>/dev/null; then
   spctl -a -t open --context context:primary-signature -vv "$DMG" >&2 || true
   echo "✗ $DMG is not notarized — Gatekeeper would reject it" >&2
