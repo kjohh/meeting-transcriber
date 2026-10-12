@@ -16,6 +16,7 @@ Notes:
   when running from the bundle.
 - The Swift coreaudio_tap binary is bundled under Contents/Resources/native/.
 """
+import os
 import re
 
 from setuptools import setup
@@ -35,6 +36,19 @@ APP_VERSION = _m.group(1)
 # microphone + system audio). Settle the product name first.
 BUNDLE_ID = "com.kylehsia.meeting-transcriber"
 APP_NAME = "Meeting Transcriber"
+
+# In-app updates (Sparkle). The feed is appcast.xml attached to the latest
+# GitHub release (scripts/release.sh writes and uploads it). The EdDSA public
+# key is public (it only verifies updates) and lives in sparkle_public_key.txt,
+# created once on the release machine by scripts/sparkle-keys.sh; the matching
+# private key never leaves that machine's Keychain. MT_SPARKLE_PUBLIC_KEY
+# overrides it for local testing. Without a key, updates are simply off.
+SPARKLE_FEED_URL = os.environ.get(
+    "MT_SPARKLE_FEED_URL",  # local testing only
+    "https://github.com/kjohh/meeting-transcriber/releases/latest/download/appcast.xml")
+SPARKLE_PUBLIC_KEY = os.environ.get("MT_SPARKLE_PUBLIC_KEY", "").strip()
+if not SPARKLE_PUBLIC_KEY and os.path.exists("sparkle_public_key.txt"):
+    SPARKLE_PUBLIC_KEY = open("sparkle_public_key.txt", encoding="utf-8").read().strip()
 
 DATA_FILES = [
     ("static", ["static/index.html"]),
@@ -112,6 +126,12 @@ OPTIONS = {
         "LSMinimumSystemVersion": "14.4",
         # Apple Silicon only: local transcription is too slow on Intel to be usable.
         "LSArchitecturePriority": ["arm64"],
+        # Sparkle (in-app updates). Checks once a day; the user is asked
+        # before anything is downloaded or installed.
+        "SUFeedURL": SPARKLE_FEED_URL,
+        "SUEnableAutomaticChecks": True,
+        "SUScheduledCheckInterval": 86400,
+        **({"SUPublicEDKey": SPARKLE_PUBLIC_KEY} if SPARKLE_PUBLIC_KEY else {}),
         "LSUIElement": False,
         "NSHighResolutionCapable": True,
     },

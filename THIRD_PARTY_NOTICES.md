@@ -40,6 +40,7 @@ Meeting Transcriber 使用了下列開放原始碼軟體與模型。感謝這些
 | SQLite | Public Domain |
 | XZ Utils（liblzma） | 0BSD |
 | mpdecimal | BSD-2-Clause |
+| Sparkle（App 內更新） | MIT（含 bsdiff BSD-2-Clause、sais-lite MIT、ed25519 zlib） |
 
 ## 致謝
 

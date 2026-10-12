@@ -3038,6 +3038,46 @@ def transcribe_upload(path: str, fname: str, backend: str, api_key: str, languag
             pass
 
 
+# ─── In-app updates (Sparkle) ─────────────────────────────────────────────────
+
+_updater = None  # SPUStandardUpdaterController once started
+
+
+def sparkle_available() -> bool:
+    """True in a built .app that embeds Sparkle and carries an update key.
+    Dev runs from source, or builds made before the key exists, fall back to
+    the plain GitHub "new version" banner (check_for_update)."""
+    if not _is_frozen_bundle():
+        return False
+    try:
+        from Foundation import NSBundle
+        main = NSBundle.mainBundle()
+        fw = os.path.join(str(main.privateFrameworksPath()), "Sparkle.framework")
+        return os.path.isdir(fw) and bool(main.objectForInfoDictionaryKey_("SUPublicEDKey"))
+    except Exception:
+        return False
+
+
+def start_sparkle():
+    """Start Sparkle's standard updater. Must run on the main thread. From
+    here Sparkle owns the flow: a daily check, its own "a new version is
+    available" window (release notes, Install / Later / Skip), download,
+    signature check, replace and relaunch."""
+    global _updater
+    try:
+        import objc
+        from Foundation import NSBundle
+        fw = os.path.join(str(NSBundle.mainBundle().privateFrameworksPath()), "Sparkle.framework")
+        objc.loadBundle("Sparkle", {}, bundle_path=fw)
+        controller_cls = objc.lookUpClass("SPUStandardUpdaterController")
+        _updater = controller_cls.alloc().initWithStartingUpdater_updaterDelegate_userDriverDelegate_(
+            True, None, None)
+        log.info("sparkle updater started")
+    except Exception as e:
+        _updater = None
+        log.warning("sparkle failed to start: %s", e)
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 # Strings pywebview draws natively (menus, the quit confirmation).
@@ -3236,7 +3276,9 @@ if __name__ == "__main__":
     # Daemon thread: dies with the process when the window closes.
     threading.Thread(target=_server.serve_forever, daemon=True).start()
     auto_download_preferred_model()
-    threading.Thread(target=check_for_update, daemon=True).start()
+    use_sparkle = sparkle_available()
+    if not use_sparkle:
+        threading.Thread(target=check_for_update, daemon=True).start()
 
     window = webview.create_window(
         APP_NAME,
@@ -3267,6 +3309,13 @@ if __name__ == "__main__":
     def menu_upload(): _page("upload")
     def menu_record(): _page("record")
 
+    def menu_check_updates():
+        if _updater is not None:
+            from PyObjCTools import AppHelper
+            AppHelper.callAfter(lambda: _updater.checkForUpdates_(None))
+        else:
+            subprocess.Popen(["open", "https://github.com/kjohh/meeting-transcriber/releases/latest"])
+
     SHORTCUTS = {  # menu title → key (⌘ + key)
         "設定…": ",",
         "新會議": "n",
@@ -3274,7 +3323,8 @@ if __name__ == "__main__":
         "上傳錄音檔…": "o",
     }
     app_menus = [
-        Menu("__app__", [MenuAction("設定…", menu_settings)]),
+        Menu("__app__", [MenuAction("檢查更新…", menu_check_updates),
+                         MenuAction("設定…", menu_settings)]),
         Menu("檔案", [
             MenuAction("新會議", menu_new),
             MenuAction("儲存逐字稿…", menu_save),
@@ -3303,6 +3353,8 @@ if __name__ == "__main__":
                 if main is not None:
                     walk(main)
             AppHelper.callAfter(_assign)
+            if use_sparkle:
+                AppHelper.callAfter(start_sparkle)
         except Exception as e:
             log.warning("could not install menu shortcuts: %s", e)
 

@@ -77,6 +77,16 @@ macOS 系統 Python 的 Tk (8.5) 在 dark mode 下渲染全黑，故走 Flask + 
 
 `LocalWhisperWorker` 用單一 process 的 `ProcessPoolExecutor`（spawn）。initializer 把 whisper.cpp 的 C 輸出導到 whisper.log、檢查 ggml magic 後載入模型；每段音訊是一個 task。逾時或子程序死掉就把 worker 標成失效，下次 `_ensure_local_worker` 重建。
 
+### App 內更新（Sparkle）
+
+Sparkle 2.10.0（`build-app.sh` 釘版本 + SHA256 下載到 build-cache）包進 `Contents/Frameworks`，拿掉 XPCServices（非 sandbox App 不需要）。簽章順序：所有 Mach-O → `Updater.app` → `Sparkle.framework/Versions/B` → Python.framework → App。
+
+- Info.plist：`SUFeedURL` 指向 latest release 的 `appcast.xml`，`SUPublicEDKey` 讀 repo 根目錄的 `sparkle_public_key.txt`（公開金鑰，要 commit）。沒有金鑰時 App 不啟動 Sparkle，退回原本的 GitHub 新版橫幅；正式 build（有 `DEVELOPER_ID`）沒有金鑰會直接失敗。
+- 私鑰只在發版那台的鑰匙圈：`scripts/sparkle-keys.sh` 建立（重跑會沿用既有的）。私鑰遺失 = 已安裝的版本再也無法 App 內更新，要另外備份（`generate_keys -x`）。
+- `release.sh` 用 `sign_update` 簽 dmg、產生只含最新一版的 `appcast.xml`，跟 dmg 一起上傳。`sparkle:version` 對應 CFBundleVersion（= APP_VERSION）。
+- `start_sparkle()` 在主執行緒啟動 `SPUStandardUpdaterController`；選單「檢查更新…」呼叫 `checkForUpdates:`。Sparkle 的介面用 App 的 zh_TW。
+- 本機測試：`MT_SPARKLE_PUBLIC_KEY` / `MT_SPARKLE_FEED_URL` 覆寫金鑰與更新來源；用 `generate_keys --account <測試名>` 做拋棄式金鑰，測完從鑰匙圈刪掉。
+
 ### 本機 API 保護
 
 Flask 綁隨機 port（`make_server(..., 0)`，不再 sleep 等啟動）。每次啟動產生 `SESSION_TOKEN`，視窗開 `/?t=<token>` 換成 HttpOnly + SameSite=Strict cookie，之後每個 request 都要帶。加上 Origin 檢查，網頁與本機其他程式都打不進來。log 會 redact token 與 `gsk_` 金鑰。debug 用瀏覽器開頁面時設 `MT_NO_TOKEN=1`。

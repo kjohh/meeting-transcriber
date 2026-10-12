@@ -65,6 +65,8 @@ DEVELOPER_ID="Developer ID Application: HAO HSIANG HSIA (R7RB39B5XN)" NOTARY_PRO
 
 `release.sh` 會先用 `spctl` 確認 dmg 已公證（沒過就中止），再以固定檔名 `Meeting Transcriber.dmg` 用 `gh release create` 上傳，README 的「直接下載」連結因此永遠指向最新版。
 
+**App 內更新（Sparkle）**：發版那台電腦第一次要先跑一次 `./scripts/sparkle-keys.sh`，建立更新用的簽章金鑰（私鑰留在那台的鑰匙圈，記得另外備份），並把產生的 `sparkle_public_key.txt` commit 進 repo。之後每次 `release.sh` 會用私鑰簽 dmg、產生 `appcast.xml` 一起上傳；已安裝的 App 每天檢查一次，有新版會跳出視窗，按「安裝更新」就會自動下載、驗證、替換並重新開啟。
+
 ## 主要功能
 
 - **三種語言模式**：`自動`（預設，Whisper 逐段自動偵測，純英文 / 純中文 / 混合都不用先設定）/ `強制中文`（force `language="zh"` + bilingual prompt 範例 prime decoder + 本機換 Breeze ASR，適合中文 / 中英夾雜會議）/ `強制英文`
@@ -95,7 +97,7 @@ session 期間語言 / backend 鎖定（避免「UI 改了但 in-flight session 
   - Source mode：`./.config.json` + `./.vocab.local`（gitignored）
   - Bundle mode：`~/Library/Application Support/Meeting Transcriber/`
 - **本地模型 cache**：`~/Library/Application Support/pywhispercpp/models/`（與 lazy-take-notes 共用）
-- **簽章**：`scripts/sign-and-package.sh` 由內而外簽章 + hardened runtime。設 `DEVELOPER_ID`（+ `NOTARY_PROFILE`）會公證並產出 .dmg；沒設時是 ad-hoc 開發版，build 腳本會 `tccutil reset` 清舊授權
+- **簽章**：`scripts/sign-and-package.sh` 由內而外簽章 + hardened runtime。設 `DEVELOPER_ID`（+ `NOTARY_PROFILE`）會公證並產出 .dmg；沒設時是 ad-hoc 開發版（要清舊授權加 `RESET_TCC=1`）
 
 ## 未來計畫
 

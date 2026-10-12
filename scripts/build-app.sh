@@ -19,6 +19,13 @@ cd "$(dirname "$0")/.."
 PY=/opt/homebrew/bin/python3.13
 BUNDLE_ID=$("$PY" -c "import re;print(re.search(r'^BUNDLE_ID\s*=\s*\"([^\"]+)\"',open('setup.py').read(),re.M).group(1))")
 
+# A release build without the update key would ship an app that can never
+# update itself in-app. Refuse instead.
+if [ -n "${DEVELOPER_ID:-}" ] && [ ! -s sparkle_public_key.txt ] && [ -z "${MT_SPARKLE_PUBLIC_KEY:-}" ]; then
+  echo "✗ sparkle_public_key.txt missing — run scripts/sparkle-keys.sh once on this machine first" >&2
+  exit 1
+fi
+
 # 1. Icon
 if [ ! -f icon.icns ] || [ assets/icon.png -nt icon.icns ]; then
   if [ -f assets/icon.png ]; then
@@ -43,12 +50,38 @@ if [ ! -f "$MODEL" ] || [ "$(shasum -a 256 "$MODEL" | cut -d' ' -f1)" != "$MODEL
   fi
 fi
 
+# 2b. Sparkle (in-app updates). Pinned release + SHA256.
+SPARKLE_VERSION=2.10.0
+SPARKLE_SHA=c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
+SPARKLE_DIR="build-cache/Sparkle-$SPARKLE_VERSION"
+if [ ! -d "$SPARKLE_DIR/Sparkle.framework" ]; then
+  echo "→ Fetching Sparkle $SPARKLE_VERSION"
+  TARBALL="build-cache/Sparkle-$SPARKLE_VERSION.tar.xz"
+  curl -fL --retry 3 -o "$TARBALL" \
+    "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz"
+  if [ "$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" != "$SPARKLE_SHA" ]; then
+    echo "✗ Sparkle checksum mismatch" >&2
+    rm -f "$TARBALL"
+    exit 1
+  fi
+  mkdir -p "$SPARKLE_DIR"
+  tar -xf "$TARBALL" -C "$SPARKLE_DIR"
+  rm -f "$TARBALL"
+fi
+
 # 3. Swift helper
 (cd native && swift build -c release)
 
 # 4. py2app
 rm -rf build dist
 "$PY" setup.py py2app
+
+# 4b. Embed Sparkle.framework. XPCServices are only for sandboxed apps (this
+#     app isn't), and Sparkle's docs say to drop them in that case.
+FW="dist/Meeting Transcriber.app/Contents/Frameworks"
+rm -rf "$FW/Sparkle.framework"
+ditto "$SPARKLE_DIR/Sparkle.framework" "$FW/Sparkle.framework"
+rm -rf "$FW/Sparkle.framework/Versions/B/XPCServices" "$FW/Sparkle.framework/XPCServices"
 
 # 5. Sign (+ notarize + dmg when DEVELOPER_ID is set)
 ./scripts/sign-and-package.sh

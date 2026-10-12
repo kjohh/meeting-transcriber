@@ -64,6 +64,15 @@ done < <(find "$APP/Contents" -type f ! -path "*/_CodeSignature/*" \
           | awk -F/ '{ print NF "\t" $0 }' | sort -rn | cut -f2-)
 echo "  signed $count nested binaries"
 
+# 2a. Sparkle: its helper app and the framework are bundles and need their
+#     own seal, inner first (Sparkle's documented order: Autoupdate and
+#     Updater.app, then the framework). Their Mach-O files were signed above.
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+if [ -d "$SPARKLE" ]; then
+  sign "$SPARKLE/Versions/B/Updater.app"
+  sign "$SPARKLE/Versions/B"
+fi
+
 # 2. Python.framework as a bundle (its Versions/Current seal).
 if [ -d "$FRAMEWORK" ]; then
   for v in "$FRAMEWORK"/Versions/*; do
