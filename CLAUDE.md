@@ -28,7 +28,7 @@ THIRD_PARTY_NOTICES.md                     ← 第三方授權（App 內「設�
 tests/test_pure.py                         ← 純函式 unittest：python3.13 -m unittest discover -s tests
 build-cache/ggml-small-q5_1.bin            ← 內建基本模型（build 腳本下載 + SHA256 驗證，gitignored）
 scripts/build-icon.sh                      ← 1024×1024 PNG → icon.icns (用 sips + iconutil)
-scripts/release.sh                         ← ditto-zip + gh release create 上傳到 GitHub Releases
+scripts/release.sh                         ← 檢查 dmg 已公證 → 以固定檔名 gh release create 上傳
 assets/icon.png                            ← 1024×1024 source icon
 ~/Library/Logs/Meeting Transcriber/        ← app.log（rotating）+ whisper.log
 .draft.json                                ← 逐字稿自動存檔（同 .config.json 的目錄規則）

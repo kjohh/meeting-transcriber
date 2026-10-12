@@ -51,7 +51,7 @@
 - py2app 打包成 self-contained .app(139MB,不含模型)
 - `scripts/build-app.sh` 一鍵 build + deep codesign + TCC reset + onboarding flag reset
 - `scripts/build-icon.sh` 從 PNG 生 .icns
-- `scripts/release.sh` ditto-zip + gh release create 上傳 GitHub Releases
+- `scripts/release.sh` gh release create 上傳 GitHub Releases(原本 ditto-zip,改為上傳 Developer ID 簽章 + 公證過的 dmg)
 - App icon(placeholder,之後 rebrand 換)
 - 修 sounddevice libportaudio.dylib 在 zip 內 dlopen 失敗的問題(`packages` 加 sounddevice)
 

@@ -23,7 +23,7 @@ native/Sources/coreaudio_tap/main.swift    ← ScreenCaptureKit 系統音擷取
 native/.build/release/coreaudio_tap        ← 編譯後的 binary（不進 git，但 py2app 會 bundle 進 .app）
 scripts/build-app.sh                       ← 完整 build：icon → py2app → deep codesign → TCC reset → onboarding flag reset
 scripts/build-icon.sh                      ← 1024×1024 PNG → icon.icns (用 sips + iconutil)
-scripts/release.sh                         ← ditto-zip + gh release create 上傳到 GitHub Releases
+scripts/release.sh                         ← 檢查 dmg 已公證 → 以固定檔名 gh release create 上傳
 assets/icon.png                            ← 1024×1024 source icon
 .config.json                               ← API key + backend + onboarding flag（git-ignored，source mode 在 project root；bundle mode 在 ~/Library/Application Support/Meeting Transcriber/）
 .vocab.local                               ← 自訂詞彙（git-ignored，同上規則）

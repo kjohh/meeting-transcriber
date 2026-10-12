@@ -8,12 +8,11 @@
 #   - `gh` CLI authenticated against this repo
 #   - dist/Meeting Transcriber.app must already be built (run scripts/build-app.sh first)
 #
-# What end users download:
-#   Meeting Transcriber.zip  →  unzip  →  drag to Applications
+#   - build must be a Developer ID build (DEVELOPER_ID + NOTARY_PROFILE set),
+#     which produces a signed, notarized and stapled dmg
 #
-# We use `ditto` (not `zip`) because it preserves macOS metadata, code
-# signatures, and resource forks. Plain `zip` strips the signature and
-# Gatekeeper will reject the .app.
+# What end users download:
+#   Meeting.Transcriber.dmg  →  open  →  drag to Applications
 
 set -euo pipefail
 
@@ -31,11 +30,26 @@ if [ ! -d "$APP" ]; then
   exit 1
 fi
 
-ZIP="dist/Meeting Transcriber.zip"
-echo "→ Packaging .app with ditto (preserves signatures)…"
-rm -f "$ZIP"
-ditto -c -k --keepParent "$APP" "$ZIP"
-ls -lh "$ZIP"
+VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
+DMG="dist/Meeting Transcriber ${VERSION}.dmg"
+if [ ! -f "$DMG" ]; then
+  echo "✗ $DMG not found — run a Developer ID build first (DEVELOPER_ID + NOTARY_PROFILE)" >&2
+  exit 1
+fi
+
+# Refuse to ship a dmg that Gatekeeper would block (ad-hoc / unnotarized).
+echo "→ Checking Gatekeeper on $DMG…"
+if ! spctl -a -t open --context context:primary-signature "$DMG" 2>/dev/null; then
+  spctl -a -t open --context context:primary-signature -vv "$DMG" >&2 || true
+  echo "✗ $DMG is not notarized — Gatekeeper would reject it" >&2
+  exit 1
+fi
+ls -lh "$DMG"
+
+# Upload under a fixed name so README's releases/latest/download link keeps
+# working across versions (GitHub turns the space into a dot).
+ASSET="dist/Meeting Transcriber.dmg"
+cp "$DMG" "$ASSET"
 
 echo
 echo "→ Creating GitHub release ${TAG}…"
@@ -43,7 +57,7 @@ echo "→ Creating GitHub release ${TAG}…"
 # previous tag, so users see what changed without us writing it by hand.
 # --target pins the tag to the exact commit we built + pushed, not the repo
 # default branch (releases are cut from the working branch, e.g. wip-machine-b).
-gh release create "${TAG}" "$ZIP" \
+gh release create "${TAG}" "$ASSET" \
   --title "${TAG}" \
   --target "$(git rev-parse HEAD)" \
   --generate-notes

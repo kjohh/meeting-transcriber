@@ -13,20 +13,16 @@ Local 模式預設用通用 Whisper turbo 處理所有語言；當你在工具�
 
 ## 安裝（給使用者）
 
-**直接下載**：[Meeting.Transcriber.zip](https://github.com/kjohh/meeting-transcriber/releases/latest/download/Meeting.Transcriber.zip)
+**直接下載**：[Meeting.Transcriber.dmg](https://github.com/kjohh/meeting-transcriber/releases/latest/download/Meeting.Transcriber.dmg)
 (永遠指向最新版,不用換連結)
 
 或先看 [Releases 頁面](https://github.com/kjohh/meeting-transcriber/releases/latest) 的版本說明。
 
-下載後 → 解壓 → **拖到「應用程式」資料夾** → 雙擊。
+下載後 → 打開 dmg → **把 App 拖到「應用程式」資料夾** → 雙擊。
 
-⚠ **不要直接從「下載」資料夾打開**。macOS 對下載中的 .app 會啟動 App Translocation(放在唯讀隨機路徑跑),導致權限永遠卡住 — App 會跳一個視窗提醒你這個問題,但最好一開始就拖到應用程式資料夾避免麻煩。
+⚠ **不要直接在 dmg 視窗裡打開**。macOS 對下載中的 .app 會啟動 App Translocation(放在唯讀隨機路徑跑),導致權限永遠卡住 — App 會跳一個視窗提醒你這個問題,但最好一開始就拖到應用程式資料夾避免麻煩。
 
-> **macOS Sequoia (15+) 第一次打開會被 Gatekeeper 擋下**(因為這個工具沒有 Apple 公證 — 還沒走到那階段)。請依以下步驟繞過:
-> 1. 雙擊 → 看到「Apple 無法驗證」彈窗 → 按「完成」
-> 2. 開 **系統設定 → 隱私權與安全性** → 拉到底 → 看到「Meeting Transcriber 已被阻止...」→ 按「**仍要打開**」
-> 3. 跳「確定要打開?」→ 按「**打開**」
-> 4. 之後雙擊就不會再被擋
+App 已用 Developer ID 簽章並經 Apple 公證，第一次打開只會看到一般的「從網路下載，確定要打開？」確認，按「打開」即可。
 
 **需求**：macOS 14.4 以上，**僅支援 Apple Silicon Mac**（M1 以後）。Intel Mac 無法執行。
 
@@ -58,11 +54,16 @@ cd native && swift build -c release && cd ..
 ## 發佈
 
 ```bash
-./scripts/build-app.sh                 # 重 build
-./scripts/release.sh v0.1.0            # zip + upload to GitHub Releases
+./scripts/release.sh v0.1.0            # upload notarized dmg to GitHub Releases
 ```
 
-`release.sh` 用 `ditto -c -k --keepParent` 打 zip（保留 code signature，避免 Gatekeeper 拒絕），然後 `gh release create` 上傳。發完使用者從 Releases 頁面下載即可。
+發佈用的 build 要帶 Developer ID 跟公證 profile，才會產出公證過的 dmg：
+
+```bash
+DEVELOPER_ID="Developer ID Application: HAO HSIANG HSIA (R7RB39B5XN)" NOTARY_PROFILE=mt-notary ./scripts/build-app.sh
+```
+
+`release.sh` 會先用 `spctl` 確認 dmg 已公證（沒過就中止），再以固定檔名 `Meeting Transcriber.dmg` 用 `gh release create` 上傳，README 的「直接下載」連結因此永遠指向最新版。
 
 ## 主要功能
 
