@@ -59,12 +59,12 @@ echo "=== Bundle ready ==="
 du -sh "$APP"
 codesign -dvv "$APP" 2>&1 | grep -E "Identifier|Authority|Signature|flags|TeamIdentifier"
 
-# Dev builds only: an ad-hoc signature changes with every build, and macOS
-# keys the permission grant to it, so a rebuilt app silently loses its grants
-# while System Settings still shows them switched on. Clear them so the next
-# launch asks again. A Developer ID signature is stable across builds, so a
-# signed build keeps the user's grants and this is skipped.
-if [ -z "${DEVELOPER_ID:-}" ]; then
+# Opt-in (RESET_TCC=1), ad-hoc dev builds only: an ad-hoc signature changes
+# with every build and macOS keys permission grants to it, so a rebuilt dev
+# app silently loses its grants while System Settings still shows them on.
+# Not automatic, because the reset is per bundle ID: it would also wipe the
+# grants of the signed release installed in /Applications.
+if [ -z "${DEVELOPER_ID:-}" ] && [ "${RESET_TCC:-0}" = "1" ]; then
   tccutil reset AudioCapture "$BUNDLE_ID" > /dev/null 2>&1 || true
   tccutil reset Microphone   "$BUNDLE_ID" > /dev/null 2>&1 || true
   echo "✓ (ad-hoc dev build) permission entries reset — next launch will ask again"

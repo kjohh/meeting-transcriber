@@ -192,7 +192,7 @@ Mic 偵測 fallback：若 `_micTestRunning`（sd.InputStream 已成功開），�
 - 簽章由內而外逐一簽每個 Mach-O（dylib、.so、`MacOS/python`、Swift helper）→ Python.framework → app，全部開 hardened runtime。不用 `--deep`（公證會擋沒 runtime / timestamp 的巢狀 binary）。
 - `DEVELOPER_ID="Developer ID Application: …"` 時加 timestamp、用 `entitlements.plist`（只有麥克風）；再設 `NOTARY_PROFILE`（`xcrun notarytool store-credentials` 建的 profile）會公證 app + dmg 並 staple。
 - 沒設時是 ad-hoc 開發版，用 `entitlements-dev.plist`：ad-hoc 沒有 Team ID，hardened runtime 會拒絕載入 Python.framework（"different Team IDs"），所以開發版多一個 disable-library-validation。開發版每次 build 簽章都變，build 腳本會 `tccutil reset AudioCapture / Microphone`。
-- `RESET_ONBOARDING=1 ./scripts/build-app.sh` 才會清 onboarding flag。
+- `RESET_ONBOARDING=1 ./scripts/build-app.sh` 才會清 onboarding flag；`RESET_TCC=1` 才會清權限（會連 /Applications 的正式版權限一起清，因為是同一個 Bundle ID）。
 - Bundle ID（`setup.py` 的 `BUNDLE_ID`）第一個公證版發出後就不能改，改了使用者要全部重新授權。
 
 ### 全域 audio state

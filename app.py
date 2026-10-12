@@ -774,7 +774,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.13"  # Single source of truth; setup.py reads it for the bundle.
+APP_VERSION = "0.1.14"  # Single source of truth; setup.py reads it for the bundle.
 
 
 def save_onboarding_completed(value: bool):
@@ -946,12 +946,32 @@ _pool_model = None       # set inside the worker process only
 _pool_load_error = ""
 
 
+def _exit_with_parent() -> None:
+    """Worker-process side: exit as soon as the app process is gone.
+
+    A pool worker blocks on its task queue and does NOT notice its parent
+    dying, so after ⌘Q, a crash or a force-quit it (and multiprocessing's
+    resource tracker, which lives as long as it does) stayed behind as an
+    orphan, one more pair per app session. Watching the parent pid covers
+    every way the app can end, including ones where no cleanup code runs."""
+    parent = os.getppid()
+
+    def _watch():
+        while True:
+            time.sleep(2)
+            if os.getppid() != parent:
+                os._exit(0)
+
+    threading.Thread(target=_watch, daemon=True, name="parent-watch").start()
+
+
 def _pool_init(model_path: str) -> None:
     """Worker-process initializer: send whisper.cpp's C-level output to
     whisper.log (kept for diagnosis, truncated past LOG_MAX_BYTES) and load
     the model. A load failure is recorded rather than raised, so the parent
     gets the reason from _pool_ready() instead of an opaque broken pool."""
     global _pool_model, _pool_load_error
+    _exit_with_parent()
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         if os.path.exists(WHISPER_LOG_FILE) and os.path.getsize(WHISPER_LOG_FILE) > LOG_MAX_BYTES:
