@@ -65,8 +65,11 @@ PORT = 0  # real port assigned at launch (bound to a free one; see __main__)
 # fall back to mic-only for the rest of the session.
 MAX_SYS_RECONNECT = 5
 
-# Groq chat model used for EN→ZH live translation. Swap if Groq retires it.
-TRANSLATE_MODEL = "llama-3.3-70b-versatile"
+# Groq chat model used for EN→ZH live translation. Swap if Groq retires it
+# (llama-3.3-70b-versatile was shut down 2026-08-16). gpt-oss is a reasoning
+# model: keep reasoning low and out of the response so the content is just
+# the translation and latency stays ~0.6s.
+TRANSLATE_MODEL = "openai/gpt-oss-120b"
 
 # ── Mixing / signal conditioning ──
 MIX_TARGET_RMS = 0.09     # per-stream loudness target before summing mic+sys
@@ -2688,6 +2691,8 @@ def _translate_text(text: str, api_key: str) -> str:
         ],
         temperature=0.2,
         max_tokens=512,
+        reasoning_effort="low",
+        include_reasoning=False,
     )
     _update_translate_usage(raw.headers)
     chat = raw.parse()
