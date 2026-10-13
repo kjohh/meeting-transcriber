@@ -777,7 +777,7 @@ def is_translocated() -> bool:
         return False
 
 
-APP_VERSION = "0.1.14"  # Single source of truth; setup.py reads it for the bundle.
+APP_VERSION = "0.1.15"  # Single source of truth; setup.py reads it for the bundle.
 
 
 def save_onboarding_completed(value: bool):
