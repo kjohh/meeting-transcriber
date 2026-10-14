@@ -79,31 +79,35 @@ NOTES=$(git log --no-merges --format='<li>%s</li>' ${PREV_TAG:+$PREV_TAG..}HEAD 
 REPO_URL="https://github.com/kjohh/meeting-transcriber"
 
 # Upload the dmg to R2 before anything points at it. Each version gets its
-# own immutable path; latest/ is the stable link for README and the website,
-# with a short cache so a new release shows up within minutes.
+# own immutable path, which the appcast links to. latest/ (the stable link
+# for README and the website) is only switched after the GitHub release
+# exists, so a failed run never advertises a version that isn't released.
 WRANGLER="npx --yes wrangler@4"
 BUCKET="kylehsia-downloads"
 PREFIX="meeting-transcriber"
 DOWNLOADS="https://downloads.kylehsia.com"
 DMG_URL="${DOWNLOADS}/${PREFIX}/${VERSION}/Meeting.Transcriber.dmg"
+LATEST_URL="${DOWNLOADS}/${PREFIX}/latest/Meeting.Transcriber.dmg"
+LOCAL_SIZE=$(stat -f%z "$ASSET")
 r2_put() {
   $WRANGLER r2 object put "${BUCKET}/$1" --file "$ASSET" --remote \
     --content-type application/x-apple-diskimage --cache-control "$2"
 }
-echo "→ Uploading to Cloudflare R2…"
-r2_put "${PREFIX}/${VERSION}/Meeting.Transcriber.dmg" "public, max-age=31536000, immutable"
-r2_put "${PREFIX}/latest/Meeting.Transcriber.dmg" "public, max-age=300"
-
-# Never publish an appcast whose download is missing or truncated.
-LOCAL_SIZE=$(stat -f%z "$ASSET")
-for url in "$DMG_URL" "${DOWNLOADS}/${PREFIX}/latest/Meeting.Transcriber.dmg"; do
-  # ?v= skips any edge-cached copy of the previous latest/
-  REMOTE_SIZE=$(curl -sfI "${url}?v=${VERSION}" | awk 'tolower($1)=="content-length:" {print $2}' | tr -d '\r' || true)
-  if [ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]; then
-    echo "✗ $url returned size '${REMOTE_SIZE}', expected ${LOCAL_SIZE}" >&2
-    exit 1
+# Fail if the public URL doesn't serve a file of exactly our size. The
+# timestamp query bypasses Cloudflare's edge cache, including a HEAD cached
+# by an earlier run of this script.
+r2_check() {
+  local size
+  size=$(curl -sfI "$1?nocache=$(date +%s)" | awk 'tolower($1)=="content-length:" {print $2}' | tr -d '\r' || true)
+  if [ "$size" != "$LOCAL_SIZE" ]; then
+    echo "✗ $1 returned size '${size}', expected ${LOCAL_SIZE}" >&2
+    return 1
   fi
-done
+}
+echo "→ Uploading ${VERSION} to Cloudflare R2…"
+r2_put "${PREFIX}/${VERSION}/Meeting.Transcriber.dmg" "public, max-age=31536000, immutable"
+# Never publish an appcast whose download is missing or truncated.
+r2_check "$DMG_URL"
 
 MIN_OS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist")
 BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Contents/Info.plist")
@@ -139,6 +143,13 @@ gh release create "${TAG}" "$ASSET" "$APPCAST" \
   --target "$(git rev-parse HEAD)" \
   --generate-notes
 
+echo "→ Pointing R2 latest/ at ${VERSION}…"
+if ! { r2_put "${PREFIX}/latest/Meeting.Transcriber.dmg" "public, max-age=300" && r2_check "$LATEST_URL"; }; then
+  echo "✗ Released, but latest/ was not updated — rerun:" >&2
+  echo "  $WRANGLER r2 object put ${BUCKET}/${PREFIX}/latest/Meeting.Transcriber.dmg --file \"$ASSET\" --remote --content-type application/x-apple-diskimage --cache-control 'public, max-age=300'" >&2
+  exit 1
+fi
+
 # Keep the 5 newest versions on R2 (free tier is 10 GB; each dmg is ~240 MB).
 # Releases are cut one at a time, so dropping the 6th newest is enough.
 # Installed apps only ever download the version in the current appcast.
@@ -151,5 +162,5 @@ fi
 
 echo
 echo "✓ Released. End users download from:"
-echo "  ${DOWNLOADS}/${PREFIX}/latest/Meeting.Transcriber.dmg"
+echo "  ${LATEST_URL}"
 gh release view "${TAG}" --json url --jq .url
