@@ -13,7 +13,7 @@ Local 模式預設用通用 Whisper turbo 處理所有語言；當你在工具�
 
 ## 安裝（給使用者）
 
-**直接下載**：[Meeting.Transcriber.dmg](https://github.com/kjohh/meeting-transcriber/releases/latest/download/Meeting.Transcriber.dmg)
+**直接下載**：[Meeting.Transcriber.dmg](https://downloads.kylehsia.com/meeting-transcriber/latest/Meeting.Transcriber.dmg)
 (永遠指向最新版,不用換連結)
 
 或先看 [Releases 頁面](https://github.com/kjohh/meeting-transcriber/releases/latest) 的版本說明。
@@ -54,7 +54,7 @@ cd native && swift build -c release && cd ..
 ## 發佈
 
 ```bash
-./scripts/release.sh v0.1.0            # upload notarized dmg to GitHub Releases
+./scripts/release.sh v0.1.0            # upload notarized dmg to Cloudflare R2 + GitHub Releases
 ```
 
 發佈用的 build 要帶 Developer ID 跟公證 profile，才會產出公證過的 dmg：
@@ -63,7 +63,7 @@ cd native && swift build -c release && cd ..
 DEVELOPER_ID="Developer ID Application: HAO HSIANG HSIA (R7RB39B5XN)" NOTARY_PROFILE=mt-notary ./scripts/build-app.sh
 ```
 
-`release.sh` 會先用 `spctl` 確認 dmg 已公證（沒過就中止），再以固定檔名 `Meeting Transcriber.dmg` 用 `gh release create` 上傳，README 的「直接下載」連結因此永遠指向最新版。
+`release.sh` 會先用 `spctl` 確認 dmg 已公證（沒過就中止），再把 dmg 傳到 Cloudflare R2（`downloads.kylehsia.com`，第一次要先 `npx wrangler login`），同時以固定檔名 `Meeting Transcriber.dmg` 用 `gh release create` 上傳一份到 GitHub 當備份。README 的「直接下載」指向 R2 的 `latest/`，因此永遠是最新版。從台灣下載 GitHub 只有約 0.1 MB/s，R2 約 8 MB/s。
 
 **App 內更新（Sparkle）**：發版那台電腦第一次要先跑一次 `./scripts/sparkle-keys.sh`，建立更新用的簽章金鑰（私鑰留在那台的鑰匙圈，記得另外備份），並把產生的 `sparkle_public_key.txt` commit 進 repo。之後每次 `release.sh` 會用私鑰簽 dmg、產生 `appcast.xml` 一起上傳；已安裝的 App 每天檢查一次，有新版會跳出視窗，按「安裝更新」就會自動下載、驗證、替換並重新開啟。
 

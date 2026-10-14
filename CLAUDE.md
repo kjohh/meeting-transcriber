@@ -28,7 +28,7 @@ THIRD_PARTY_NOTICES.md                     ← 第三方授權（App 內「設�
 tests/test_pure.py                         ← 純函式 unittest：python3.13 -m unittest discover -s tests
 build-cache/ggml-small-q5_1.bin            ← 內建基本模型（build 腳本下載 + SHA256 驗證，gitignored）
 scripts/build-icon.sh                      ← 1024×1024 PNG → icon.icns (用 sips + iconutil)
-scripts/release.sh                         ← 檢查 dmg 已公證 → 以固定檔名 gh release create 上傳
+scripts/release.sh                         ← 檢查 dmg 已公證 → 傳到 R2（下載用）→ gh release create（備份 + appcast）
 assets/icon.png                            ← 1024×1024 source icon
 ~/Library/Logs/Meeting Transcriber/        ← app.log（rotating）+ whisper.log
 .draft.json                                ← 逐字稿自動存檔（同 .config.json 的目錄規則）
@@ -83,7 +83,8 @@ Sparkle 2.10.0（`build-app.sh` 釘版本 + SHA256 下載到 build-cache）包�
 
 - Info.plist：`SUFeedURL` 指向 latest release 的 `appcast.xml`，`SUPublicEDKey` 讀 repo 根目錄的 `sparkle_public_key.txt`（公開金鑰，要 commit）。沒有金鑰時 App 不啟動 Sparkle，退回原本的 GitHub 新版橫幅；正式 build（有 `DEVELOPER_ID`）沒有金鑰會直接失敗。
 - 私鑰只在發版那台的鑰匙圈：`scripts/sparkle-keys.sh` 建立（重跑會沿用既有的）。私鑰遺失 = 已安裝的版本再也無法 App 內更新，要另外備份（`generate_keys -x`）。
-- `release.sh` 用 `sign_update` 簽 dmg、產生只含最新一版的 `appcast.xml`，跟 dmg 一起上傳。`sparkle:version` 對應 CFBundleVersion（= APP_VERSION）。
+- `release.sh` 用 `sign_update` 簽 dmg、產生只含最新一版的 `appcast.xml`，跟 dmg 一起上傳。
+- **dmg 從 Cloudflare R2 下載，不是 GitHub**（2026-10-14 實測台灣下載 GitHub release 0.06–0.12 MB/s，R2 約 8 MB/s）。bucket `kylehsia-downloads`、網域 `downloads.kylehsia.com`：`meeting-transcriber/<版本>/` 每版一份（immutable），`latest/` 給 README（快取 5 分鐘）。appcast 的 enclosure 指向 R2 的版本路徑，**appcast 本身留在 GitHub**——已安裝的 App 的 `SUFeedURL` 寫死在 GitHub，換掉舊版就找不到更新。R2 只留最近 5 版（免費額度 10GB），發版時刪掉第 6 新的。`sparkle:version` 對應 CFBundleVersion（= APP_VERSION）。
 - `start_sparkle()` 在主執行緒啟動 `SPUStandardUpdaterController`；選單「檢查更新…」呼叫 `checkForUpdates:`。Sparkle 的介面用 App 的 zh_TW。
 - 本機測試：`MT_SPARKLE_PUBLIC_KEY` / `MT_SPARKLE_FEED_URL` 覆寫金鑰與更新來源；用 `generate_keys --account <測試名>` 做拋棄式金鑰，測完從鑰匙圈刪掉。
 
