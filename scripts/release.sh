@@ -142,7 +142,7 @@ gh release create "${TAG}" "$ASSET" "$APPCAST" \
 # Keep the 5 newest versions on R2 (free tier is 10 GB; each dmg is ~240 MB).
 # Releases are cut one at a time, so dropping the 6th newest is enough.
 # Installed apps only ever download the version in the current appcast.
-OLD_TAG=$(gh release list --limit 10 --json tagName --jq '.[5].tagName // empty')
+OLD_TAG=$(gh release list --exclude-drafts --limit 10 --json tagName --jq '.[5].tagName // empty')
 if [ -n "$OLD_TAG" ]; then
   echo "→ Removing ${OLD_TAG#v} from R2…"
   $WRANGLER r2 object delete "${BUCKET}/${PREFIX}/${OLD_TAG#v}/Meeting.Transcriber.dmg" --remote \
