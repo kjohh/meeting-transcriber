@@ -35,6 +35,7 @@ assets/icon.png                            ← 1024×1024 source icon
 .draft.json                                ← 逐字稿自動存檔（同 .config.json 的目錄規則）
 .config.json                               ← backend + onboarding flag 等設定（Groq 金鑰在鑰匙圈，不在這裡）（git-ignored，source mode 在 project root；bundle mode 在 ~/Library/Application Support/Meeting Transcriber/）
 .vocab.local                               ← 自訂詞彙（git-ignored，同上規則）
+recordings/                                ← 整場錄音，會後重轉用，7 天後自動刪（同上規則）
 .vocab.local.example                       ← 詞彙範本
 dist/Meeting Transcriber.app               ← py2app 產出（git-ignored）
 icon.icns                                  ← build-icon.sh 產出（git-ignored）
@@ -104,9 +105,10 @@ Groq 金鑰存 Keychain（generic password，service `Meeting Transcriber`），
 借用 [lazy-take-notes](https://github.com/CJHwong/lazy-take-notes) 的 VAD heuristic：
 
 - **`CHUNK_DURATION = 25.0`** — 滿 25s 強制切（避免長句無限累積）
-- **`PAUSE_DURATION = 1.5`** — 尾部連續 1.5s 靜音才認定句末
+- **`PAUSE_DURATION = 2.0`** — 尾部連續 2s 靜音才認定句末（1.5s 會把句中換氣切斷）
 - **`SILENCE_THRESHOLD = 0.005`** — 逐 frame voice-activity 閾值（低，讓輕聲講話的 frame 仍算 active）
 - **`MIN_SPEECH = 2.0`** — buffer 至少 2s 語音才考慮 silence-trigger
+- **`MIN_CHUNK_DURATION = 10.0`** — 靜音最早在 buffer 滿 10s 才能切。舊設定平均約 8s 一段，太短：中英夾雜缺上下文、turbo 容易重複幻覺。代價是字幕延遲變 10–25s（原本 3.5–25s）
 - **`OVERLAP = 1.0`** — 僅「hard-cap」trigger 保留 overlap tail；silence-trigger 句子已結束，不保留（避免 stale audio 拖到下一輪觸發鬼影 chunk）。保留的 1s overlap 會被轉錄兩次，由 `_dedup_boundary` 在 append 前砍掉接縫重複（見下）
 
 **`_chunk_worker` 把 snapshot + decision + consume 包在同一個 `_buf_lock` block 內** — 否則 `/pause` 觸發的 flush thread 跟 chunker 會 race 出 double transcribe。
@@ -117,7 +119,9 @@ Whisper 的 `prompt` 參數**不是 instruction，是 conditioning context**。�
 
 1. 強制 `language="zh"`（中文 decoder 天然支援 latin token interleaving）
 2. `_BILINGUAL_PROMPT` 提供典型中英夾雜「範例句」prime decoder 模仿這種風格
-3. Prompt chain 把上一段 transcript 最後 80 字元加進去，給跨 chunk 連續性
+3. Prompt chain 把上一段 transcript 結尾加進去，給跨 chunk 連續性
+
+Prompt 由 `assemble_prompt` 依 token 預算組（Whisper 只留最後 224 token，`PROMPT_TOKEN_BUDGET = 220`）：順序 chain → 詞彙 → 示範句，示範句永遠完整保留；先替 chain 保留 `PROMPT_CHAIN_MIN_TOKENS` 再放詞彙（整個詞，照檔案順序，放不下的後面幾個略過），chain 再吃剩下的。token 用 `estimate_prompt_tokens` 估（中日韓字 1.5、其他字元 0.4，對真實 tokenizer 校準過，偏高估）。舊的 330 字上限曾讓詞彙＋示範句吃滿，chain 被砍到一個字都不剩。
 
 Prompt chain 太長會誘發 Whisper 進入 **repetition loop**（複製 prompt 內容當輸出）。所以 chain 只留 1 段、上限 80 字元；偵測到輸出有 repetition loop 時不更新 chain。
 
@@ -156,6 +160,15 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 ### 上傳檔案
 
 `decode_to_wav16k` 用 macOS 內建 `afconvert`（mp3/m4a/wav/aiff/flac/mp4/mov），失敗才找 ffmpeg（webm/ogg 等）。雲端且 ≤ 24 MB 直接傳原檔；其他情況切成約 10 分鐘一段（在最後 15 秒內最安靜的 100ms 切），逐段轉錄、帶上一段結尾當 prompt，時間戳是檔案內的位置（00:10:00）。
+
+### 會後整場重轉（本機模型）
+
+錄音時 `SessionRecorder` 把 chunker 實際消耗的混音（每個 sample 只寫一次）寫進 `recordings/YYYYMMDD-HHMMSS.wav`（同 `.config.json` 的目錄規則），每次寫入附牆鐘時間錨點，暫停不會在檔案留空白。`/stop` 後 `start_retranscription` 在背景用該語言要的本機模型（zh = Breeze）每 180 秒一段整場重轉，帶上一段結尾當 prompt，時間戳換回會議當下的時間，再取代**這一場**的即時逐字稿（`_session_first_line` 之後），前端收 `transcript_replace` 重畫。
+
+- 想要的模型沒下載就跳過（內建小模型比即時結果差），保留即時版本
+- 整理期間有編輯、清空、恢復草稿、上傳或新的 `/start`（`_lines_rev` 變了）就不取代；`/start`、`/clear` 會取消進行中的重轉
+- WAV 約 115 MB/小時；重轉結束後用 `afconvert` 轉成 AAC `.m4a`（約 22 MB/小時），失敗就留 WAV
+- 超過 `RECORDING_RETENTION_DAYS = 7` 天的錄音在啟動與每次 `/start` 時自動刪除
 
 ### 逐字稿自動存檔 / 關閉確認
 

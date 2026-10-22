@@ -969,6 +969,11 @@ es.onmessage = ({data}) => {
     renderModelChip();
   } else if (msg.type === 'transcript') {
     appendLine(msg.data);
+  } else if (msg.type === 'transcript_replace') {
+    // Post-session re-transcription swapped in the whole transcript.
+    document.getElementById('transcript').innerHTML = '';
+    document.getElementById('transcript-zh').innerHTML = '';
+    msg.data.forEach(l => appendLine(l));
   } else if (msg.type === 'status') {
     document.getElementById('status').textContent = msg.data;
   } else if (msg.type === 'state') {
