@@ -14,3 +14,4 @@ build-cache/
 .draft.json
 .draft.json.tmp
 .wrangler/
+recordings/

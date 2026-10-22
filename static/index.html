@@ -533,6 +533,7 @@ button .ic { margin-right: 5px; }
   <!-- Tier 1 — primary action + integrated live status (state · timer · wave) -->
   <div class="controls-main">
     <button id="btn-record" class="btn-record" onclick="onRecordClick()"><svg class="ic" aria-hidden="true"><use href="#i-record"/></svg>開始錄音</button>
+    <button id="btn-end" class="btn-action" onclick="endMeeting()" title="結束錄音、保留逐字稿，並用本機模型整場重新整理一次">結束會議</button>
     <button id="btn-new" class="btn-action" onclick="newSession()" title="結束目前的會議，清空逐字稿開新場"><svg class="ic" aria-hidden="true"><use href="#i-refresh"/></svg>新會議</button>
     <button id="btn-save" class="btn-action btn-save" onclick="saveTranscript()" title="儲存逐字稿（⌘S）">儲存</button>
     <div class="live-status" id="live-status">
@@ -746,6 +747,17 @@ button .ic { margin-right: 5px; }
         </select>
       </div>
 
+      <!-- Session recordings -->
+      <div class="settings-section">
+        <div class="settings-section-title">會議錄音</div>
+        <div class="hint">錄音時會暫存整場音訊，按「結束會議」後用本機模型重新整理逐字稿。預設整理完或按「新會議」就刪除。開啟後保留 7 天（約 22 MB/小時），存在 App 的資料夾，不會進 Time Machine 備份。</div>
+        <label class="switch-ctl" style="margin-top:6px">
+          <input type="checkbox" id="keep-recordings-toggle" onchange="onKeepRecordingsToggle()">
+          <span class="switch-track"></span>
+          <span>保留會議錄音 7 天</span>
+        </label>
+      </div>
+
       <!-- Export format -->
       <div class="settings-section">
         <div class="settings-section-title">儲存格式</div>
@@ -948,6 +960,8 @@ es.onmessage = ({data}) => {
     if (msg.cloud_model) { const s = document.getElementById('cloud-model-select'); if (s) s.value = msg.cloud_model; }
     if (msg.zh_model) { const s = document.getElementById('zh-model-select'); if (s) s.value = msg.zh_model; }
     if (msg.export_format) document.getElementById('export-format-select').value = msg.export_format;
+    document.getElementById('keep-recordings-toggle').checked = !!msg.keep_recordings;
+    if (msg.retranscribe_pending) setTimeout(() => offerRetranscription(msg.retranscribe_pending), 300);
     if (msg.translate_usage) _lastUsage = msg.translate_usage;
     if (typeof msg.translate === 'boolean') setTranslateUI(msg.translate);
     if (msg.models) modelStatus = msg.models;
@@ -969,6 +983,10 @@ es.onmessage = ({data}) => {
     renderModelChip();
   } else if (msg.type === 'transcript') {
     appendLine(msg.data);
+  } else if (msg.type === 'retranscribe_ready') {
+    offerRetranscription(msg.data.count);
+  } else if (msg.type === 'retranscribe_discarded') {
+    _deferredOffer = null;
   } else if (msg.type === 'status') {
     document.getElementById('status').textContent = msg.data;
   } else if (msg.type === 'state') {
@@ -1148,6 +1166,7 @@ function sync() {
   document.getElementById('btn-vocab').disabled  = false;
   document.getElementById('btn-save').disabled = activeRecording || transcriptEmpty;
   document.getElementById('btn-new').disabled  = activeRecording || (!sessionInProgress && transcriptEmpty);
+  document.getElementById('btn-end').disabled  = !sessionInProgress;
 
   // ── Integrated live status: dot + label + timer + waveform ──
   const live = document.getElementById('live-status');
@@ -1240,6 +1259,55 @@ function newSession() {
   }
 }
 
+/* ── 結束會議 + post-session re-transcription ── */
+function endMeeting() {
+  // Same overlay as 新會議: /stop joins the worker threads (up to ~45 s), and
+  // a click on 新會議 or 錄音 in that window races the stop.
+  document.getElementById('btn-end').disabled = true;
+  showBusy('結束會議', '正在完成最後一段轉錄…');
+  fetch('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({retranscribe: true})})
+    .catch(e => setStatus('連線錯誤：' + e))
+    .finally(() => hideBusy());
+}
+
+let _deferredOffer = null;  // a ready re-transcription waiting for another dialog to close
+function _flushDeferredOffer() {
+  if (_deferredOffer === null) return;
+  if (_modalOpen()) { setTimeout(_flushDeferredOffer, 300); return; }
+  const count = _deferredOffer;
+  _deferredOffer = null;
+  offerRetranscription(count);
+}
+
+function offerRetranscription(count) {
+  // Never replace a question the user hasn't answered (the shared confirm
+  // dialog would): wait until no dialog is open. The server drops the offer
+  // (retranscribe_discarded) if the user clears or starts a meeting meanwhile.
+  if (_modalOpen()) {
+    const first = _deferredOffer === null;
+    _deferredOffer = count;
+    if (first) setTimeout(_flushDeferredOffer, 300);
+    return;
+  }
+  // Never swap the transcript under the user: they choose. Opening the dialog
+  // moves focus, so an edit in progress is committed (blur) before this runs.
+  showConfirm('要換成整理後的逐字稿嗎？',
+    '本機模型用整場錄音重新轉出 ' + count + ' 段逐字稿，通常比即時版本完整。取代後，這場的即時版本（包含你改過的字）會被換掉。',
+    () => fetch('/retranscribe/apply', {method: 'POST'}).then(r => r.json()).then(res => {
+      if (!res.ok) { setStatus(res.error || '取代失敗，保留目前的版本。'); return; }
+      document.getElementById('transcript').innerHTML = '';
+      document.getElementById('transcript-zh').innerHTML = '';
+      res.lines.forEach(l => appendLine(l));
+    }),
+    {ok: '取代', cancel: '保留即時版本', onCancel: () => fetch('/retranscribe/dismiss', {method: 'POST'})});
+}
+
+function onKeepRecordingsToggle() {
+  const enabled = document.getElementById('keep-recordings-toggle').checked;
+  fetch('/keep_recordings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled})})
+    .then(() => setStatus(enabled ? '會議錄音會保留 7 天。' : '會議錄音用完就刪除，已刪除保留中的錄音。'));
+}
+
 function _doNewSession() {
   // End current recording (if any) and clear the transcript.
   // /stop joins worker threads and reaps the whisper subprocess — can
@@ -1248,7 +1316,7 @@ function _doNewSession() {
   document.getElementById('btn-new').disabled = true;
   showBusy('整理本場會議', '正在完成最後一段轉錄…');
 
-  fetch('/stop', {method:'POST'})
+  fetch('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({retranscribe: false})})
     .then(() => fetch('/clear', {method:'POST'}))
     .then(() => {
       document.getElementById('transcript').innerHTML = '';

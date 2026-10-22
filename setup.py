@@ -54,6 +54,7 @@ DATA_FILES = [
     ("static", ["static/index.html"]),
     ("native/.build/release", ["native/.build/release/coreaudio_tap"]),
     ("models", ["build-cache/ggml-small-q5_1.bin"]),
+    ("assets", ["assets/whisper-multilingual.tiktoken"]),
     ("", ["THIRD_PARTY_NOTICES.md"]),
 ]
 

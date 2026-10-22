@@ -35,6 +35,8 @@ assets/icon.png                            ← 1024×1024 source icon
 .draft.json                                ← 逐字稿自動存檔（同 .config.json 的目錄規則）
 .config.json                               ← backend + onboarding flag 等設定（Groq 金鑰在鑰匙圈，不在這裡）（git-ignored，source mode 在 project root；bundle mode 在 ~/Library/Application Support/Meeting Transcriber/）
 .vocab.local                               ← 自訂詞彙（git-ignored，同上規則）
+recordings/                                ← 整場錄音，會後重轉用；用完即刪，設定開保留才留 7 天（同上規則）
+assets/whisper-multilingual.tiktoken       ← Whisper 詞彙表，算 prompt token 用（prompt_tokens.py）
 .vocab.local.example                       ← 詞彙範本
 dist/Meeting Transcriber.app               ← py2app 產出（git-ignored）
 icon.icns                                  ← build-icon.sh 產出（git-ignored）
@@ -104,9 +106,10 @@ Groq 金鑰存 Keychain（generic password，service `Meeting Transcriber`），
 借用 [lazy-take-notes](https://github.com/CJHwong/lazy-take-notes) 的 VAD heuristic：
 
 - **`CHUNK_DURATION = 25.0`** — 滿 25s 強制切（避免長句無限累積）
-- **`PAUSE_DURATION = 1.5`** — 尾部連續 1.5s 靜音才認定句末
+- **`PAUSE_DURATION = 2.0`** — 尾部連續 2s 靜音才認定句末（1.5s 會把句中換氣切斷）
 - **`SILENCE_THRESHOLD = 0.005`** — 逐 frame voice-activity 閾值（低，讓輕聲講話的 frame 仍算 active）
 - **`MIN_SPEECH = 2.0`** — buffer 至少 2s 語音才考慮 silence-trigger
+- **`MIN_CHUNK_DURATION = 10.0`** — 靜音最早在 buffer 滿 10s 才能切。舊設定平均約 8s 一段，太短：中英夾雜缺上下文、turbo 容易重複幻覺。代價是字幕延遲變 10–25s（原本 3.5–25s）
 - **`OVERLAP = 1.0`** — 僅「hard-cap」trigger 保留 overlap tail；silence-trigger 句子已結束，不保留（避免 stale audio 拖到下一輪觸發鬼影 chunk）。保留的 1s overlap 會被轉錄兩次，由 `_dedup_boundary` 在 append 前砍掉接縫重複（見下）
 
 **`_chunk_worker` 把 snapshot + decision + consume 包在同一個 `_buf_lock` block 內** — 否則 `/pause` 觸發的 flush thread 跟 chunker 會 race 出 double transcribe。
@@ -117,7 +120,11 @@ Whisper 的 `prompt` 參數**不是 instruction，是 conditioning context**。�
 
 1. 強制 `language="zh"`（中文 decoder 天然支援 latin token interleaving）
 2. `_BILINGUAL_PROMPT` 提供典型中英夾雜「範例句」prime decoder 模仿這種風格
-3. Prompt chain 把上一段 transcript 最後 80 字元加進去，給跨 chunk 連續性
+3. Prompt chain 把上一段 transcript 結尾加進去，給跨 chunk 連續性
+
+Prompt 由 `assemble_prompt` 依 token 預算組（whisper.cpp 只留最後 223 token、API 224，`PROMPT_TOKEN_BUDGET = 220`）：順序 chain → 詞彙 → 示範句，示範句永遠完整保留；先替 chain 保留 `PROMPT_CHAIN_MIN_TOKENS` 再放詞彙（整個詞，照檔案順序，放不下的後面幾個略過並寫 log），chain 再吃剩下的，組完再數一次，超過就再砍 chain。舊的 330 字上限曾讓詞彙＋示範句吃滿，chain 被砍到一個字都不剩。
+
+token 用 `prompt_tokens.count()` 精確計算，不載入模型：同時算 OpenAI 的 BPE（Groq 用的）與 whisper.cpp 的切法（ASCII-only regex + 由左最長比對，常常比 BPE 多），取較大值。詞彙表是 `assets/whisper-multilingual.tiktoken`（OpenAI，MIT），所有多語 Whisper 模型共用（含 large-v3/turbo、Breeze）。`tests/fixtures/prompt_token_counts.json` 是用 tiktoken 與 whisper.cpp 的 `whisper_tokenize`（Breeze）實測的數字，兩邊都要逐字相符。檔案不見時退回 UTF-8 位元組數（兩種切法的上限）。
 
 Prompt chain 太長會誘發 Whisper 進入 **repetition loop**（複製 prompt 內容當輸出）。所以 chain 只留 1 段、上限 80 字元；偵測到輸出有 repetition loop 時不更新 chain。
 
@@ -156,6 +163,20 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 ### 上傳檔案
 
 `decode_to_wav16k` 用 macOS 內建 `afconvert`（mp3/m4a/wav/aiff/flac/mp4/mov），失敗才找 ffmpeg（webm/ogg 等）。雲端且 ≤ 24 MB 直接傳原檔；其他情況切成約 10 分鐘一段（在最後 15 秒內最安靜的 100ms 切），逐段轉錄、帶上一段結尾當 prompt，時間戳是檔案內的位置（00:10:00）。
+
+### 會後整場重轉（本機模型）
+
+錄音時 `SessionRecorder` 把 chunker 實際消耗的混音（每個 sample 只寫一次）寫進 `recordings/YYYYMMDD-HHMMSS.wav`（同 `.config.json` 的目錄規則，每次開新場都對資料夾跑一次 `tmutil addexclusion`，舊版建的資料夾也會排除在 Time Machine 外），每次寫入附牆鐘時間錨點，暫停不會在檔案留空白。
+
+按「結束會議」（`/stop` 帶 `retranscribe: true`）後，`start_retranscription` 在背景用該語言要的本機模型（zh = Breeze）每 180 秒一段整場重轉：帶上一段**清理過**的結尾當 prompt（那段有重複迴圈就不帶），連續相同的 segment 最多留兩個、A/B 交替的迴圈在這一對重複出現後就砍掉，時間戳換回會議當下的時間。結果放在 `_pending_retranscription`，前端收 `retranscribe_ready` 跳確認框，使用者選「取代」（`/retranscribe/apply`，只換**這一場**，`_session_first_line` 之後）或「保留即時版本」（`/retranscribe/dismiss`）。不自動替換，所以不會蓋掉正在打的字：確認框搶焦點時，編輯中的那行會先 blur 存檔。
+
+- 「新會議」是 `/stop`（不帶 retranscribe）再 `/clear`：不重轉、不載模型，錄音直接處理掉
+- 想要的模型沒下載、或這場真的有一行被翻譯就跳過（只開翻譯開關、沒翻到任何一行不算；重轉的行對不回原本的翻譯，重翻又要用 Groq 額度），保留即時版本
+- `/start`、`/clear`、恢復草稿、上傳會讓 `_lines_rev` 變動，之後就不能套用；`/start`、`/clear` 也會取消進行中的重轉。純文字編輯不算（取代是使用者自己選的，確認框有寫會蓋掉改過的字）
+- `/stop` 在鎖內先記下 `_lines_rev` 與 `_session_first_line` 才去 join（最長約 45 秒），join 期間的 `/clear` 會讓這次重轉直接跳過、錄音照刪。join 期間 `_stopping` 為真，`/start` 會被拒，`/pause` 在沒錄音時不動作，第二個 `/stop`（新會議）與 `/clear` 會等這次收尾完才動，最後一段晚到的字也會被清掉；新會議的 `/stop` 等待時會讓這次直接不重轉，不載模型；前端「結束會議」跟「新會議」一樣蓋處理中遮罩
+- 整理好時若有別的確認框開著（例如「開始新會議？」），先等它關掉再跳；這期間被清掉或開新場，後端廣播 `retranscribe_discarded`，前端就不跳
+- 錄音用完（套用、保留即時、跳過、取消、新會議）就刪；設定開「保留會議錄音」（`keep_recordings`，預設關）才用 `afconvert` 轉成 AAC `.m4a`（約 22 MB/小時）保留 `RECORDING_RETENTION_DAYS = 7` 天。WAV 錄音中約 115 MB/小時
+- 啟動與每次 `/start` 清錄音：沒開保留就全刪（含當機留下的），有開就刪超過 7 天的；關掉設定時立刻刪掉保留中的
 
 ### 逐字稿自動存檔 / 關閉確認
 

@@ -26,6 +26,8 @@ import sounddevice as sd
 from flask import Flask, Response, abort, jsonify, request, send_file
 from groq import Groq
 
+import prompt_tokens
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000
@@ -48,8 +50,15 @@ PAUSE_BODY_THRESHOLD = 0.012    # For pause-boundary detection: body must
                                 # have real speech (not just ambient noise).
 PAUSE_TAIL_THRESHOLD = 0.015    # Tail counts as silence when RMS is below
                                 # this — tolerates ambient noise.
-PAUSE_DURATION = 1.5            # seconds of silence required to trigger
+PAUSE_DURATION = 2.0            # seconds of silence required to trigger (was
+                                # 1.5: a breath between clauses cut sentences)
 MIN_SPEECH = 2.0                # don't trigger before this much speech buffered
+MIN_CHUNK_DURATION = 10.0       # seconds — earliest a PAUSE may close a chunk.
+                                # At 1.5s / 2s the 2026-10-22 meeting averaged
+                                # ~8s chunks: too little context for zh/en
+                                # code-switching, and short chunks are where
+                                # turbo loops. Costs caption latency: a line
+                                # now lands 10–25s after it starts, not 3.5–25s.
 VOICE_ACTIVITY_RATIO = 0.15     # min fraction of 100ms frames that must be
                                 # "active" (above SILENCE_THRESHOLD) before we
                                 # send a chunk to Whisper
@@ -93,9 +102,11 @@ PAUSE_REL_DROP = 0.45     # tail counts as a pause when its RMS drops below this
 PROMPT_CHAIN_CHARS = 160  # chars of prior transcript carried as cross-chunk
                           # context (was 80 — too short to keep continuity)
 PROMPT_CHAIN_KEEP = 2     # number of recent segments kept in the chain
-PROMPT_MAX_CHARS = 330    # hard cap on the assembled prompt (~224 Whisper tokens
-                          # for CJK-heavy text); the style prime is placed LAST so
-                          # Whisper's tail-keep truncation never drops it
+PROMPT_TOKEN_BUDGET = 220  # whisper.cpp keeps the last 223 prompt tokens, the API
+                           # 224; counted exactly by prompt_tokens.count()
+PROMPT_CHAIN_MIN_TOKENS = 60  # budget held back for the chain before vocab is fitted.
+                          # The old 330-char cap let vocab + prime alone fill the
+                          # prompt, so the chain was silently cut to nothing.
 
 # ── Local whisper.cpp decoding ──
 LOCAL_BEAM_SIZE = 5       # beam search (default greedy beam=-1 is lower accuracy);
@@ -206,6 +217,13 @@ CONFIG_FILE = os.path.join(_user_data_dir(), ".config.json")
 # a crash or ⌘Q never loses a meeting; offered back on next launch.
 DRAFT_FILE = os.path.join(_user_data_dir(), ".draft.json")
 VOCAB_FILE = os.path.join(_user_data_dir(), ".vocab.local")
+# Whole-session audio, kept so the meeting can be re-transcribed after /stop
+# (see "Post-session re-transcription"). ~115 MB per hour as WAV while
+# recording, compressed to AAC (~22 MB per hour) once the re-transcription
+# finishes; files older than RECORDING_RETENTION_DAYS are deleted.
+RECORDINGS_DIR = os.path.join(_user_data_dir(), "recordings")
+RECORDING_RETENTION_DAYS = 7
+prompt_tokens.configure(os.path.join(_resource_dir(), "assets", "whisper-multilingual.tiktoken"))
 
 # Downloadable local models. Pinned to a repo commit and verified against the
 # file's SHA256 (Hugging Face serves the LFS sha256 as the X-Linked-ETag), so a
@@ -344,6 +362,18 @@ _transcribe_queue: "queue.Queue" = queue.Queue(maxsize=8)
 # drains the last flushed chunk before exiting — fixes a dropped-tail race.
 _consumer_should_exit = threading.Event()
 
+# True while /stop is joining the previous session's threads (up to ~45 s).
+# /start refuses then: the finishing /stop would otherwise clear the new
+# session's _recorder and set _consumer_should_exit under it.
+_stopping = False
+# Set when no /stop is finishing. A second /stop (新會議 right after 結束會議)
+# waits on it, so the /clear that follows lands after the last late line.
+_stop_finished = threading.Event()
+_stop_finished.set()
+# Set by that waiting /stop: the meeting is about to be cleared, so the
+# finishing /stop skips the re-transcription instead of loading a model for it.
+_stop_superseded = False
+
 # Download state (local backend only). Lock-protected so SSE clients can poll.
 _download_state: dict = {"active": False, "percent": 0, "model": "", "error": ""}
 _download_lock = threading.Lock()
@@ -382,6 +412,19 @@ _buf_lock = threading.Lock()
 # original transcription, tr is the (optional) translation, tag is an optional
 # source label (e.g. an uploaded filename).
 _lines: list[dict] = []
+# Bumped by anything that changes which lines _lines holds, other than the
+# live transcriber: clear, draft restore, upload, a new /start. A finished
+# re-transcription can only be applied while this is unchanged, so it never
+# lands on a newer session. (Text edits don't bump it: applying is the user's
+# explicit choice, and the confirm says it replaces edited lines too.)
+_lines_rev = 0
+_recorder: Optional["SessionRecorder"] = None
+_session_first_line = 0  # index in _lines of the current session's first line
+_retranscribe_cancel = threading.Event()
+_retranscribe_thread: Optional[threading.Thread] = None
+# A finished pass waiting for the user to apply or dismiss it:
+# {"lines", "first", "rev", "path"}. Guarded by _buf_lock.
+_pending_retranscription: Optional[dict] = None
 
 # EN→ZH live translation toggle. Off by default — the user opts in per session.
 # Mirrors the config "translate" flag; set on launch and via /translate.
@@ -1005,7 +1048,7 @@ def _pool_ready() -> str:
     return _pool_load_error or ("" if _pool_model is not None else "model not loaded")
 
 
-def _pool_transcribe(audio: np.ndarray, language: str, prompt: str) -> str:
+def _pool_decode(audio: np.ndarray, language: str, prompt: str) -> list:
     kw: dict = {}
     if language and language != "auto":
         kw["language"] = language
@@ -1020,7 +1063,18 @@ def _pool_transcribe(audio: np.ndarray, language: str, prompt: str) -> str:
     except Exception:
         # A pywhispercpp build that rejects the extra params: plain decode.
         segments = _pool_model.transcribe(audio, **kw)
+    return segments
+
+
+def _pool_transcribe(audio: np.ndarray, language: str, prompt: str) -> str:
+    segments = _pool_decode(audio, language, prompt)
     return " ".join(t for t in (seg.text.strip() for seg in segments) if t)
+
+
+def _pool_transcribe_segments(audio: np.ndarray, language: str, prompt: str) -> list[tuple[float, str]]:
+    """(start seconds, text) per whisper segment; whisper.cpp t0 is in 10 ms units."""
+    return [(seg.t0 / 100.0, seg.text.strip()) for seg in _pool_decode(audio, language, prompt)
+            if seg.text.strip()]
 
 
 class LocalWhisperWorker:
@@ -1056,6 +1110,12 @@ class LocalWhisperWorker:
         with self._lock:
             return self._run(_pool_transcribe, audio.astype(np.float32), language, prompt,
                              timeout=self._TRANSCRIBE_TIMEOUT)
+
+    def transcribe_segments(self, audio: np.ndarray, language: str, prompt: str,
+                            timeout: Optional[float] = None) -> list[tuple[float, str]]:
+        with self._lock:
+            return self._run(_pool_transcribe_segments, audio.astype(np.float32), language, prompt,
+                             timeout=timeout or self._TRANSCRIBE_TIMEOUT)
 
     def _run(self, fn, *args, timeout: float):
         from concurrent.futures import TimeoutError as FutureTimeout
@@ -1239,20 +1299,20 @@ def _vocab_lines() -> list[str]:
         return []
 
 
-def load_vocab() -> str:
-    """Read user vocabulary from .vocab.local. Returns a comma-joined hint string
-    appended to Whisper's prompt, improving recognition of proper nouns that
-    aren't in the model's training distribution (brand names, internal jargon,
-    people).
+def load_vocab_terms() -> list[str]:
+    """Read user vocabulary terms from .vocab.local, in file order. They go into
+    Whisper's prompt to help with proper nouns that aren't in the model's
+    training distribution (brand names, internal jargon, people).
 
     Lines of the form ``wrong=>right`` are correction pairs, NOT prompt hints —
     they're applied as a post-hoc find/replace on transcript output instead of
     eating the limited prompt window (see apply_vocab_corrections). Only the
     plain terms go into the prompt."""
-    words = [ln for ln in _vocab_lines() if "=>" not in ln]
-    if not words:
-        return ""
-    return "專有名詞:" + "、".join(words) + "。"
+    return [ln for ln in _vocab_lines() if "=>" not in ln]
+
+
+def format_vocab(terms: list[str]) -> str:
+    return ("專有名詞:" + "、".join(terms) + "。") if terms else ""
 
 
 def load_vocab_corrections() -> list[tuple[str, str]]:
@@ -1305,7 +1365,7 @@ def events():
     def generate():
         try:
             # send initial state on connect
-            yield f"data: {json.dumps({'type':'init','has_key':has_api_key_nonblocking(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'cloud_model':load_cloud_model(),'zh_model':load_zh_model(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated(),'draft':_draft_summary(),'version':APP_VERSION,'download':dict(_download_state),'update':_update_info,'export_format':load_export_format()})}\n\n"
+            yield f"data: {json.dumps({'type':'init','has_key':has_api_key_nonblocking(),'lines':_lines,'recording':_recording,'paused':_paused,'language':_language,'backend':load_backend(),'cloud_model':load_cloud_model(),'zh_model':load_zh_model(),'translate':load_translate(),'translate_usage':dict(_translate_usage),'models':_model_status_payload(),'onboarding_completed':load_onboarding_completed(),'translocated':is_translocated(),'draft':_draft_summary(),'version':APP_VERSION,'download':dict(_download_state),'update':_update_info,'export_format':load_export_format(),'keep_recordings':load_keep_recordings(),'retranscribe_pending':len(_pending_retranscription['lines']) if _pending_retranscription else 0})}\n\n"
             while True:
                 try:
                     event = q.get(timeout=25)
@@ -1383,6 +1443,7 @@ def route_start():
     global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
     global _chunk_worker_thread, _transcribe_consumer_thread, _local_worker
     global _sys_capture_thread, _mic_gate_deadline, _mix_gain_sys, _mix_gain_mic
+    global _recorder, _session_first_line, _lines_rev, _stopping
 
     data = request.json or {}
     language = data.get("language", "auto")
@@ -1406,6 +1467,8 @@ def route_start():
     with _lifecycle_lock:
         if _recording:
             return jsonify({"ok": False, "error": "已經在錄音中"})
+        if _stopping:
+            return jsonify({"ok": False, "error": "上一場還在收尾，請稍候再開始。"})
 
         _language = language
         _backend = backend
@@ -1423,9 +1486,14 @@ def route_start():
         _mix_gain_sys = 1.0
         _mix_gain_mic = 1.0
         _translate_ctx.clear()
+        # A re-transcription of the previous session must not touch this one.
+        _retranscribe_cancel.set()
+        discard_pending_retranscription()
         with _buf_lock:
             _sys_buf.clear()
             _mic_buf.clear()
+            _lines_rev += 1
+            _session_first_line = len(_lines)
 
         # Drain any stale items left in the transcribe queue from a previous
         # session (shouldn't happen if /stop joined properly, but defensive).
@@ -1473,6 +1541,9 @@ def route_start():
         # (the monthly re-confirm / system stop). A transient drop self-heals
         # in ~1s instead of silently losing the rest of the meeting; only a
         # persistent failure (e.g. permission revoked) falls back to mic-only.
+        # Opened only once /start can no longer fail, so no rollback path leaks it.
+        _recorder = open_session_recorder()
+
         _sys_capture_thread = threading.Thread(target=_sys_capture_supervisor, daemon=True)
         _sys_capture_thread.start()
 
@@ -1509,6 +1580,8 @@ def route_pause():
     """
     global _paused
     with _lifecycle_lock:
+        if not _recording:
+            return jsonify({"ok": False, "paused": False})
         _paused = not _paused
         paused_now = _paused
         # NOTE: we deliberately do NOT re-arm the mic gate on resume. _sys_ready
@@ -1533,6 +1606,7 @@ def _flush_pending_audio():
         _sys_buf.clear()
         _mic_buf.clear()
     audio = _mix_buffers(sa, ma)
+    _record(audio)
     if len(audio) > SAMPLE_RATE // 2:
         _queue_chunk(audio, "flush", "flush chunk")
 
@@ -1540,12 +1614,31 @@ def _flush_pending_audio():
 @app.route("/stop", methods=["POST"])
 def route_stop():
     global _recording, _paused, _swift_proc, _mic_stream
-    global _chunk_worker_thread, _transcribe_consumer_thread
+    global _chunk_worker_thread, _transcribe_consumer_thread, _recorder, _stopping
+    global _stop_superseded
 
+    # "結束會議" asks for the post-session pass; "新會議" (stop, then clear)
+    # doesn't, so it never spawns a model just to cancel it.
+    retranscribe = bool((request.json or {}).get("retranscribe", False))
+    with _lifecycle_lock:
+        finishing = not _recording and _stopping
+        if finishing and not retranscribe:
+            _stop_superseded = True
+    if finishing:
+        _stop_finished.wait(timeout=60)
+        return jsonify({"ok": True})
     with _lifecycle_lock:
         if not _recording:
             return jsonify({"ok": True})  # idempotent
         _recording = False
+        _stopping = True
+        _stop_superseded = False
+        _stop_finished.clear()
+        recorder, language = _recorder, _language  # cleared after the final flush below
+        # The session as it ends. A /clear or upload during the joins below
+        # bumps _lines_rev, so the re-transcription sees the session is gone.
+        with _buf_lock:
+            rev, first = _lines_rev, _session_first_line
         _paused = False
         _set_quit_guard(False)
 
@@ -1564,26 +1657,43 @@ def route_stop():
         _chunk_worker_thread = None
         _transcribe_consumer_thread = None
 
-    # Join outside the lifecycle lock — chunk_worker needs to acquire _buf_lock
-    # and the consumer needs to drain the queue, both can take seconds.
-    # `newSession` (frontend) chains /stop → /clear, so /stop must return only
-    # after every late _append_line has landed, or /clear will race them.
-    if chunk_worker and chunk_worker.is_alive():
-        chunk_worker.join(timeout=15)
-    # Signal the consumer to exit only NOW — the chunk worker has flushed its
-    # final chunk into the queue, so the consumer drains that (and anything
-    # else queued) before it sees an empty queue + this flag and quits.
-    _consumer_should_exit.set()
-    if consumer and consumer.is_alive():
-        consumer.join(timeout=30)
+    try:
+        # Join outside the lifecycle lock — chunk_worker needs to acquire _buf_lock
+        # and the consumer needs to drain the queue, both can take seconds.
+        # `newSession` (frontend) chains /stop → /clear, so /stop must return only
+        # after every late _append_line has landed, or /clear will race them.
+        if chunk_worker and chunk_worker.is_alive():
+            chunk_worker.join(timeout=15)
+        # Signal the consumer to exit only NOW — the chunk worker has flushed its
+        # final chunk into the queue, so the consumer drains that (and anything
+        # else queued) before it sees an empty queue + this flag and quits.
+        _consumer_should_exit.set()
+        if consumer and consumer.is_alive():
+            consumer.join(timeout=30)
 
-    # NOTE: do NOT close the whisper subprocess here. Worker is now
-    # app-scoped — keeping it alive across sessions skips the 2-3s model
-    # reload between recordings. atexit + the next /start's mismatch
-    # check still handle cleanup on app exit / language switch.
+        # NOTE: do NOT close the whisper subprocess here. Worker is now
+        # app-scoped — keeping it alive across sessions skips the 2-3s model
+        # reload between recordings. atexit + the next /start's mismatch
+        # check still handle cleanup on app exit / language switch.
 
-    _broadcast("state", {"recording": False, "paused": False})
-    _set_status(f"已停止，共 {len(_lines)} 段逐字稿。")
+        _broadcast("state", {"recording": False, "paused": False})
+        _set_status(f"已停止，共 {len(_lines)} 段逐字稿。")
+    finally:
+        # The chunk worker has written its final flush, so the recording is whole.
+        # Cleared even if a join raised, or every later /start is refused.
+        with _lifecycle_lock:
+            _recorder = None
+            _stopping = False
+            superseded = _stop_superseded
+    try:
+        if recorder is not None:
+            recorder.close()
+            if retranscribe and not superseded:
+                start_retranscription(recorder, language, rev, first)
+            else:
+                finish_recording(recorder.path)
+    finally:
+        _stop_finished.set()
     return jsonify({"ok": True})
 
 
@@ -1605,16 +1715,17 @@ def route_upload():
     if not f:
         return jsonify({"ok": False, "error": "沒有收到檔案"})
 
+    global _lines_rev
+    with _buf_lock:
+        _lines_rev += 1  # its lines would be lost if a re-transcription replaced them
     suffix = os.path.splitext(f.filename)[1] or ".wav"
     tmp = tempfile.NamedTemporaryFile(prefix="mt_", suffix=suffix, delete=False)
     f.save(tmp.name)
     fname = f.filename
 
     def _do():
-        vocab = load_vocab()
-        prompt = vocab
-        if language == "zh":
-            prompt = (vocab + " " + _BILINGUAL_PROMPT).strip()
+        terms = load_vocab_terms()
+        prime = _BILINGUAL_PROMPT if language == "zh" else ""
 
         def _on_segment(offset: float, text: str):
             # Same post-processing as the live path: strip non-speech markers /
@@ -1638,7 +1749,7 @@ def route_upload():
 
         _set_status(f"正在轉錄 {fname}，長檔可能需要幾分鐘…")
         try:
-            transcribe_upload(tmp.name, fname, backend, key, language, prompt,
+            transcribe_upload(tmp.name, fname, backend, key, language, terms, prime,
                               _on_segment, _on_progress)
             _set_status("檔案轉錄完成。")
         except Exception as e:
@@ -1658,10 +1769,15 @@ def route_clear():
     # Serialise with /stop so a late _append_line from a still-draining
     # transcribe doesn't land into the cleared list. Also hold _buf_lock so the
     # clear can't interleave between /line's bounds-check and its indexed write.
+    global _lines_rev
+    _stop_finished.wait(timeout=60)  # a /stop still joining would append after the clear
     with _lifecycle_lock:
         with _buf_lock:
             _lines.clear()
+            _lines_rev += 1
     _translate_ctx.clear()
+    _retranscribe_cancel.set()  # nothing left for it to replace; it deletes its recording
+    discard_pending_retranscription()
     clear_draft()
     return jsonify({"ok": True})
 
@@ -1669,7 +1785,7 @@ def route_clear():
 @app.route("/draft/restore", methods=["POST"])
 def route_draft_restore():
     """Load the previous run's unsaved transcript back into the session."""
-    global _pending_draft
+    global _pending_draft, _lines_rev
     draft = _pending_draft
     if not draft:
         return jsonify({"ok": False, "error": "沒有可恢復的逐字稿"})
@@ -1678,6 +1794,7 @@ def route_draft_restore():
             return jsonify({"ok": False, "error": "目前已有逐字稿，無法恢復"})
         with _buf_lock:
             _lines.extend(dict(l) for l in draft["lines"])
+            _lines_rev += 1
     _pending_draft = None
     save_draft()
     return jsonify({"ok": True, "lines": _lines})
@@ -2154,10 +2271,11 @@ def _should_trigger(buf_len: int) -> tuple[bool, str]:
     chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION)
     pause_samples = int(SAMPLE_RATE * PAUSE_DURATION)
     min_speech_samples = int(SAMPLE_RATE * MIN_SPEECH)
+    min_chunk_samples = int(SAMPLE_RATE * MIN_CHUNK_DURATION)
 
     if buf_len >= chunk_samples:
         return True, "cap"
-    if buf_len >= min_speech_samples + pause_samples:
+    if buf_len >= max(min_chunk_samples, min_speech_samples + pause_samples):
         return True, "pause-check"  # actual silence check needs the audio array
     return False, ""
 
@@ -2183,35 +2301,87 @@ def _is_pause_boundary(audio: np.ndarray) -> bool:
     return tail_rms < PAUSE_TAIL_THRESHOLD or tail_rms < body_rms * PAUSE_REL_DROP
 
 
-def _build_prompt(vocab: str) -> str:
-    """Compose the Whisper conditioning prompt from chain + vocab + (zh-only)
-    bilingual style demo.
+def _fit_tail(text: str, budget: int) -> str:
+    """Longest tail of *text* that fits *budget* tokens (the newest context)."""
+    if budget <= 0:
+        return ""
+    if prompt_tokens.count(text) <= budget:
+        return text
+    lo, hi = 0, len(text)  # binary search the start index
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if prompt_tokens.count(text[mid:]) <= budget:
+            hi = mid
+        else:
+            lo = mid + 1
+    return text[lo:].strip()
 
-    Whisper keeps the LAST ~224 tokens of the prompt and truncates the front, so
-    parts are ordered lowest-value-first: chain (droppable continuity) → vocab →
-    style prime LAST, so the prime — the thing that makes code-switching work —
-    always survives. The whole prompt is then capped at PROMPT_MAX_CHARS.
+
+def _fit_vocab(terms: list[str], budget: int) -> list[str]:
+    """The leading *terms* whose formatted vocab fits *budget*. Whole terms
+    only; terms past the budget are left out rather than cut mid-word."""
+    kept: list[str] = []
+    for t in terms:
+        if prompt_tokens.count(format_vocab(kept + [t])) > budget:
+            break
+        kept.append(t)
+    return kept
+
+
+_vocab_overflow_logged: tuple = ()
+
+
+def assemble_prompt(chain: str, terms: list[str], prime: str,
+                    budget: int = PROMPT_TOKEN_BUDGET,
+                    chain_min: int = PROMPT_CHAIN_MIN_TOKENS) -> str:
+    """Compose a Whisper prompt from three parts, each with its own budget.
+
+    Whisper keeps only the LAST prompt tokens, so parts are ordered chain →
+    vocab → prime: the style prime (the thing that makes code-switching work)
+    is always kept whole. Vocab is fitted after holding back *chain_min*
+    tokens for the chain, so a long vocab list can no longer crowd out the
+    previous chunk's text; the chain then takes whatever vocab left over.
+    Token counts don't add up exactly across the joining spaces, so the
+    assembled prompt is counted again and trimmed until it fits."""
+    global _vocab_overflow_logged
+    available = budget - prompt_tokens.count(prime)
+    reserve = min(chain_min, prompt_tokens.count(chain))
+    kept = _fit_vocab(terms, available - reserve)
+    if len(kept) < len(terms) and _vocab_overflow_logged != tuple(terms):
+        _vocab_overflow_logged = tuple(terms)
+        log.info("vocab: %d of %d terms fit the prompt; left out: %s",
+                 len(kept), len(terms), "、".join(terms[len(kept):]))
+    vocab = format_vocab(kept)
+    chain = _fit_tail(chain, available - prompt_tokens.count(vocab))
+
+    def join():
+        return " ".join(p for p in (chain, format_vocab(kept), prime) if p)
+    prompt = join()
+    while prompt_tokens.count(prompt) > budget and (chain or kept):
+        over = prompt_tokens.count(prompt) - budget
+        if chain:
+            chain = _fit_tail(chain, prompt_tokens.count(chain) - over)
+        else:
+            kept = kept[:-1]
+        prompt = join()
+    return prompt
+
+
+def _build_prompt(terms: list[str]) -> str:
+    """Prompt for the next live chunk: recent transcript chain + vocab +
+    (zh-only) bilingual style demo, fitted by assemble_prompt.
 
     The bilingual prime only goes in when language is forced zh — under auto it
     would bias the decoder toward Chinese tokens and turn pure-English chunks
     into garbled CJK. Under forced en it's irrelevant."""
-    parts: list[str] = []
-    if _prompt_chain:
-        # Carry recent transcript for cross-chunk continuity (recurring proper
-        # nouns, ongoing topic). _is_repetition_loop / _has_runaway_repeat gate
-        # the chain, so a longer window doesn't reintroduce loops.
-        chain = " ".join(_prompt_chain)[-PROMPT_CHAIN_CHARS:]
-        parts.append(chain)
-    if vocab:
-        parts.append(vocab)
-    if _language == "zh":
-        parts.append(_BILINGUAL_PROMPT)
-    prompt = " ".join(parts).strip()
-    if len(prompt) > PROMPT_MAX_CHARS:
-        # Keep the TAIL (prime + vocab survive; oldest chain drops first).
-        prompt = prompt[-PROMPT_MAX_CHARS:]
+    # Carry recent transcript for cross-chunk continuity (recurring proper
+    # nouns, ongoing topic). _is_repetition_loop / _has_runaway_repeat gate
+    # the chain, so a longer window doesn't reintroduce loops.
+    chain = " ".join(_prompt_chain)[-PROMPT_CHAIN_CHARS:]
+    prime = _BILINGUAL_PROMPT if _language == "zh" else ""
+    prompt = assemble_prompt(chain, terms, prime)
     if os.environ.get("MT_DEBUG_PROMPT"):
-        print(f"DEBUG prompt len={len(prompt)} chars", file=sys.stderr)
+        print(f"DEBUG prompt ~{prompt_tokens.count(prompt)} tokens", file=sys.stderr)
     return prompt
 
 
@@ -2613,6 +2783,7 @@ def _chunk_worker(api_key: str):
                 _sys_buf.clear()
                 _mic_buf.clear()
                 reason = "pause"
+                consumed = mixed
             else:  # 'cap' — continuous speech hit the hard cap.
                 cut = _best_cut_index(mixed)
                 if cut is not None:
@@ -2622,13 +2793,18 @@ def _chunk_worker(api_key: str):
                     _sys_buf[:] = [sa[cut:]] if len(sa) > cut else []
                     _mic_buf[:] = [ma[cut:]] if len(ma) > cut else []
                     reason = "cap-clean"
+                    consumed = mixed
                 else:
                     # No good gap — keep a 1s overlap tail for context; the seam
                     # echo is stripped downstream by _dedup_boundary (from_cap).
                     _sys_buf[:] = [sa[-overlap_samples:]] if len(sa) > overlap_samples else []
                     _mic_buf[:] = [ma[-overlap_samples:]] if len(ma) > overlap_samples else []
                     reason = "cap"
+                    # The kept tail is the next chunk's head: record it once.
+                    kept = max(len(b[0]) if b else 0 for b in (_sys_buf, _mic_buf))
+                    consumed = mixed[:len(mixed) - kept]
 
+        _record(consumed)
         _queue_chunk(mixed, reason, "chunk")
         _broadcast("queue", _transcribe_queue.qsize())
 
@@ -2673,7 +2849,7 @@ def _translate_text(text: str, api_key: str) -> str:
         "保留專有名詞、產品名、人名、英文縮寫(如 ETA、HBL、AMS)原樣不譯;"
         "若輸入本來就是中文,原樣輸出。"
     )
-    vocab = load_vocab()
+    vocab = format_vocab(load_vocab_terms())
     if vocab:
         sys_prompt += f" 參考{vocab}"
     # Give the translator the previous 1-2 source lines as context (NOT to be
@@ -2791,8 +2967,7 @@ def _transcribe(audio: np.ndarray, api_key: str, reason: str = "flush"):
     _broadcast("transcribing", True)
     _set_status("轉錄中…")
 
-    vocab = load_vocab()
-    prompt = _build_prompt(vocab)
+    prompt = _build_prompt(load_vocab_terms())
 
     try:
         if _backend == "local":
@@ -2999,7 +3174,7 @@ def _wav_bytes(audio: np.ndarray) -> bytes:
 
 
 def transcribe_upload(path: str, fname: str, backend: str, api_key: str, language: str,
-                      base_prompt: str, on_segment, on_progress):
+                      terms: list[str], prime: str, on_segment, on_progress):
     """Transcribe an uploaded file, calling on_segment(offset_seconds, text)
     per piece and on_progress(done, total) as it goes.
 
@@ -3010,7 +3185,8 @@ def transcribe_upload(path: str, fname: str, backend: str, api_key: str, languag
     if backend == "cloud" and os.path.getsize(path) <= UPLOAD_DIRECT_MAX_BYTES:
         on_progress(0, 1)
         with open(path, "rb") as f:
-            on_segment(0.0, _groq_transcribe_file(f, fname, api_key, language, base_prompt))
+            on_segment(0.0, _groq_transcribe_file(f, fname, api_key, language,
+                                                  assemble_prompt("", terms, prime)))
         on_progress(1, 1)
         return
 
@@ -3026,7 +3202,9 @@ def transcribe_upload(path: str, fname: str, backend: str, api_key: str, languag
         prev_tail = ""
         on_progress(0, total)
         for i, (offset, audio) in enumerate(iter_wav_segments(wav, UPLOAD_SEGMENT_SECONDS), start=1):
-            prompt = (base_prompt + (" " + prev_tail if prev_tail else "")).strip()[-PROMPT_MAX_CHARS:]
+            # Previous piece's tail goes FIRST: the old order put it after the
+            # prime, so the char-cap tail-keep dropped vocab before the chain.
+            prompt = assemble_prompt(prev_tail, terms, prime)
             if worker is not None:
                 text = worker.transcribe(audio, language, prompt)
             else:
@@ -3041,6 +3219,347 @@ def transcribe_upload(path: str, fname: str, backend: str, api_key: str, languag
             os.unlink(wav)
         except OSError:
             pass
+
+
+# ─── Post-session re-transcription ──────────────────────────────────────────────
+# The live transcript is built from short chunks so captions keep up. After
+# 結束會議, the whole session's audio goes through the local model in long pieces
+# (more context per decode, no live latency limit) and the user can swap the
+# result in for that session's live lines. Free: no Groq call at any step
+# (translated sessions are skipped rather than re-translated).
+
+RETRANSCRIBE_PIECE_SECONDS = 180  # long enough for context; one piece stays
+                                  # well under RETRANSCRIBE_TIMEOUT on a Mac
+RETRANSCRIBE_TIMEOUT = 900.0
+RETRANSCRIBE_MERGE_CHARS = 4      # whisper segments shorter than this ("對",
+                                  # "OK") join the previous line
+
+
+class SessionRecorder:
+    """Writes the session's mixed audio, exactly the samples the live chunker
+    consumed, to one 16 kHz mono 16-bit WAV. Each write also stores a
+    wall-clock anchor, so an offset in the file maps back to the clock time
+    the live lines are stamped with (pauses leave no gap in the file)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.samples = 0
+        self.anchors: list[tuple[int, float]] = []  # (sample offset, epoch seconds)
+        self._lock = threading.Lock()
+        self._wf = wave.open(path, "wb")
+        self._wf.setnchannels(1)
+        self._wf.setsampwidth(2)
+        self._wf.setframerate(SAMPLE_RATE)
+
+    def write(self, audio: np.ndarray, end_time: Optional[float] = None) -> None:
+        if audio is None or not len(audio):
+            return
+        end = time.time() if end_time is None else end_time
+        with self._lock:
+            if self._wf is None:
+                return
+            self.anchors.append((self.samples, end - len(audio) / SAMPLE_RATE))
+            self._wf.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+            self.samples += len(audio)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._wf is not None:
+                self._wf.close()
+                self._wf = None
+
+    def wallclock(self, offset_seconds: float) -> datetime:
+        """Clock time of *offset_seconds* into the recording."""
+        sample = int(offset_seconds * SAMPLE_RATE)
+        base_sample, base_time = self.anchors[0] if self.anchors else (0, time.time())
+        for s, t in self.anchors:
+            if s > sample:
+                break
+            base_sample, base_time = s, t
+        return datetime.fromtimestamp(base_time + (sample - base_sample) / SAMPLE_RATE)
+
+
+def load_keep_recordings() -> bool:
+    return bool(_read_config().get("keep_recordings", False))
+
+
+def save_keep_recordings(value: bool):
+    cfg = _read_config()
+    cfg["keep_recordings"] = bool(value)
+    _write_config(cfg)
+
+
+def prune_recordings(now: Optional[float] = None) -> None:
+    """Delete recordings that shouldn't be on disk any more: all of them when
+    the user doesn't keep recordings (a crash can leave one behind), else
+    those older than RECORDING_RETENTION_DAYS. Never touches the recording of
+    the session in progress or the one a pending re-transcription points at."""
+    keep = load_keep_recordings()
+    cutoff = (time.time() if now is None else now) - RECORDING_RETENTION_DAYS * 86400
+    in_use = {r.path for r in (_recorder,) if r is not None}
+    with _buf_lock:
+        if _pending_retranscription:
+            in_use.add(_pending_retranscription["path"])
+    try:
+        names = os.listdir(RECORDINGS_DIR)
+    except FileNotFoundError:
+        return
+    for name in names:
+        path = os.path.join(RECORDINGS_DIR, name)
+        if path in in_use:
+            continue
+        try:
+            if os.path.isfile(path) and (not keep or os.path.getmtime(path) < cutoff):
+                os.unlink(path)
+                log.info("deleted recording %s", name)
+        except OSError as e:
+            log.warning("could not delete recording %s: %s", name, e)
+
+
+def _exclude_from_backup(path: str) -> None:
+    """Keep meeting audio out of Time Machine (sticky per-folder exclusion)."""
+    try:
+        subprocess.run(["tmutil", "addexclusion", path], capture_output=True, timeout=10)
+    except Exception as e:
+        log.warning("tmutil addexclusion failed: %s", e)
+
+
+def open_session_recorder() -> Optional[SessionRecorder]:
+    """A recorder for a new session, or None if the file can't be created
+    (recording then goes on without the post-session pass)."""
+    prune_recordings()
+    try:
+        os.makedirs(RECORDINGS_DIR, mode=0o700, exist_ok=True)
+        # Every session, not only on creation: a folder made by an earlier
+        # version was never excluded. tmutil addexclusion is idempotent.
+        _exclude_from_backup(RECORDINGS_DIR)
+        path = os.path.join(RECORDINGS_DIR, datetime.now().strftime("%Y%m%d-%H%M%S") + ".wav")
+        return SessionRecorder(path)
+    except OSError as e:
+        log.warning("session recording disabled: %s", e)
+        return None
+
+
+def _record(audio: np.ndarray) -> None:
+    rec = _recorder
+    if rec is not None:
+        try:
+            rec.write(audio)
+        except Exception as e:  # never let the side recording break live transcription
+            log.warning("session recording write failed: %s", e)
+
+
+def compress_recording(wav_path: str) -> str:
+    """Re-encode a finished session WAV as AAC (.m4a, about 1/5 the size) with
+    macOS's built-in afconvert. Returns the kept file's path; on failure the
+    WAV is kept as-is."""
+    out = os.path.splitext(wav_path)[0] + ".m4a"
+    try:
+        subprocess.run(["afconvert", "-f", "m4af", "-d", "aac", "-b", "48000", wav_path, out],
+                       check=True, capture_output=True, timeout=600)
+        os.unlink(wav_path)
+        return out
+    except Exception as e:
+        log.warning("recording compression failed, keeping WAV: %s", e)
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        return wav_path
+
+
+def finish_recording(path: str) -> None:
+    """A session's recording is no longer needed by the app: delete it, or,
+    when the user keeps recordings, compress it and keep it for
+    RECORDING_RETENTION_DAYS."""
+    if not os.path.exists(path):
+        return
+    if load_keep_recordings():
+        compress_recording(path)
+        return
+    try:
+        os.unlink(path)
+    except OSError as e:
+        log.warning("could not delete recording: %s", e)
+
+
+def segments_to_lines(segments: list[tuple[float, str]], language: str) -> list[tuple[float, str]]:
+    """Clean whisper segments (offset seconds, text) with the same filters as
+    the live path, cap a run of identical segments at two (a loop split across
+    segments, which per-segment cleaning can't see), and fold very short
+    segments into the previous line."""
+    lines: list[tuple[float, str]] = []
+    run_key, run_len = None, 0
+    keys: list[str] = []  # every kept-or-dropped segment, for A/B loop detection
+    for offset, text in segments:
+        text = _drop_hallucinations((text or "").strip(), language)
+        if not text or _is_loop_hallucination(text):
+            continue
+        text = apply_vocab_corrections(_strip_display_labels(_trim_repetition(_collapse_runs(text))))
+        if not text.strip():
+            continue
+        key = _norm_clause(text)
+        run_len = run_len + 1 if key == run_key else 1
+        run_key = key
+        keys.append(key)
+        if run_len > 2:
+            continue
+        # A, B, A, B, …: once the pair repeats, the rest of the loop goes
+        # (the live path's _collapse_runs does this within one chunk).
+        if len(keys) >= 4 and keys[-1] == keys[-3] and keys[-2] == keys[-4] and keys[-1] != keys[-2]:
+            continue
+        if lines and len(text) < RETRANSCRIBE_MERGE_CHARS:
+            lines[-1] = (lines[-1][0], lines[-1][1] + " " + text)
+        else:
+            lines.append((offset, text))
+    return lines
+
+
+def retranscribe_recording(recorder: SessionRecorder, worker: "LocalWhisperWorker",
+                           language: str, cancel: threading.Event,
+                           on_progress=None) -> Optional[list[dict]]:
+    """Transcript lines for the whole recording, stamped with the clock times
+    of the live session; None if *cancel* was set before it finished."""
+    terms = load_vocab_terms()
+    prime = _BILINGUAL_PROMPT if language == "zh" else ""
+    total = max(1, int(np.ceil(recorder.samples / SAMPLE_RATE / RETRANSCRIBE_PIECE_SECONDS)))
+    out: list[dict] = []
+    prev_tail = ""
+    for i, (offset, audio) in enumerate(iter_wav_segments(recorder.path, RETRANSCRIBE_PIECE_SECONDS), start=1):
+        if cancel.is_set():
+            return None
+        if on_progress:
+            on_progress(i, max(total, i))
+        segments = worker.transcribe_segments(audio, language, assemble_prompt(prev_tail, terms, prime),
+                                              timeout=RETRANSCRIBE_TIMEOUT)
+        cleaned = segments_to_lines(segments, language)
+        for seg_offset, text in cleaned:
+            out.append({"ts": recorder.wallclock(offset + seg_offset).strftime("%H:%M:%S"),
+                        "text": text, "tr": "", "tag": ""})
+        # Prime the next piece the way the live chain is primed: from cleaned
+        # text, and not at all when this piece looped (it would carry over).
+        raw = " ".join(t for _, t in segments if t.strip())
+        tail = " ".join(t for _, t in cleaned)
+        if tail and not (_is_repetition_loop(raw) or _has_runaway_repeat(raw)):
+            prev_tail = _strip_speaker_labels(tail).strip()[-PROMPT_CHAIN_CHARS:]
+    return None if cancel.is_set() else out
+
+
+def _session_has_translation(first: int) -> bool:
+    with _buf_lock:
+        return any(l.get("tr") for l in _lines[first:])
+
+
+def start_retranscription(recorder: SessionRecorder, language: str, rev: int, first: int) -> None:
+    """After 結束會議: re-transcribe the session in the background with the
+    local model the language wants, then offer it to the user, who applies
+    or dismisses it (nothing is swapped automatically). Skipped, keeping the
+    live lines, when that model isn't downloaded (the bundled small model is
+    less accurate than the live result) or when a line of the session was translated
+    (re-transcribed lines can't carry the live translations, and redoing them
+    would spend the Groq quota). *rev* and *first* are the session as /stop
+    found it; if the transcript has changed since (cleared, say), it's skipped."""
+    global _retranscribe_cancel, _retranscribe_thread
+    with _buf_lock:
+        changed = _lines_rev != rev
+    if changed or recorder.samples < SAMPLE_RATE:
+        finish_recording(recorder.path)
+        return
+    if _session_has_translation(first):
+        _set_status("這場有即時翻譯，整場重轉會蓋掉翻譯，所以保留即時版本。")
+        finish_recording(recorder.path)
+        return
+    alias = pick_local_model(language)
+    model_path = model_local_path(alias)
+    if model_path is None:
+        # Not auto-downloaded for cloud users (it's a 1.6 GB model): say so,
+        # so the skipped pass isn't silent.
+        log.info("re-transcription skipped: model %s not downloaded", alias)
+        _set_status("會後整場重轉需要本機語音模型，到「設定」下載後，下一場會自動重轉。")
+        finish_recording(recorder.path)
+        return
+    cancel = threading.Event()
+    _retranscribe_cancel.set()  # at most one pass at a time
+    _retranscribe_cancel = cancel
+
+    def _run():
+        global _pending_retranscription
+        def _progress(done: int, total: int):
+            _set_status(f"正在用本機模型重新整理逐字稿（{done}/{total}）…")
+        lines = None
+        try:
+            if not cancel.is_set():  # a 新會議 right after 結束 shouldn't load a model
+                worker = _ensure_local_worker(model_path)
+                lines = retranscribe_recording(recorder, worker, language, cancel, _progress)
+        except Exception as e:
+            log.exception("re-transcription failed")
+            if not cancel.is_set():
+                _set_status(f"重新整理逐字稿失敗，保留即時版本：{_friendly_error(e)}")
+        if lines:
+            offered = False
+            with _buf_lock:
+                if not cancel.is_set() and _lines_rev == rev:
+                    _pending_retranscription = {"lines": lines, "first": first, "rev": rev,
+                                                "path": recorder.path}
+                    offered = True
+            if offered:
+                _broadcast("retranscribe_ready", {"count": len(lines)})
+                _set_status(f"本機模型整理好逐字稿了（{len(lines)} 段），請選擇要不要取代。")
+                return  # the recording is finished when the user decides
+        elif lines == [] and not cancel.is_set():
+            _set_status("本機模型沒有轉出內容，保留即時版本。")
+        finish_recording(recorder.path)
+
+    _retranscribe_thread = threading.Thread(target=_run, daemon=True)
+    _retranscribe_thread.start()
+
+
+def discard_pending_retranscription() -> None:
+    global _pending_retranscription
+    with _buf_lock:
+        pending, _pending_retranscription = _pending_retranscription, None
+    if pending:
+        _broadcast("retranscribe_discarded", True)
+        finish_recording(pending["path"])
+
+
+@app.route("/retranscribe/apply", methods=["POST"])
+def route_retranscribe_apply():
+    """Replace the session's live lines with the finished re-transcription."""
+    global _pending_retranscription
+    with _lifecycle_lock, _buf_lock:
+        pending = _pending_retranscription
+        if not pending:
+            return jsonify({"ok": False, "error": "沒有整理好的逐字稿"})
+        _pending_retranscription = None
+        if _recording or _lines_rev != pending["rev"]:
+            ok = False
+        else:
+            _lines[pending["first"]:] = pending["lines"]
+            ok = True
+        lines = list(_lines)
+    finish_recording(pending["path"])
+    if not ok:
+        return jsonify({"ok": False, "error": "逐字稿已經變動，保留目前的版本。"})
+    save_draft()
+    _set_status(f"已換成本機模型整理的逐字稿，共 {len(pending['lines'])} 段。")
+    log.info("re-transcription applied from line %d (%d lines)", pending["first"], len(pending["lines"]))
+    return jsonify({"ok": True, "lines": lines})
+
+
+@app.route("/retranscribe/dismiss", methods=["POST"])
+def route_retranscribe_dismiss():
+    discard_pending_retranscription()
+    _set_status("保留即時逐字稿。")
+    return jsonify({"ok": True})
+
+
+@app.route("/keep_recordings", methods=["POST"])
+def route_keep_recordings():
+    save_keep_recordings(bool((request.json or {}).get("enabled", False)))
+    if not load_keep_recordings():
+        prune_recordings()  # turning it off removes what was kept
+    return jsonify({"ok": True, "enabled": load_keep_recordings()})
 
 
 # ─── In-app updates (Sparkle) ─────────────────────────────────────────────────
@@ -3121,6 +3640,7 @@ if __name__ == "__main__":
     threading.Thread(target=preload_api_key, daemon=True).start()
     _pending_draft = load_draft()
     cleanup_orphan_tempfiles()
+    prune_recordings()
     reap_orphan_audio_taps()
     _translate_enabled = load_translate()  # restore the toggle from config
 

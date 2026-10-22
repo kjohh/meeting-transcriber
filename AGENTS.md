@@ -69,9 +69,10 @@ ScreenCaptureKit 是 macOS 13+ 原生 API，不需安裝虛擬音訊裝置。Swi
 借用 [lazy-take-notes](https://github.com/CJHwong/lazy-take-notes) 的 VAD heuristic：
 
 - **`CHUNK_DURATION = 25.0`** — 滿 25s 強制切（避免長句無限累積）
-- **`PAUSE_DURATION = 1.5`** — 尾部連續 1.5s 靜音才認定句末
+- **`PAUSE_DURATION = 2.0`** — 尾部連續 2s 靜音才認定句末（1.5s 會把句中換氣切斷）
 - **`SILENCE_THRESHOLD = 0.005`** — 逐 frame voice-activity 閾值（低，讓輕聲講話的 frame 仍算 active）
 - **`MIN_SPEECH = 2.0`** — buffer 至少 2s 語音才考慮 silence-trigger
+- **`MIN_CHUNK_DURATION = 10.0`** — 靜音最早在 buffer 滿 10s 才能切，字幕延遲 10–25s（細節見 CLAUDE.md）
 - **`OVERLAP = 1.0`** — 僅「hard-cap」trigger 保留 overlap tail；silence-trigger 句子已結束，不保留（避免 stale audio 拖到下一輪觸發鬼影 chunk）。保留的 1s overlap 會被轉錄兩次，由 `_dedup_boundary` 在 append 前砍掉接縫重複（見下）
 
 **`_chunk_worker` 把 snapshot + decision + consume 包在同一個 `_buf_lock` block 內** — 否則 `/pause` 觸發的 flush thread 跟 chunker 會 race 出 double transcribe。
@@ -82,7 +83,7 @@ Whisper 的 `prompt` 參數**不是 instruction，是 conditioning context**。�
 
 1. 強制 `language="zh"`（中文 decoder 天然支援 latin token interleaving）
 2. `_BILINGUAL_PROMPT` 提供典型中英夾雜「範例句」prime decoder 模仿這種風格
-3. Prompt chain 把上一段 transcript 最後 80 字元加進去，給跨 chunk 連續性
+3. Prompt chain 把上一段 transcript 結尾加進去，給跨 chunk 連續性；三部分依 token 預算組合（`assemble_prompt`，細節見 CLAUDE.md）
 
 Prompt chain 太長會誘發 Whisper 進入 **repetition loop**（複製 prompt 內容當輸出）。所以 chain 只留 1 段、上限 80 字元；偵測到輸出有 repetition loop 時不更新 chain。
 

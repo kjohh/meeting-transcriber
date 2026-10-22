@@ -70,7 +70,7 @@ DEVELOPER_ID="Developer ID Application: HAO HSIANG HSIA (R7RB39B5XN)" NOTARY_PRO
 ## 主要功能
 
 - **三種語言模式**：`自動`（預設，Whisper 逐段自動偵測，純英文 / 純中文 / 混合都不用先設定）/ `強制中文`（force `language="zh"` + bilingual prompt 範例 prime decoder + 本機換 Breeze ASR，適合中文 / 中英夾雜會議）/ `強制英文`
-- **Silence-aware chunking**：句子不會被死板的計時器切兩半。25 秒上限或 1.5 秒靜音偵測才切片
+- **Silence-aware chunking**：句子不會被死板的計時器切兩半。滿 10 秒後遇到 2 秒靜音、或 25 秒上限才切片
 - **Repetition trim**：Whisper 經典的「同句重複 N 次」hallucination 自動截斷為最多 2 次
 - **自訂詞彙表**：UI 內編輯 → `.vocab.local`（gitignored）→ 每次 chunk 即時讀取，prime Whisper 認識專有名詞 / 品牌 / 縮寫 / 人名
 - **Backend 切換**：UI dropdown 一鍵切雲端 / 本機，敏感會議走本地
@@ -96,6 +96,7 @@ session 期間語言 / backend 鎖定（避免「UI 改了但 in-flight session 
 - **設定儲存**：
   - Source mode：`./.config.json` + `./.vocab.local`（gitignored）
   - Bundle mode：`~/Library/Application Support/Meeting Transcriber/`
+- **整場錄音**：錄音時暫存在設定目錄的 `recordings/`（不進 Time Machine）。按「結束會議」後用本機模型整場重轉，由你選要不要取代即時逐字稿；用完就刪。設定開「保留會議錄音」才壓成 `.m4a`（約 22 MB/小時）保留 7 天
 - **本地模型 cache**：`~/Library/Application Support/pywhispercpp/models/`（與 lazy-take-notes 共用）
 - **簽章**：`scripts/sign-and-package.sh` 由內而外簽章 + hardened runtime。設 `DEVELOPER_ID`（+ `NOTARY_PROFILE`）會公證並產出 .dmg；沒設時是 ad-hoc 開發版（要清舊授權加 `RESET_TCC=1`）
 
