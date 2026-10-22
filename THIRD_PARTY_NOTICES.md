@@ -10,6 +10,7 @@ Meeting Transcriber 使用了下列開放原始碼軟體與模型。感謝這些
 | Whisper large-v3-turbo（ggml 格式） | 多語通用模型（下載） | MIT | https://huggingface.co/ggerganov/whisper.cpp |
 | Breeze ASR 25（MediaTek Research） | 中文強化模型（下載） | Apache-2.0 | https://huggingface.co/MediaTek-Research/Breeze-ASR-25 |
 | Breeze ASR 25 ggml 轉檔 | 中文強化模型的 whisper.cpp 格式 | Apache-2.0 | https://huggingface.co/alan314159/Breeze-ASR-25-whispercpp |
+| Whisper 多語詞彙表（`multilingual.tiktoken`） | 計算提示詞的 token 數 | MIT | https://github.com/openai/whisper |
 
 ## 程式元件
 

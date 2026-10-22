@@ -37,41 +37,80 @@ def silence(seconds):
     return np.zeros(int(seconds * SR), dtype=np.float32)
 
 
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "prompt_token_counts.json")
+
+
+class TokenCounts(unittest.TestCase):
+    """prompt_tokens must reproduce the real tokenizers. Fixture counts were
+    measured with OpenAI's tokenizer (tiktoken, what Groq runs) and with
+    whisper.cpp's whisper_tokenize on the Breeze model."""
+
+    def test_matches_both_real_tokenizers(self):
+        import json
+        import prompt_tokens as T
+        with open(FIXTURE, encoding="utf-8") as f:
+            cases = json.load(f)
+        self.assertGreater(len(cases), 40)
+        for c in cases:
+            self.assertEqual(T.bpe_count(c["text"]), c["groq"], c["text"])
+            self.assertEqual(T.cpp_count(c["text"]), c["whisper_cpp"], c["text"])
+            self.assertEqual(T.count(c["text"]), max(c["groq"], c["whisper_cpp"]))
+
+    def test_missing_vocab_falls_back_to_byte_length(self):
+        import prompt_tokens as T
+        try:
+            T.configure("/nonexistent/vocab")
+            self.assertEqual(T.count("蔡沛甄 ab"), len("蔡沛甄 ab".encode("utf-8")))
+        finally:
+            T.configure(os.path.join(os.path.dirname(FIXTURE), "..", "..", "assets",
+                                     "whisper-multilingual.tiktoken"))
+
+
 class PromptBudget(unittest.TestCase):
+    def fits(self, p):
+        import prompt_tokens as T
+        self.assertLessEqual(T.count(p), A.PROMPT_TOKEN_BUDGET)
+
     def test_long_vocab_no_longer_crowds_out_the_chain(self):
+        import prompt_tokens as T
         chain = CHAIN * 3  # longer than the chain reserve
         p = A.assemble_prompt(chain, LONG_TERMS, A._BILINGUAL_PROMPT)
-        self.assertLessEqual(A.estimate_prompt_tokens(p), A.PROMPT_TOKEN_BUDGET)
+        self.fits(p)
         chain_part = p.split("專有名詞:")[0].strip()
-        self.assertGreaterEqual(A.estimate_prompt_tokens(chain_part), A.PROMPT_CHAIN_MIN_TOKENS - 2)
+        self.assertGreaterEqual(T.count(chain_part), A.PROMPT_CHAIN_MIN_TOKENS - 2)
         self.assertTrue(chain.endswith(chain_part), "chain keeps the NEWEST text")
+
+    def test_rare_names_without_chain_or_prime_stay_in_budget(self):
+        # Rare CJK names cost more tokens per character; whisper.cpp would cut
+        # the head of an over-long prompt, mid-term.
+        names = ["蔡沛甄", "鄧婕羚", "魏翊瑄", "蘇韡", "龔鈺翔", "Tzu-Huei", "Carpusher"] * 12
+        p = A.assemble_prompt("", names, "")
+        self.fits(p)
+        self.assertTrue(p.startswith("專有名詞:") and p.endswith("。"))
 
     def test_chain_shorter_than_reserve_is_kept_whole(self):
         p = A.assemble_prompt(CHAIN, LONG_TERMS, A._BILINGUAL_PROMPT)
         self.assertTrue(p.startswith(CHAIN + " 專有名詞:"))
+        self.fits(p)
 
     def test_prime_is_whole_and_last(self):
-        p = A.assemble_prompt(CHAIN, LONG_TERMS, A._BILINGUAL_PROMPT)
+        p = A.assemble_prompt(CHAIN * 3, LONG_TERMS * 3, A._BILINGUAL_PROMPT)
         self.assertTrue(p.endswith(A._BILINGUAL_PROMPT))
+        self.fits(p)
 
     def test_vocab_keeps_whole_terms_in_file_order(self):
-        p = A.assemble_prompt(CHAIN, LONG_TERMS, A._BILINGUAL_PROMPT)
+        p = A.assemble_prompt(CHAIN * 3, LONG_TERMS * 3, A._BILINGUAL_PROMPT)
         vocab = p[p.index("專有名詞:") + len("專有名詞:"):p.index("。", p.index("專有名詞:"))]
         kept = vocab.split("、")
-        self.assertEqual(kept, LONG_TERMS[:len(kept)])
+        self.assertEqual(kept, (LONG_TERMS * 3)[:len(kept)])
         self.assertGreater(len(kept), 0)
 
     def test_short_vocab_leaves_room_for_more_chain(self):
         long_chain = CHAIN * 4
         short = A.assemble_prompt(long_chain, ["GoFreight"], A._BILINGUAL_PROMPT)
-        long = A.assemble_prompt(long_chain, LONG_TERMS, A._BILINGUAL_PROMPT)
+        long = A.assemble_prompt(long_chain, LONG_TERMS * 3, A._BILINGUAL_PROMPT)
         self.assertGreater(len(short.split("專有名詞:")[0]), len(long.split("專有名詞:")[0]))
-        self.assertLessEqual(A.estimate_prompt_tokens(short), A.PROMPT_TOKEN_BUDGET)
-
-    def test_no_chain_lets_vocab_use_the_budget(self):
-        p = A.assemble_prompt("", LONG_TERMS, A._BILINGUAL_PROMPT)
-        self.assertTrue(p.startswith("專有名詞:"))
-        self.assertLessEqual(A.estimate_prompt_tokens(p), A.PROMPT_TOKEN_BUDGET)
+        self.fits(short)
 
     def test_empty_parts(self):
         self.assertEqual(A.assemble_prompt("", [], ""), "")
@@ -167,10 +206,19 @@ class Recorder(unittest.TestCase):
             open(p, "wb").close()
         now = time.time()
         os.utime(old, (now - 8 * 86400, now - 8 * 86400))
-        with mock.patch.object(A, "RECORDINGS_DIR", self.dir):
+        with mock.patch.object(A, "RECORDINGS_DIR", self.dir), \
+                mock.patch.object(A, "load_keep_recordings", return_value=True):
             A.prune_recordings(now=now)
         self.assertFalse(os.path.exists(old))
         self.assertTrue(os.path.exists(new))
+
+    def test_prune_deletes_everything_when_not_keeping(self):
+        leftover = os.path.join(self.dir, "crash.wav")
+        open(leftover, "wb").close()
+        with mock.patch.object(A, "RECORDINGS_DIR", self.dir), \
+                mock.patch.object(A, "load_keep_recordings", return_value=False):
+            A.prune_recordings()
+        self.assertFalse(os.path.exists(leftover))
 
     def test_compress_replaces_wav_with_smaller_m4a(self):
         rec = self._rec()
@@ -247,14 +295,19 @@ class FakeWorker:
         return self.per_piece(len(self.prompts))
 
 
+def make_recording(d, audio, end):
+    rec = A.SessionRecorder(os.path.join(d, "s.wav"))
+    rec.write(audio, end_time=time.mktime(end + (0, 0, -1)))
+    rec.close()
+    return rec
+
+
 class Retranscribe(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.rec = A.SessionRecorder(os.path.join(self.dir, "s.wav"))
         # 200 s starting 11:00:00; the 2 s gap at 170 s is where piece 1 ends.
-        self.rec.write(np.concatenate([tone(170), silence(2), tone(28)]),
-                       end_time=time.mktime((2026, 10, 22, 11, 3, 20, 0, 0, -1)))
-        self.rec.close()
+        self.rec = make_recording(self.dir, np.concatenate([tone(170), silence(2), tone(28)]),
+                                  (2026, 10, 22, 11, 3, 20))
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -269,67 +322,118 @@ class Retranscribe(unittest.TestCase):
         self.assertEqual(len(w.prompts), 2)  # 200 s → two 180 s pieces
         self.assertIn("第二句話", w.prompts[1], "next piece is primed with the previous text")
 
+    def test_a_loop_split_across_segments_is_capped_at_two(self):
+        segs = [(float(i), "Let's do it.") for i in range(5)] + [(6.0, "好，下一個議題")]
+        texts = [t for _, t in A.segments_to_lines(segs, "zh")]
+        self.assertEqual(texts, ["Let's do it.", "Let's do it.", "好，下一個議題"])
+
+    def test_a_looping_piece_does_not_prime_the_next(self):
+        loop = [(float(i), "這個用途,這個用途,這個用途,這個用途") for i in range(4)]
+        w = FakeWorker(lambda n: loop if n == 1 else [(1.0, "第二段")])
+        A.retranscribe_recording(self.rec, w, "zh", threading.Event())
+        self.assertNotIn("用途", w.prompts[1])
+
     def test_cancel_returns_none(self):
         cancel = threading.Event()
         cancel.set()
         self.assertIsNone(A.retranscribe_recording(self.rec, FakeWorker(lambda n: []), "zh", cancel))
 
 
-class SyncThread:
-    def __init__(self, target, daemon=None):
-        self.target = target
+class EndMeetingFlow(unittest.TestCase):
+    """Drives the real Flask routes in the order the UI calls them."""
 
-    def start(self):
-        self.target()
-
-
-class ReplaceLiveLines(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.rec = A.SessionRecorder(os.path.join(self.dir, "s.wav"))
-        self.rec.write(tone(5), end_time=time.mktime((2026, 10, 22, 11, 0, 5, 0, 0, -1)))
-        self.rec.close()
-        self._saved = (list(A._lines), A._lines_rev, A._session_first_line, A.DRAFT_FILE)
+        self.saved = (list(A._lines), A._lines_rev, A._session_first_line, A.DRAFT_FILE,
+                      A.RECORDINGS_DIR, A._recording, A._recorder, A._language, A._translate_enabled)
+        A.RECORDINGS_DIR = self.dir
+        A.DRAFT_FILE = os.path.join(self.dir, "draft.json")
         A._lines[:] = [{"ts": "10:00:00", "text": "上一場", "tr": "", "tag": ""},
                        {"ts": "11:00:00", "text": "即時版本", "tr": "", "tag": ""}]
-        A._session_first_line = 1
-        A.DRAFT_FILE = os.path.join(self.dir, "draft.json")
-        self.patches = [
-            mock.patch.object(A, "model_local_path", return_value="/fake/model.bin"),
-            mock.patch.object(A, "_ensure_local_worker",
-                              return_value=FakeWorker(lambda n: [(0.0, "重新整理後的版本")])),
-            mock.patch.object(A.threading, "Thread", SyncThread),
-            mock.patch.object(A, "_broadcast"),
-        ]
-        for p in self.patches:
-            p.start()
+        A._session_first_line, A._language, A._translate_enabled = 1, "zh", False
+        self.worker = FakeWorker(lambda n: [(0.0, "重新整理後的版本")])
+        self.ensure = mock.patch.object(A, "_ensure_local_worker", return_value=self.worker)
+        self.patches = [mock.patch.object(A, "model_local_path", return_value="/fake/model.bin"),
+                        self.ensure, mock.patch.object(A, "_broadcast"),
+                        mock.patch.object(A, "load_keep_recordings", return_value=False),
+                        mock.patch.dict(os.environ, {"MT_NO_TOKEN": "1"})]
+        self.ensure_mock = [p.start() for p in self.patches][1]
+        self.client = A.app.test_client()
 
     def tearDown(self):
         for p in self.patches:
             p.stop()
-        A._lines[:], A._lines_rev, A._session_first_line, A.DRAFT_FILE = self._saved
+        (A._lines[:], A._lines_rev, A._session_first_line, A.DRAFT_FILE, A.RECORDINGS_DIR,
+         A._recording, A._recorder, A._language, A._translate_enabled) = self.saved
+        A._pending_retranscription = None
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def test_replaces_only_this_sessions_lines_and_compresses(self):
-        A.start_retranscription(self.rec, "zh")
+    def _record_session(self):
+        A._recorder = A.SessionRecorder(os.path.join(self.dir, "s.wav"))
+        A._recorder.write(tone(5))
+        A._recording = True
+
+    def _wait_idle(self):
+        if A._retranscribe_thread is not None:
+            A._retranscribe_thread.join(5)
+
+    def post(self, path, body=None):
+        return self.client.post(path, json=body or {}).get_json()
+
+    def test_end_meeting_offers_then_apply_replaces_only_this_session(self):
+        self._record_session()
+        self.post("/stop", {"retranscribe": True})
+        self._wait_idle()
+        self.assertIsNotNone(A._pending_retranscription)
+        self.assertEqual([l["text"] for l in A._lines], ["上一場", "即時版本"], "not swapped by itself")
+        res = self.post("/retranscribe/apply")
+        self.assertTrue(res["ok"])
         self.assertEqual([l["text"] for l in A._lines], ["上一場", "重新整理後的版本"])
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "s.m4a")))
+        self.assertEqual(os.listdir(self.dir), ["draft.json"], "recording deleted once applied")
 
-    def test_an_edit_during_the_pass_keeps_the_live_lines(self):
-        real = A.retranscribe_recording
+    def test_new_meeting_stop_then_clear_loads_no_model_and_deletes_audio(self):
+        self._record_session()
+        self.post("/stop")            # 新會議 sends no retranscribe flag
+        self.post("/clear")
+        self.ensure_mock.assert_not_called()
+        self.assertEqual([n for n in os.listdir(self.dir) if n != "draft.json"], [])
 
-        def edit_midway(*a, **kw):
-            A._lines_rev += 1  # what /line, /clear or an upload does
-            return real(*a, **kw)
-        with mock.patch.object(A, "retranscribe_recording", side_effect=edit_midway):
-            A.start_retranscription(self.rec, "zh")
+    def test_clear_after_end_meeting_cancels_and_deletes_audio(self):
+        self._record_session()
+        self.post("/stop", {"retranscribe": True})
+        self._wait_idle()
+        self.post("/clear")
+        self.assertIsNone(A._pending_retranscription)
+        self.assertEqual([n for n in os.listdir(self.dir) if n != "draft.json"], [])
+
+    def test_dismiss_keeps_live_lines_and_deletes_audio(self):
+        self._record_session()
+        self.post("/stop", {"retranscribe": True})
+        self._wait_idle()
+        self.post("/retranscribe/dismiss")
         self.assertEqual([l["text"] for l in A._lines], ["上一場", "即時版本"])
+        self.assertEqual([n for n in os.listdir(self.dir) if n != "draft.json"], [])
+
+    def test_translated_session_is_not_retranscribed(self):
+        A._lines[1]["tr"] = "即時翻譯"
+        self._record_session()
+        self.post("/stop", {"retranscribe": True})
+        self.ensure_mock.assert_not_called()
+        self.assertIsNone(A._pending_retranscription)
+        self.assertEqual(A._lines[1]["tr"], "即時翻譯")
 
     def test_skipped_when_the_model_is_not_downloaded(self):
+        self._record_session()
         with mock.patch.object(A, "model_local_path", return_value=None):
-            A.start_retranscription(self.rec, "zh")
-        self.assertEqual([l["text"] for l in A._lines], ["上一場", "即時版本"])
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "s.m4a")))
+            self.post("/stop", {"retranscribe": True})
+        self.ensure_mock.assert_not_called()
+        self.assertEqual([n for n in os.listdir(self.dir) if n != "draft.json"], [])
+
+    def test_keep_recordings_compresses_instead_of_deleting(self):
+        self._record_session()
+        with mock.patch.object(A, "load_keep_recordings", return_value=True):
+            self.post("/stop")
+        self.assertEqual(sorted(os.listdir(self.dir)), ["s.m4a"])
 
 
 if __name__ == "__main__":

@@ -35,7 +35,8 @@ assets/icon.png                            ← 1024×1024 source icon
 .draft.json                                ← 逐字稿自動存檔（同 .config.json 的目錄規則）
 .config.json                               ← backend + onboarding flag 等設定（Groq 金鑰在鑰匙圈，不在這裡）（git-ignored，source mode 在 project root；bundle mode 在 ~/Library/Application Support/Meeting Transcriber/）
 .vocab.local                               ← 自訂詞彙（git-ignored，同上規則）
-recordings/                                ← 整場錄音，會後重轉用，7 天後自動刪（同上規則）
+recordings/                                ← 整場錄音，會後重轉用；用完即刪，設定開保留才留 7 天（同上規則）
+assets/whisper-multilingual.tiktoken       ← Whisper 詞彙表，算 prompt token 用（prompt_tokens.py）
 .vocab.local.example                       ← 詞彙範本
 dist/Meeting Transcriber.app               ← py2app 產出（git-ignored）
 icon.icns                                  ← build-icon.sh 產出（git-ignored）
@@ -121,7 +122,9 @@ Whisper 的 `prompt` 參數**不是 instruction，是 conditioning context**。�
 2. `_BILINGUAL_PROMPT` 提供典型中英夾雜「範例句」prime decoder 模仿這種風格
 3. Prompt chain 把上一段 transcript 結尾加進去，給跨 chunk 連續性
 
-Prompt 由 `assemble_prompt` 依 token 預算組（Whisper 只留最後 224 token，`PROMPT_TOKEN_BUDGET = 220`）：順序 chain → 詞彙 → 示範句，示範句永遠完整保留；先替 chain 保留 `PROMPT_CHAIN_MIN_TOKENS` 再放詞彙（整個詞，照檔案順序，放不下的後面幾個略過），chain 再吃剩下的。token 用 `estimate_prompt_tokens` 估（中日韓字 1.5、其他字元 0.4，對真實 tokenizer 校準過，偏高估）。舊的 330 字上限曾讓詞彙＋示範句吃滿，chain 被砍到一個字都不剩。
+Prompt 由 `assemble_prompt` 依 token 預算組（whisper.cpp 只留最後 223 token、API 224，`PROMPT_TOKEN_BUDGET = 220`）：順序 chain → 詞彙 → 示範句，示範句永遠完整保留；先替 chain 保留 `PROMPT_CHAIN_MIN_TOKENS` 再放詞彙（整個詞，照檔案順序，放不下的後面幾個略過並寫 log），chain 再吃剩下的，組完再數一次，超過就再砍 chain。舊的 330 字上限曾讓詞彙＋示範句吃滿，chain 被砍到一個字都不剩。
+
+token 用 `prompt_tokens.count()` 精確計算，不載入模型：同時算 OpenAI 的 BPE（Groq 用的）與 whisper.cpp 的切法（ASCII-only regex + 由左最長比對，常常比 BPE 多），取較大值。詞彙表是 `assets/whisper-multilingual.tiktoken`（OpenAI，MIT），所有多語 Whisper 模型共用（含 large-v3/turbo、Breeze）。`tests/fixtures/prompt_token_counts.json` 是用 tiktoken 與 whisper.cpp 的 `whisper_tokenize`（Breeze）實測的數字，兩邊都要逐字相符。檔案不見時退回 UTF-8 位元組數（兩種切法的上限）。
 
 Prompt chain 太長會誘發 Whisper 進入 **repetition loop**（複製 prompt 內容當輸出）。所以 chain 只留 1 段、上限 80 字元；偵測到輸出有 repetition loop 時不更新 chain。
 
@@ -163,12 +166,15 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 
 ### 會後整場重轉（本機模型）
 
-錄音時 `SessionRecorder` 把 chunker 實際消耗的混音（每個 sample 只寫一次）寫進 `recordings/YYYYMMDD-HHMMSS.wav`（同 `.config.json` 的目錄規則），每次寫入附牆鐘時間錨點，暫停不會在檔案留空白。`/stop` 後 `start_retranscription` 在背景用該語言要的本機模型（zh = Breeze）每 180 秒一段整場重轉，帶上一段結尾當 prompt，時間戳換回會議當下的時間，再取代**這一場**的即時逐字稿（`_session_first_line` 之後），前端收 `transcript_replace` 重畫。
+錄音時 `SessionRecorder` 把 chunker 實際消耗的混音（每個 sample 只寫一次）寫進 `recordings/YYYYMMDD-HHMMSS.wav`（同 `.config.json` 的目錄規則，資料夾排除在 Time Machine 外），每次寫入附牆鐘時間錨點，暫停不會在檔案留空白。
 
-- 想要的模型沒下載就跳過（內建小模型比即時結果差），保留即時版本
-- 整理期間有編輯、清空、恢復草稿、上傳或新的 `/start`（`_lines_rev` 變了）就不取代；`/start`、`/clear` 會取消進行中的重轉
-- WAV 約 115 MB/小時；重轉結束後用 `afconvert` 轉成 AAC `.m4a`（約 22 MB/小時），失敗就留 WAV
-- 超過 `RECORDING_RETENTION_DAYS = 7` 天的錄音在啟動與每次 `/start` 時自動刪除
+按「結束會議」（`/stop` 帶 `retranscribe: true`）後，`start_retranscription` 在背景用該語言要的本機模型（zh = Breeze）每 180 秒一段整場重轉：帶上一段**清理過**的結尾當 prompt（那段有重複迴圈就不帶），連續相同的 segment 最多留兩個，時間戳換回會議當下的時間。結果放在 `_pending_retranscription`，前端收 `retranscribe_ready` 跳確認框，使用者選「取代」（`/retranscribe/apply`，只換**這一場**，`_session_first_line` 之後）或「保留即時版本」（`/retranscribe/dismiss`）。不自動替換，所以不會蓋掉正在打的字：確認框搶焦點時，編輯中的那行會先 blur 存檔。
+
+- 「新會議」是 `/stop`（不帶 retranscribe）再 `/clear`：不重轉、不載模型，錄音直接處理掉
+- 想要的模型沒下載、或這場有即時翻譯就跳過（重轉的行對不回原本的翻譯，重翻又要用 Groq 額度），保留即時版本
+- `/start`、`/clear`、恢復草稿、上傳會讓 `_lines_rev` 變動，之後就不能套用；`/start`、`/clear` 也會取消進行中的重轉。純文字編輯不算（取代是使用者自己選的，確認框有寫會蓋掉改過的字）
+- 錄音用完（套用、保留即時、跳過、取消、新會議）就刪；設定開「保留會議錄音」（`keep_recordings`，預設關）才用 `afconvert` 轉成 AAC `.m4a`（約 22 MB/小時）保留 `RECORDING_RETENTION_DAYS = 7` 天。WAV 錄音中約 115 MB/小時
+- 啟動與每次 `/start` 清錄音：沒開保留就全刪（含當機留下的），有開就刪超過 7 天的；關掉設定時立刻刪掉保留中的
 
 ### 逐字稿自動存檔 / 關閉確認
 
