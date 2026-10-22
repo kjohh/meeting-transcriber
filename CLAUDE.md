@@ -166,13 +166,15 @@ Whisper 經典 hallucination：對沒信心的 audio（靜音 / off-script / rep
 
 ### 會後整場重轉（本機模型）
 
-錄音時 `SessionRecorder` 把 chunker 實際消耗的混音（每個 sample 只寫一次）寫進 `recordings/YYYYMMDD-HHMMSS.wav`（同 `.config.json` 的目錄規則，資料夾排除在 Time Machine 外），每次寫入附牆鐘時間錨點，暫停不會在檔案留空白。
+錄音時 `SessionRecorder` 把 chunker 實際消耗的混音（每個 sample 只寫一次）寫進 `recordings/YYYYMMDD-HHMMSS.wav`（同 `.config.json` 的目錄規則，每次開新場都對資料夾跑一次 `tmutil addexclusion`，舊版建的資料夾也會排除在 Time Machine 外），每次寫入附牆鐘時間錨點，暫停不會在檔案留空白。
 
-按「結束會議」（`/stop` 帶 `retranscribe: true`）後，`start_retranscription` 在背景用該語言要的本機模型（zh = Breeze）每 180 秒一段整場重轉：帶上一段**清理過**的結尾當 prompt（那段有重複迴圈就不帶），連續相同的 segment 最多留兩個，時間戳換回會議當下的時間。結果放在 `_pending_retranscription`，前端收 `retranscribe_ready` 跳確認框，使用者選「取代」（`/retranscribe/apply`，只換**這一場**，`_session_first_line` 之後）或「保留即時版本」（`/retranscribe/dismiss`）。不自動替換，所以不會蓋掉正在打的字：確認框搶焦點時，編輯中的那行會先 blur 存檔。
+按「結束會議」（`/stop` 帶 `retranscribe: true`）後，`start_retranscription` 在背景用該語言要的本機模型（zh = Breeze）每 180 秒一段整場重轉：帶上一段**清理過**的結尾當 prompt（那段有重複迴圈就不帶），連續相同的 segment 最多留兩個、A/B 交替的迴圈在這一對重複出現後就砍掉，時間戳換回會議當下的時間。結果放在 `_pending_retranscription`，前端收 `retranscribe_ready` 跳確認框，使用者選「取代」（`/retranscribe/apply`，只換**這一場**，`_session_first_line` 之後）或「保留即時版本」（`/retranscribe/dismiss`）。不自動替換，所以不會蓋掉正在打的字：確認框搶焦點時，編輯中的那行會先 blur 存檔。
 
 - 「新會議」是 `/stop`（不帶 retranscribe）再 `/clear`：不重轉、不載模型，錄音直接處理掉
-- 想要的模型沒下載、或這場有即時翻譯就跳過（重轉的行對不回原本的翻譯，重翻又要用 Groq 額度），保留即時版本
+- 想要的模型沒下載、或這場真的有一行被翻譯就跳過（只開翻譯開關、沒翻到任何一行不算；重轉的行對不回原本的翻譯，重翻又要用 Groq 額度），保留即時版本
 - `/start`、`/clear`、恢復草稿、上傳會讓 `_lines_rev` 變動，之後就不能套用；`/start`、`/clear` 也會取消進行中的重轉。純文字編輯不算（取代是使用者自己選的，確認框有寫會蓋掉改過的字）
+- `/stop` 在鎖內先記下 `_lines_rev` 與 `_session_first_line` 才去 join（最長約 45 秒），join 期間的 `/clear` 會讓這次重轉直接跳過、錄音照刪。join 期間 `_stopping` 為真，`/start` 會被拒，`/pause` 在沒錄音時不動作，第二個 `/stop`（新會議）與 `/clear` 會等這次收尾完才動，最後一段晚到的字也會被清掉；新會議的 `/stop` 等待時會讓這次直接不重轉，不載模型；前端「結束會議」跟「新會議」一樣蓋處理中遮罩
+- 整理好時若有別的確認框開著（例如「開始新會議？」），先等它關掉再跳；這期間被清掉或開新場，後端廣播 `retranscribe_discarded`，前端就不跳
 - 錄音用完（套用、保留即時、跳過、取消、新會議）就刪；設定開「保留會議錄音」（`keep_recordings`，預設關）才用 `afconvert` 轉成 AAC `.m4a`（約 22 MB/小時）保留 `RECORDING_RETENTION_DAYS = 7` 天。WAV 錄音中約 115 MB/小時
 - 啟動與每次 `/start` 清錄音：沒開保留就全刪（含當機留下的），有開就刪超過 7 天的；關掉設定時立刻刪掉保留中的
 

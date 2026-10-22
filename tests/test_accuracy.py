@@ -327,6 +327,12 @@ class Retranscribe(unittest.TestCase):
         texts = [t for _, t in A.segments_to_lines(segs, "zh")]
         self.assertEqual(texts, ["Let's do it.", "Let's do it.", "好，下一個議題"])
 
+    def test_an_alternating_loop_across_segments_is_cut_once_the_pair_repeats(self):
+        segs = [(float(i), "對，就是這樣。" if i % 2 == 0 else "Let's do it.") for i in range(8)]
+        segs.append((9.0, "好，下一個議題"))
+        texts = [t for _, t in A.segments_to_lines(segs, "zh")]
+        self.assertEqual(texts, ["對，就是這樣。", "Let's do it.", "對，就是這樣。", "好，下一個議題"])
+
     def test_a_looping_piece_does_not_prime_the_next(self):
         loop = [(float(i), "這個用途,這個用途,這個用途,這個用途") for i in range(4)]
         w = FakeWorker(lambda n: loop if n == 1 else [(1.0, "第二段")])
@@ -366,6 +372,7 @@ class EndMeetingFlow(unittest.TestCase):
         (A._lines[:], A._lines_rev, A._session_first_line, A.DRAFT_FILE, A.RECORDINGS_DIR,
          A._recording, A._recorder, A._language, A._translate_enabled) = self.saved
         A._pending_retranscription = None
+        A._stopping, A._chunk_worker_thread = False, None
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def _record_session(self):
@@ -421,6 +428,75 @@ class EndMeetingFlow(unittest.TestCase):
         self.ensure_mock.assert_not_called()
         self.assertIsNone(A._pending_retranscription)
         self.assertEqual(A._lines[1]["tr"], "即時翻譯")
+
+    def test_translation_toggle_alone_does_not_skip(self):
+        A._translate_enabled = True  # on, but no line of this session was translated
+        self._record_session()
+        self.post("/stop", {"retranscribe": True})
+        self._wait_idle()
+        self.assertIsNotNone(A._pending_retranscription)
+
+    def test_new_meeting_during_the_end_meeting_stop_drops_the_pass(self):
+        # 結束會議, then 新會議 (/stop, /clear) while the first /stop is still
+        # joining: 新會議's /stop waits for it, so the late final line is cleared
+        # too, and the cleared meeting is not re-transcribed, offered, or kept.
+        new_meeting = {}
+
+        def click_new_meeting():
+            client = A.app.test_client()
+            client.post("/stop", json={})
+            new_meeting["stopped_at"] = len(A._lines)
+            client.post("/clear", json={})
+
+        class SlowWorker:
+            def is_alive(self): return True
+            def join(self, timeout=None):
+                t = threading.Thread(target=click_new_meeting)
+                t.start()
+                new_meeting["thread"] = t
+                t.join(0.3)
+                new_meeting["blocked"] = t.is_alive()
+                A._append_line("最後一段", ts="11:05:00")  # the final flush lands late
+
+        self._record_session()
+        A._chunk_worker_thread = SlowWorker()
+        self.post("/stop", {"retranscribe": True})
+        new_meeting["thread"].join(5)
+        self._wait_idle()
+        self.assertTrue(new_meeting["blocked"], "新會議's /stop waits for the finishing one")
+        self.assertEqual(new_meeting["stopped_at"], 3, "and returns only after the late line")
+        self.ensure_mock.assert_not_called()
+        self.assertIsNone(A._pending_retranscription)
+        self.assertEqual(A._lines, [])
+        self.assertEqual([n for n in os.listdir(self.dir) if n != "draft.json"], [])
+
+    def test_start_is_refused_until_the_stop_finishes(self):
+        test = self
+        seen = {}
+
+        class SlowWorker:
+            def is_alive(self): return True
+            def join(self, timeout=None):
+                seen["start"] = test.post("/start", {"backend": "local", "language": "zh"})
+                seen["pause"] = test.post("/pause")
+
+        self._record_session()
+        A._chunk_worker_thread = SlowWorker()
+        with mock.patch.object(A, "resolve_local_model", return_value=("m", "/fake/model.bin")), \
+             mock.patch.object(A.os.path, "exists", return_value=True):
+            self.post("/stop", {"retranscribe": True})
+        self._wait_idle()
+        self.assertFalse(seen["start"]["ok"])
+        self.assertIn("收尾", seen["start"]["error"])
+        self.assertFalse(seen["pause"]["ok"], "pause is a no-op once recording has stopped")
+        self.assertFalse(A._recording)
+        self.assertFalse(A._stopping)
+
+    def test_recordings_folder_is_excluded_from_backup_even_if_it_already_exists(self):
+        with mock.patch.object(A, "_exclude_from_backup") as excl:
+            rec = A.open_session_recorder()
+        rec.close()
+        excl.assert_called_once_with(self.dir)
 
     def test_skipped_when_the_model_is_not_downloaded(self):
         self._record_session()

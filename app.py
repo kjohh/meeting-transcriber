@@ -362,6 +362,18 @@ _transcribe_queue: "queue.Queue" = queue.Queue(maxsize=8)
 # drains the last flushed chunk before exiting — fixes a dropped-tail race.
 _consumer_should_exit = threading.Event()
 
+# True while /stop is joining the previous session's threads (up to ~45 s).
+# /start refuses then: the finishing /stop would otherwise clear the new
+# session's _recorder and set _consumer_should_exit under it.
+_stopping = False
+# Set when no /stop is finishing. A second /stop (新會議 right after 結束會議)
+# waits on it, so the /clear that follows lands after the last late line.
+_stop_finished = threading.Event()
+_stop_finished.set()
+# Set by that waiting /stop: the meeting is about to be cleared, so the
+# finishing /stop skips the re-transcription instead of loading a model for it.
+_stop_superseded = False
+
 # Download state (local backend only). Lock-protected so SSE clients can poll.
 _download_state: dict = {"active": False, "percent": 0, "model": "", "error": ""}
 _download_lock = threading.Lock()
@@ -1431,7 +1443,7 @@ def route_start():
     global _recording, _paused, _swift_proc, _mic_stream, _language, _backend
     global _chunk_worker_thread, _transcribe_consumer_thread, _local_worker
     global _sys_capture_thread, _mic_gate_deadline, _mix_gain_sys, _mix_gain_mic
-    global _recorder, _session_first_line, _lines_rev
+    global _recorder, _session_first_line, _lines_rev, _stopping
 
     data = request.json or {}
     language = data.get("language", "auto")
@@ -1455,6 +1467,8 @@ def route_start():
     with _lifecycle_lock:
         if _recording:
             return jsonify({"ok": False, "error": "已經在錄音中"})
+        if _stopping:
+            return jsonify({"ok": False, "error": "上一場還在收尾，請稍候再開始。"})
 
         _language = language
         _backend = backend
@@ -1566,6 +1580,8 @@ def route_pause():
     """
     global _paused
     with _lifecycle_lock:
+        if not _recording:
+            return jsonify({"ok": False, "paused": False})
         _paused = not _paused
         paused_now = _paused
         # NOTE: we deliberately do NOT re-arm the mic gate on resume. _sys_ready
@@ -1598,16 +1614,31 @@ def _flush_pending_audio():
 @app.route("/stop", methods=["POST"])
 def route_stop():
     global _recording, _paused, _swift_proc, _mic_stream
-    global _chunk_worker_thread, _transcribe_consumer_thread, _recorder
+    global _chunk_worker_thread, _transcribe_consumer_thread, _recorder, _stopping
+    global _stop_superseded
 
     # "結束會議" asks for the post-session pass; "新會議" (stop, then clear)
     # doesn't, so it never spawns a model just to cancel it.
     retranscribe = bool((request.json or {}).get("retranscribe", False))
     with _lifecycle_lock:
+        finishing = not _recording and _stopping
+        if finishing and not retranscribe:
+            _stop_superseded = True
+    if finishing:
+        _stop_finished.wait(timeout=60)
+        return jsonify({"ok": True})
+    with _lifecycle_lock:
         if not _recording:
             return jsonify({"ok": True})  # idempotent
         _recording = False
+        _stopping = True
+        _stop_superseded = False
+        _stop_finished.clear()
         recorder, language = _recorder, _language  # cleared after the final flush below
+        # The session as it ends. A /clear or upload during the joins below
+        # bumps _lines_rev, so the re-transcription sees the session is gone.
+        with _buf_lock:
+            rev, first = _lines_rev, _session_first_line
         _paused = False
         _set_quit_guard(False)
 
@@ -1626,35 +1657,43 @@ def route_stop():
         _chunk_worker_thread = None
         _transcribe_consumer_thread = None
 
-    # Join outside the lifecycle lock — chunk_worker needs to acquire _buf_lock
-    # and the consumer needs to drain the queue, both can take seconds.
-    # `newSession` (frontend) chains /stop → /clear, so /stop must return only
-    # after every late _append_line has landed, or /clear will race them.
-    if chunk_worker and chunk_worker.is_alive():
-        chunk_worker.join(timeout=15)
-    # Signal the consumer to exit only NOW — the chunk worker has flushed its
-    # final chunk into the queue, so the consumer drains that (and anything
-    # else queued) before it sees an empty queue + this flag and quits.
-    _consumer_should_exit.set()
-    if consumer and consumer.is_alive():
-        consumer.join(timeout=30)
+    try:
+        # Join outside the lifecycle lock — chunk_worker needs to acquire _buf_lock
+        # and the consumer needs to drain the queue, both can take seconds.
+        # `newSession` (frontend) chains /stop → /clear, so /stop must return only
+        # after every late _append_line has landed, or /clear will race them.
+        if chunk_worker and chunk_worker.is_alive():
+            chunk_worker.join(timeout=15)
+        # Signal the consumer to exit only NOW — the chunk worker has flushed its
+        # final chunk into the queue, so the consumer drains that (and anything
+        # else queued) before it sees an empty queue + this flag and quits.
+        _consumer_should_exit.set()
+        if consumer and consumer.is_alive():
+            consumer.join(timeout=30)
 
-    # NOTE: do NOT close the whisper subprocess here. Worker is now
-    # app-scoped — keeping it alive across sessions skips the 2-3s model
-    # reload between recordings. atexit + the next /start's mismatch
-    # check still handle cleanup on app exit / language switch.
+        # NOTE: do NOT close the whisper subprocess here. Worker is now
+        # app-scoped — keeping it alive across sessions skips the 2-3s model
+        # reload between recordings. atexit + the next /start's mismatch
+        # check still handle cleanup on app exit / language switch.
 
-    _broadcast("state", {"recording": False, "paused": False})
-    _set_status(f"已停止，共 {len(_lines)} 段逐字稿。")
-
-    # The chunk worker has written its final flush, so the recording is whole.
-    _recorder = None
-    if recorder is not None:
-        recorder.close()
-        if retranscribe:
-            start_retranscription(recorder, language)
-        else:
-            finish_recording(recorder.path)
+        _broadcast("state", {"recording": False, "paused": False})
+        _set_status(f"已停止，共 {len(_lines)} 段逐字稿。")
+    finally:
+        # The chunk worker has written its final flush, so the recording is whole.
+        # Cleared even if a join raised, or every later /start is refused.
+        with _lifecycle_lock:
+            _recorder = None
+            _stopping = False
+            superseded = _stop_superseded
+    try:
+        if recorder is not None:
+            recorder.close()
+            if retranscribe and not superseded:
+                start_retranscription(recorder, language, rev, first)
+            else:
+                finish_recording(recorder.path)
+    finally:
+        _stop_finished.set()
     return jsonify({"ok": True})
 
 
@@ -1731,6 +1770,7 @@ def route_clear():
     # transcribe doesn't land into the cleared list. Also hold _buf_lock so the
     # clear can't interleave between /line's bounds-check and its indexed write.
     global _lines_rev
+    _stop_finished.wait(timeout=60)  # a /stop still joining would append after the clear
     with _lifecycle_lock:
         with _buf_lock:
             _lines.clear()
@@ -3289,10 +3329,10 @@ def open_session_recorder() -> Optional[SessionRecorder]:
     (recording then goes on without the post-session pass)."""
     prune_recordings()
     try:
-        fresh = not os.path.isdir(RECORDINGS_DIR)
         os.makedirs(RECORDINGS_DIR, mode=0o700, exist_ok=True)
-        if fresh:
-            _exclude_from_backup(RECORDINGS_DIR)
+        # Every session, not only on creation: a folder made by an earlier
+        # version was never excluded. tmutil addexclusion is idempotent.
+        _exclude_from_backup(RECORDINGS_DIR)
         path = os.path.join(RECORDINGS_DIR, datetime.now().strftime("%Y%m%d-%H%M%S") + ".wav")
         return SessionRecorder(path)
     except OSError as e:
@@ -3350,6 +3390,7 @@ def segments_to_lines(segments: list[tuple[float, str]], language: str) -> list[
     segments into the previous line."""
     lines: list[tuple[float, str]] = []
     run_key, run_len = None, 0
+    keys: list[str] = []  # every kept-or-dropped segment, for A/B loop detection
     for offset, text in segments:
         text = _drop_hallucinations((text or "").strip(), language)
         if not text or _is_loop_hallucination(text):
@@ -3360,7 +3401,12 @@ def segments_to_lines(segments: list[tuple[float, str]], language: str) -> list[
         key = _norm_clause(text)
         run_len = run_len + 1 if key == run_key else 1
         run_key = key
+        keys.append(key)
         if run_len > 2:
+            continue
+        # A, B, A, B, …: once the pair repeats, the rest of the loop goes
+        # (the live path's _collapse_runs does this within one chunk).
+        if len(keys) >= 4 and keys[-1] == keys[-3] and keys[-2] == keys[-4] and keys[-1] != keys[-2]:
             continue
         if lines and len(text) < RETRANSCRIBE_MERGE_CHARS:
             lines[-1] = (lines[-1][0], lines[-1][1] + " " + text)
@@ -3404,21 +3450,22 @@ def _session_has_translation(first: int) -> bool:
         return any(l.get("tr") for l in _lines[first:])
 
 
-def start_retranscription(recorder: SessionRecorder, language: str) -> None:
+def start_retranscription(recorder: SessionRecorder, language: str, rev: int, first: int) -> None:
     """After 結束會議: re-transcribe the session in the background with the
     local model the language wants, then offer it to the user, who applies
     or dismisses it (nothing is swapped automatically). Skipped, keeping the
     live lines, when that model isn't downloaded (the bundled small model is
-    less accurate than the live result) or when the session was translated
+    less accurate than the live result) or when a line of the session was translated
     (re-transcribed lines can't carry the live translations, and redoing them
-    would spend the Groq quota)."""
+    would spend the Groq quota). *rev* and *first* are the session as /stop
+    found it; if the transcript has changed since (cleared, say), it's skipped."""
     global _retranscribe_cancel, _retranscribe_thread
     with _buf_lock:
-        rev, first = _lines_rev, _session_first_line
-    if recorder.samples < SAMPLE_RATE:
+        changed = _lines_rev != rev
+    if changed or recorder.samples < SAMPLE_RATE:
         finish_recording(recorder.path)
         return
-    if _translate_enabled or _session_has_translation(first):
+    if _session_has_translation(first):
         _set_status("這場有即時翻譯，整場重轉會蓋掉翻譯，所以保留即時版本。")
         finish_recording(recorder.path)
         return
@@ -3472,6 +3519,7 @@ def discard_pending_retranscription() -> None:
     with _buf_lock:
         pending, _pending_retranscription = _pending_retranscription, None
     if pending:
+        _broadcast("retranscribe_discarded", True)
         finish_recording(pending["path"])
 
 

@@ -985,6 +985,8 @@ es.onmessage = ({data}) => {
     appendLine(msg.data);
   } else if (msg.type === 'retranscribe_ready') {
     offerRetranscription(msg.data.count);
+  } else if (msg.type === 'retranscribe_discarded') {
+    _deferredOffer = null;
   } else if (msg.type === 'status') {
     document.getElementById('status').textContent = msg.data;
   } else if (msg.type === 'state') {
@@ -1259,12 +1261,34 @@ function newSession() {
 
 /* ── 結束會議 + post-session re-transcription ── */
 function endMeeting() {
+  // Same overlay as 新會議: /stop joins the worker threads (up to ~45 s), and
+  // a click on 新會議 or 錄音 in that window races the stop.
   document.getElementById('btn-end').disabled = true;
+  showBusy('結束會議', '正在完成最後一段轉錄…');
   fetch('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({retranscribe: true})})
-    .then(() => sync());
+    .catch(e => setStatus('連線錯誤：' + e))
+    .finally(() => hideBusy());
+}
+
+let _deferredOffer = null;  // a ready re-transcription waiting for another dialog to close
+function _flushDeferredOffer() {
+  if (_deferredOffer === null) return;
+  if (_modalOpen()) { setTimeout(_flushDeferredOffer, 300); return; }
+  const count = _deferredOffer;
+  _deferredOffer = null;
+  offerRetranscription(count);
 }
 
 function offerRetranscription(count) {
+  // Never replace a question the user hasn't answered (the shared confirm
+  // dialog would): wait until no dialog is open. The server drops the offer
+  // (retranscribe_discarded) if the user clears or starts a meeting meanwhile.
+  if (_modalOpen()) {
+    const first = _deferredOffer === null;
+    _deferredOffer = count;
+    if (first) setTimeout(_flushDeferredOffer, 300);
+    return;
+  }
   // Never swap the transcript under the user: they choose. Opening the dialog
   // moves focus, so an edit in progress is committed (blur) before this runs.
   showConfirm('要換成整理後的逐字稿嗎？',
